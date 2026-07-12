@@ -1,0 +1,5 @@
+# Must point at the repository whose Precompiled Binaries workflow publishes
+# the release assets (the workflow publishes to its own github.repository).
+precompiled_binaries:
+  url_prefix: https://github.com/otzaria/otzaria_search_engine/releases/download/precompiled_
+  public_key: 8b1d5cbe1a2eb4ba0face7d49f68cb75d29bbf1f7d1a569c42d277d20ea65316

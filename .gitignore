@@ -1,0 +1,8 @@
+# Rust build output (root workspace + any nested crate)
+/target
+**/target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# OS / editor
+.DS_Store

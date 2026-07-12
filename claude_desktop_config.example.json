@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "otzaria": {
+      "command": "/ABSOLUTE/PATH/TO/otzaria_mcp/run-stdio.sh",
+      "args": ["--data-dir", "/ABSOLUTE/PATH/TO/otzaria_latest"]
+    }
+  }
+}

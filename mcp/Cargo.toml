@@ -1,0 +1,27 @@
+[package]
+name = "otzaria-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP server exposing the Otzaria Jewish-texts library (SQLite + Tantivy), read-only, offline."
+license = "MIT"
+
+[[bin]]
+name = "otzaria-mcp"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync", "signal", "time"] }
+# rusqlite pinned to the same version/features the `search_engine` crate uses, so the
+# bundled SQLite is unified to a single C library (avoids duplicate-symbol conflicts
+# once search_engine is added in Milestone 1).
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+schemars = "1.0"
+rmcp = { version = "2.2.0", features = ["transport-io", "schemars"] }
+# Otzaria's actual Tantivy search engine (git submodule, pinned). Reused so the
+# MCP reproduces the app's exact search semantics (Hebrew morphology, regex-phrase,
+# facets) rather than reimplementing them. Read-only use of SearchEngine.
+search_engine = { path = "../vendor/otzaria_search_engine/rust" }
+# rmcp (official Rust MCP SDK) is added via `cargo add` so the exact latest version resolves.
