@@ -85,10 +85,10 @@ stdin/stdout; לוגים על stderr.
 | כלי | תיאור |
 |---|---|
 | `search_books` | חיפוש ספרים לפי כותרת/תיאור → id, כותרת, heRef, קטגוריה, מחבר, מס' שורות |
-| `full_text_search` | חיפוש טקסט מלא (Tantivy). מצבים: `advanced`/`exact`/`fuzzy`. כל תוצאה: **book_id + line_index** קנוניים, reference, snippet מודגש «…», total |
+| `full_text_search` | חיפוש טקסט מלא (Tantivy). מצבים: `advanced`/`exact`/`fuzzy`. תוצאות `official` כוללות **book_id + line_index** קנוניים; תוצאות PDF/ספרי משתמש/קטלוג חיצוני מסומנות במקורן ואינן נשלחות ל־`get_text` |
 | `resolve_ref` | פענוח הפניה עברית → (book_id, line_index). תומך בכותרות, ראשי-תיבות, תנ״ך, משנה, תלמוד (כולל דף `ב:`) |
 | `get_text` | שורות ספר לפי `line_index` (0-based) → heRef+content, `next_line_index`, אופציית `strip_html` |
-| `get_book_toc` | תוכן עניינים היררכי + מבנים חלופיים (פרשה/דף/סימן) עם מצביעי line_index |
+| `get_book_toc` | תוכן עניינים היררכי + מבנים חלופיים. מעבירים `alt_structure_key` מתוך `alt_structures` כדי לקבל את צומתי הפרשה/דף/סימן עם מצביעי `line_index` |
 | `get_links` | קישורים לספר/שורה (15 סוגים), כיוון outgoing/incoming/both, מקור+יעד עם heRef+snippet |
 | `get_commentaries` | מפרשים/תרגומים על שורה/טווח + רשימת מפרשים דיפולטיביים מסודרת |
 | `get_book_info` | מטא מלא: מחבר, דור, נושאים, מקור, דגלי-קישורים, ניקוד/טעמים, ראשי-תיבות, גרסאות |
@@ -107,8 +107,9 @@ stdin/stdout; לוגים על stderr.
 ```
 
 - **קריאה-בלבד:** ה-DB נפתח `SQLITE_OPEN_READ_ONLY`; המנוע לקריאה בלבד.
-- **מיפוי קנוני:** באינדקס `file_path="id:<bookId>"` ו-`segment=lineIndex` → כל hit
-  ממופה חד-משמעית לספר ולשורה ב-`seforim.db` (מאומת בבדיקות).
+- **מיפוי קנוני:** רק באינדקס `file_path="id:<bookId>"` ו-`segment=lineIndex` יש
+  מיפוי חד-משמעי לספר ולשורה ב-`seforim.db`. ספרי משתמש, קטלוגים חיצוניים ו-PDF מסומנים
+  במפורש ואינם מועברים לכלי ה-SQLite.
 - **עדכון-חם:** משימת-רקע מנטרת טביעת-אצבע (mtime+גודל של ה-DB ושני קבצי meta של
   האינדקס); כשהיא משתנה ומתייצבת, ה-DB והאינדקס מוחלפים **כזוג תקין** מאחורי `RwLock`.
 - **גרסת מנוע:** ה-crate המוונדר (0.6.7) חייב להתאים לסכימת האינדקס בדיסק
@@ -123,8 +124,10 @@ cargo fmt -p otzaria-mcp --check
 cargo clippy -p otzaria-mcp --all-targets --no-deps -- -D warnings   # --no-deps: לא לנתח את ה-crate המוונדר
 ```
 
-בדיקות האינטגרציה ([`mcp/tests/real_data.rs`](mcp/tests/real_data.rs)) מדלגות בחן כשאין
-נתונים, ומאמתות עם נתונים: corpus golden ל-`resolve_ref` והגשר `full_text_search`→`get_text`.
+בדיקות היחידה כוללות מסד SQLite בזיכרון לקישורי־טווח ול־TOC חלופי, ולכן ה-CI מכסה את
+החוזים האלה בלי להוריד את הספרייה. בדיקות האינטגרציה
+([`mcp/tests/real_data.rs`](mcp/tests/real_data.rs)) מדלגות בחן כשאין נתונים, ומאמתות עם
+נתונים: corpus golden ל-`resolve_ref` והגשר `full_text_search`→`get_text`.
 
 ## מבנה
 

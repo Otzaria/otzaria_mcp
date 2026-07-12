@@ -124,6 +124,10 @@ pub struct GetCommentariesParams {
 pub struct GetBookTocParams {
     /// Book id.
     pub book_id: i64,
+    /// Optional alternate-structure key from `alt_structures`, e.g. `Parasha`.
+    /// When set, `alt_entries` contains its navigable tree.
+    #[serde(default)]
+    pub alt_structure_key: Option<String>,
     /// Max TOC entries (default 200, capped at 1000).
     #[serde(default)]
     pub limit: Option<u32>,
@@ -158,10 +162,10 @@ impl OtzariaServer {
         &self,
         Parameters(p): Parameters<SearchBooksParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let query = required_text(p.query, "query")?;
         let snap = self.lib.current();
         let limit = p.limit.unwrap_or(20).min(100) as i64;
         let db = snap.db.clone();
-        let query = p.query;
         let books = run_blocking(move || db.search_books(&query, limit)).await?;
         self.respond(&snap, json!({ "count": books.len(), "books": books }))
     }
@@ -222,15 +226,16 @@ impl OtzariaServer {
         name = "full_text_search",
         description = "Full-text search across the entire Otzaria library using its real Tantivy engine \
                        (Hebrew morphology; nikud/te'amim handled automatically). Modes: 'advanced' (default, \
-                       morphological), 'exact', 'fuzzy'. Each hit returns canonical book_id + line_index \
-                       (feed straight into get_text / get_links / get_book_info), the book title, a reference \
-                       breadcrumb, and a «…»-highlighted snippet. PDF hits return a page number instead.",
+                       morphological), 'exact', 'fuzzy'. Official hits return canonical book_id + line_index \
+                       (feed straight into get_text / get_links / get_book_info); user, external, and PDF hits \
+                       are marked by source and are not SQLite addresses.",
         annotations(read_only_hint = true)
     )]
     pub async fn full_text_search(
         &self,
         Parameters(p): Parameters<FullTextSearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let query = required_text(p.query, "query")?;
         let snap = self.lib.current();
         let Some(search) = snap.search.clone() else {
             return Err(ErrorData::internal_error(
@@ -243,7 +248,6 @@ impl OtzariaServer {
         let limit = p.limit.unwrap_or(20).min(100);
         let offset = p.offset.unwrap_or(0);
         let order = p.order.unwrap_or_else(|| "catalogue".to_string());
-        let query = p.query;
         let facet = p.facet;
         let resp =
             run_blocking(move || search.search(query, mode, limit, offset, facet, &order)).await?;
@@ -296,8 +300,8 @@ impl OtzariaServer {
         &self,
         Parameters(p): Parameters<ResolveRefParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let reference = required_text(p.reference, "reference")?;
         let snap = self.lib.current();
-        let reference = p.reference;
         let limit = p.limit.unwrap_or(10).min(50) as i64;
         let db = snap.db.clone();
         let candidates = run_blocking(move || db.resolve_ref(&reference, limit)).await?;
@@ -335,7 +339,7 @@ impl OtzariaServer {
         name = "get_book_toc",
         description = "Hierarchical table of contents for a book: a flattened, pre-ordered list of entries with \
                        level, text, has_children, and a line_index pointer to pass to get_text. Also lists the \
-                       book's alternate structures (e.g. Parasha, Daf, Siman) when present.",
+                       book's alternate structures; pass alt_structure_key to return that structure's entries.",
         annotations(read_only_hint = true)
     )]
     pub async fn get_book_toc(
@@ -345,8 +349,11 @@ impl OtzariaServer {
         let snap = self.lib.current();
         let limit = p.limit.unwrap_or(200).min(1000) as i64;
         let book_id = p.book_id;
+        let alt_structure_key = p.alt_structure_key;
         let db = snap.db.clone();
-        let toc = run_blocking(move || db.get_book_toc(book_id, limit)).await?;
+        let toc =
+            run_blocking(move || db.get_book_toc(book_id, limit, alt_structure_key.as_deref()))
+                .await?;
         self.respond(&snap, serde_json::to_value(toc).unwrap())
     }
 
@@ -415,4 +422,29 @@ where
         .await
         .map_err(|e| ErrorData::internal_error(format!("task join error: {e}"), None))?
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+}
+
+fn required_text(value: String, field: &str) -> Result<String, ErrorData> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(ErrorData::invalid_params(
+            format!("{field} must not be empty"),
+            None,
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::required_text;
+
+    #[test]
+    fn rejects_blank_required_text() {
+        assert!(required_text("  \n".to_string(), "query").is_err());
+        assert_eq!(
+            required_text(" בראשית ".to_string(), "query").unwrap(),
+            "בראשית"
+        );
+    }
 }

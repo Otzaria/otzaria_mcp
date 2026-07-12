@@ -25,7 +25,7 @@
 בנאמנות. משתמש הקצה מחזיק רק את נתוני אוצריא (`seforim.db`, `lexical.db`, `index/`, PDFים)
 — לא את קוד המקור. לכן ה-MCP עצמאי בזמן ריצה וקורא **קריאה-בלבד** את נתוני אוצריא.
 
-**תוצאה מבוקשת (v1):** בינארי עצמאי, תעבורת **stdio בלבד**, 6 כלים ליבתיים, קריאה-בלבד.
+**תוצאה ממומשת (v1):** בינארי עצמאי, תעבורת **stdio בלבד**, 9 כלים, קריאה-בלבד.
 
 ---
 
@@ -77,7 +77,7 @@
 
 ---
 
-## כלים — v1: 6 כלים ליבתיים (ביקורת #4)
+## כלים — v1: 9 כלים
 | כלי | מקור | פלט/הערות |
 |---|---|---|
 | `full_text_search` | Tantivy | query, mode(`advanced`/`exact`/`fuzzy`), limit, offset, category(facet אופ'), order. מחזיר לכל hit: **bookId, lineIndex** (קנוני), title, reference, snippet, isPdf, filePath + total. (fuzzy: טוען `lexical.db` אם קיים) |
@@ -86,10 +86,9 @@
 | `search_books` | SQLite | `title LIKE ? OR heShortDesc LIKE ?` + `book_author→author→generation`. מחזיר bookId, title, heRef, מחבר, קטגוריה, דור, totalLines, isBaseBook |
 | `get_links` | SQLite | לפי bookId (+lineIndex/connection_type אופ'); מטפל ב-15 סוגי-קישור ובמודל הטווחים (`link`+`link_range`). כותרות+heRef+snippet של מקור ויעד |
 | `get_book_info` | SQLite | ל-bookId: heRef, heShortDesc/heDesc, מחבר(ים)+דור, נושאים, מקור, שנת/מקום הוצאה, דגלי-קישורים, hasAltStructures/Teamim/Nekudot, totalLines, גרסאות-טקסט (`book_version`), כמה ראשי-תיבות |
-
-**נדחים לשלב ב'** (אחרי שהמיפוי Search→DB מוכח): `get_commentaries`
-(`default_commentator` + לינקי COMMENTARY/TARGUM עם טקסט), `get_book_toc`
-(`tocEntry`+`tocText`+alt_toc), `browse_categories` (`category`+`category_closure`).
+| `get_commentaries` | SQLite | מפרשים ותרגומים על שורה או טווח, כולל קישורי־טווח ורשימת מפרשי ברירת המחדל |
+| `get_book_toc` | SQLite | TOC רגיל; `alt_structure_key` מחזיר גם את צומתי המבנה החלופי עם `lineIndex` |
+| `browse_categories` | SQLite | עץ הקטגוריות וספרים ישירים תחת קטגוריה |
 
 ### חוזה API אחיד (ביקורת #5) — להגדיר לפני מימוש
 - `limit`: ברירת-מחדל וסף עליון מפורשים לכל כלי (למשל 50, מקס' 200).
@@ -149,7 +148,7 @@ vendoring של קוד ה-crate + `vendor/tantivy-fst` פנימה.
    `(bookId,lineIndex)` (אימות מול `get_text`).
 2. `resolve_ref` + `get_links` (מודל 15-הסוגים והטווחים).
 3. hot-reload (`reload.rs`) + חוזה-שגיאות + בדיקות מלאות (fmt/clippy/unit/e2e).
-4. שלב ב': `get_commentaries`, `get_book_toc`, `browse_categories`. אח"כ HTTP (עם האבטחה לעיל).
+4. הרחבות עתידיות: HTTP עם האבטחה לעיל.
 
 ## אימות (end-to-end, מול הנתונים האמיתיים)
 1. `search_books "בראשית"` → ספרים עם מחבר/דור/קטגוריה.

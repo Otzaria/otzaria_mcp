@@ -8,7 +8,9 @@
 //! heRef so they line up. This is the biggest correctness-risk tool; it is covered by
 //! a golden test corpus (see tests/).
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -47,6 +49,14 @@ pub struct RefIndex {
     book_title: HashMap<i64, String>,
     /// bookId → (is_base_book, orderIndex) for ranking candidates.
     book_meta: HashMap<i64, (bool, i64)>,
+    /// Lazily built normalized heRef index for each requested book.
+    line_cache: Mutex<HashMap<i64, BTreeMap<String, CachedLine>>>,
+}
+
+#[derive(Clone)]
+struct CachedLine {
+    line_index: i64,
+    he_ref: String,
 }
 
 fn add_name(map: &mut HashMap<String, Vec<i64>>, name: &str, id: i64) {
@@ -107,7 +117,48 @@ impl RefIndex {
             book_heref,
             book_title,
             book_meta,
+            line_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn matching_line(
+        &self,
+        conn: &Connection,
+        book_id: i64,
+        canonical: &str,
+    ) -> Result<Option<CachedLine>> {
+        let mut cache = self.line_cache.lock().unwrap();
+        if let Entry::Vacant(entry) = cache.entry(book_id) {
+            let mut stmt = conn.prepare(
+                "SELECT lineIndex, heRef FROM line \
+                  WHERE bookId = ?1 AND heRef IS NOT NULL ORDER BY lineIndex",
+            )?;
+            let mut lines = BTreeMap::new();
+            for row in stmt.query_map([book_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })? {
+                let (line_index, he_ref) = row?;
+                let normalized = normalize_ref(&he_ref);
+                lines
+                    .entry(normalized)
+                    .or_insert(CachedLine { line_index, he_ref });
+            }
+            entry.insert(lines);
+        }
+
+        let Some(lines) = cache.get(&book_id) else {
+            return Ok(None);
+        };
+        if let Some(line) = lines.get(canonical) {
+            return Ok(Some(line.clone()));
+        }
+
+        Ok(lines
+            .range(canonical.to_string()..)
+            .take_while(|(he_ref, _)| starts_with_tokens(he_ref, canonical))
+            .map(|(_, line)| line)
+            .min_by_key(|line| line.line_index)
+            .cloned())
     }
 }
 
@@ -169,7 +220,7 @@ pub fn resolve(
             canonical.push_str(&address);
         }
 
-        if let Some(c) = first_line_matching(conn, bid, &title, &canonical)? {
+        if let Some(c) = first_line_matching(conn, index, bid, &title, &canonical)? {
             out.push(c);
         }
     }
@@ -199,37 +250,32 @@ pub fn resolve(
 /// prefixed by (prefix) `canonical`. Prefers an exact match if one exists.
 fn first_line_matching(
     conn: &Connection,
+    index: &RefIndex,
     book_id: i64,
     title: &str,
     canonical: &str,
 ) -> Result<Option<RefCandidate>> {
-    let mut stmt = conn.prepare(
-        "SELECT lineIndex, heRef, content FROM line \
-          WHERE bookId = ?1 AND heRef IS NOT NULL ORDER BY lineIndex",
+    let Some(line) = index.matching_line(conn, book_id, canonical)? else {
+        return Ok(None);
+    };
+    let content = conn.query_row(
+        "SELECT content FROM line WHERE bookId = ?1 AND lineIndex = ?2",
+        rusqlite::params![book_id, line.line_index],
+        |r| r.get::<_, String>(0),
     )?;
-    let rows = stmt.query_map([book_id], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })?;
-
-    let mut prefix_hit: Option<(i64, String, String)> = None;
-    for row in rows.flatten() {
-        let (li, href, content) = row;
-        let nh = normalize_ref(&href);
-        if nh == *canonical {
-            return Ok(Some(make_candidate(
-                book_id, title, li, href, content, "exact",
-            )));
-        }
-        if prefix_hit.is_none() && starts_with_tokens(&nh, canonical) {
-            prefix_hit = Some((li, href, content));
-        }
-    }
-    Ok(prefix_hit
-        .map(|(li, href, content)| make_candidate(book_id, title, li, href, content, "prefix")))
+    let match_kind = if normalize_ref(&line.he_ref) == canonical {
+        "exact"
+    } else {
+        "prefix"
+    };
+    Ok(Some(make_candidate(
+        book_id,
+        title,
+        line.line_index,
+        line.he_ref,
+        content,
+        match_kind,
+    )))
 }
 
 /// Last resort: substring match on raw `line.heRef`.
@@ -280,7 +326,8 @@ fn make_candidate(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_ref, starts_with_tokens};
+    use super::{normalize_ref, starts_with_tokens, RefIndex};
+    use rusqlite::Connection;
 
     #[test]
     fn strips_nikud_and_gershayim() {
@@ -306,5 +353,26 @@ mod tests {
         assert!(starts_with_tokens("בראשית א א", "בראשית א"));
         assert!(starts_with_tokens("בראשית", "בראשית"));
         assert!(!starts_with_tokens("בראשית אב", "בראשית א"));
+    }
+
+    #[test]
+    fn resolves_from_the_per_book_normalized_cache() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE book (id INTEGER PRIMARY KEY, title TEXT NOT NULL, heRef TEXT, isBaseBook INTEGER NOT NULL, orderIndex INTEGER NOT NULL);
+             CREATE TABLE book_acronym (bookId INTEGER NOT NULL, term TEXT NOT NULL);
+             CREATE TABLE line (bookId INTEGER NOT NULL, lineIndex INTEGER NOT NULL, heRef TEXT, content TEXT NOT NULL);
+             INSERT INTO book VALUES (1, 'בראשית', 'בראשית', 1, 1);
+             INSERT INTO line VALUES (1, 2, 'בראשית א, א', 'בתחילה');",
+        )
+        .unwrap();
+        let index = RefIndex::build(&conn);
+
+        let first = super::resolve(&conn, &index, "בראשית א א", 1).unwrap();
+        let second = super::resolve(&conn, &index, "בראשית א א", 1).unwrap();
+
+        assert_eq!(first[0].line_index, 2);
+        assert_eq!(second[0].line_index, 2);
+        assert_eq!(index.line_cache.lock().unwrap().len(), 1);
     }
 }

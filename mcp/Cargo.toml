@@ -24,4 +24,6 @@ rmcp = { version = "2.2.0", features = ["transport-io", "schemars"] }
 # MCP reproduces the app's exact search semantics (Hebrew morphology, regex-phrase,
 # facets) rather than reimplementing them. Read-only use of SearchEngine.
 search_engine = { path = "../vendor/otzaria_search_engine/rust" }
-# rmcp (official Rust MCP SDK) is added via `cargo add` so the exact latest version resolves.
+
+[dev-dependencies]
+tempfile = "3"

@@ -82,7 +82,7 @@ impl Search {
             );
         }
 
-        let mut engine = SearchEngine::new(&index_str);
+        let mut engine = SearchEngine::open_read_only(&index_str)?;
         if let Some(lex) = lexical_db {
             if let Some(lex_str) = lex.to_str() {
                 // Best-effort: only affects fuzzy morphology; false just means "no lexicon".
@@ -171,9 +171,12 @@ impl SearchResponse {
 
 #[derive(Debug, Serialize)]
 pub struct SearchHit {
-    /// Canonical seforim.db book id for official text books (None for PDFs / external).
+    /// Where this document lives. Only `official` hits can be followed with the
+    /// SQLite-backed tools in this MCP.
+    pub source: SearchHitSource,
+    /// Canonical seforim.db book id for official text books only.
     pub book_id: Option<i64>,
-    /// seforim.db line index for text books (== segment); None for PDFs.
+    /// seforim.db line index for official text books only.
     pub line_index: Option<i64>,
     /// For PDF hits: 1-based page number (segment + 1).
     pub page: Option<i64>,
@@ -185,14 +188,33 @@ pub struct SearchHit {
     pub file_path: String,
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchHitSource {
+    Official,
+    User,
+    External,
+    Pdf,
+}
+
 impl SearchHit {
     fn from_result(r: SearchResult) -> SearchHit {
-        let (book_id, line_index, page) = if r.is_pdf {
-            (None, None, Some(r.segment as i64 + 1))
+        let (source, book_id, line_index, page) = if r.is_pdf {
+            (SearchHitSource::Pdf, None, None, Some(r.segment as i64 + 1))
+        } else if let Some(book_id) = parse_official_book_id(&r.file_path) {
+            (
+                SearchHitSource::Official,
+                Some(book_id),
+                Some(r.segment as i64),
+                None,
+            )
+        } else if r.file_path.starts_with("uid:") {
+            (SearchHitSource::User, None, None, None)
         } else {
-            (parse_book_id(&r.file_path), Some(r.segment as i64), None)
+            (SearchHitSource::External, None, None, None)
         };
         SearchHit {
+            source,
             book_id,
             line_index,
             page,
@@ -205,15 +227,9 @@ impl SearchHit {
     }
 }
 
-/// Parse the seforim.db book id out of the index `file_path`.
-/// Text books are indexed as `id:<bookId>` (official) or `uid:<bookId>` (user book).
-fn parse_book_id(file_path: &str) -> Option<i64> {
-    for prefix in ["id:", "uid:"] {
-        if let Some(rest) = file_path.strip_prefix(prefix) {
-            return rest.parse::<i64>().ok();
-        }
-    }
-    None
+/// Parse an official seforim.db book id out of the index `file_path`.
+fn parse_official_book_id(file_path: &str) -> Option<i64> {
+    file_path.strip_prefix("id:")?.parse::<i64>().ok()
 }
 
 /// Convert the engine's `<font color=red>…</font>` highlight markup into `«…»`
@@ -227,14 +243,15 @@ fn clean_snippet(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_book_id, Mode};
+    use super::{parse_official_book_id, Mode, SearchHit, SearchHitSource};
+    use search_engine::api::search_engine::{SearchEngine, SearchResult};
 
     #[test]
     fn parses_book_id_prefixes() {
-        assert_eq!(parse_book_id("id:1"), Some(1));
-        assert_eq!(parse_book_id("uid:57"), Some(57));
-        assert_eq!(parse_book_id("/abs/path/book.pdf"), None);
-        assert_eq!(parse_book_id("ext:foo"), None);
+        assert_eq!(parse_official_book_id("id:1"), Some(1));
+        assert_eq!(parse_official_book_id("uid:57"), None);
+        assert_eq!(parse_official_book_id("/abs/path/book.pdf"), None);
+        assert_eq!(parse_official_book_id("ext:foo"), None);
     }
 
     #[test]
@@ -243,5 +260,33 @@ mod tests {
         assert!(matches!(Mode::parse("advanced").unwrap(), Mode::Advanced));
         assert!(matches!(Mode::parse("fuzzy").unwrap(), Mode::Fuzzy));
         assert!(Mode::parse("nope").is_err());
+    }
+
+    #[test]
+    fn user_results_are_not_presented_as_official_books() {
+        let hit = SearchHit::from_result(SearchResult {
+            title: "ספר אישי".to_string(),
+            reference: String::new(),
+            text: String::new(),
+            id: 1,
+            segment: 7,
+            is_pdf: false,
+            file_path: "uid:1".to_string(),
+        });
+        assert_eq!(hit.source, SearchHitSource::User);
+        assert_eq!(hit.book_id, None);
+        assert_eq!(hit.line_index, None);
+    }
+
+    #[test]
+    fn read_only_open_does_not_create_index_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        drop(SearchEngine::new(path));
+        let metadata = dir.path().join("otzaria_index_meta.json");
+        std::fs::remove_file(&metadata).unwrap();
+
+        let _search = super::Search::open(dir.path(), None).unwrap();
+        assert!(!metadata.exists());
     }
 }

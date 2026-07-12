@@ -420,6 +420,34 @@ pub struct SearchEngine {
 }
 
 impl SearchEngine {
+    /// Opens an existing index without acquiring a writer lock or creating any
+    /// metadata files. Consumers that only search an index should use this
+    /// instead of [`Self::new`].
+    pub fn open_read_only(path: &str) -> Result<Self> {
+        let schema = current_schema();
+        let mmap_directory = MmapDirectory::open(path)
+            .with_context(|| format!("unable to open mmap directory at {path}"))?;
+        let index = Index::open(mmap_directory)
+            .with_context(|| format!("unable to open index at {path}"))?;
+        if index.schema() != schema {
+            anyhow::bail!("index at {path} was built with an incompatible schema");
+        }
+        let index_reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()
+            .context("failed to create index reader")?;
+
+        Ok(SearchEngine {
+            schema,
+            index,
+            index_writer: None,
+            writer_heap_size: DEFAULT_WRITER_HEAP_SIZE,
+            index_reader,
+            magic_dict: None,
+        })
+    }
+
     #[frb(sync)]
     pub fn new(path: &str) -> Self {
         debug!("new path={}", path);

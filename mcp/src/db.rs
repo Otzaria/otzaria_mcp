@@ -3,7 +3,7 @@
 //! default, or `immutable=1` only in explicit `--snapshot` mode.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use std::sync::{Mutex, OnceLock};
 
@@ -305,7 +305,9 @@ impl Db {
                JOIN line sl ON lk.sourceLineId = sl.id \
                JOIN book tb ON lk.targetBookId = tb.id \
                JOIN line tl ON lk.targetLineId = tl.id \
-              WHERE lk.sourceBookId = ?1 AND sl.lineIndex BETWEEN ?2 AND ?3 \
+               LEFT JOIN link_range lr ON lr.linkId = lk.id AND lr.side = 0 \
+              WHERE lk.sourceBookId = ?1 AND sl.lineIndex <= ?3 \
+                AND COALESCE(lr.endLineIndex, sl.lineIndex) >= ?2 \
                 AND ct.name IN ('COMMENTARY','SUPER_COMMENTARY','TARGUM','MIDRASH','PARSHANUT','DIBUR_HAMATCHIL')",
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> =
@@ -365,7 +367,12 @@ impl Db {
     // ── get_book_toc ─────────────────────────────────────────────────────────
     /// Flattened (pre-order) table of contents with line_index pointers for
     /// get_text, plus the book's alternate structures.
-    pub fn get_book_toc(&self, book_id: i64, limit: i64) -> Result<BookToc> {
+    pub fn get_book_toc(
+        &self,
+        book_id: i64,
+        limit: i64,
+        alt_structure_key: Option<&str>,
+    ) -> Result<BookToc> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT te.id, te.parentId, te.level, tt.text, te.hasChildren, l.lineIndex \
@@ -401,10 +408,64 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
+        let selected_alt = if let Some(key) = alt_structure_key {
+            conn.query_row(
+                "SELECT id, key, COALESCE(heTitle, title, key) \
+                   FROM alt_toc_structure WHERE bookId = ?1 AND key = ?2",
+                rusqlite::params![book_id, key],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        AltStructure {
+                            key: r.get(1)?,
+                            title: r.get(2)?,
+                        },
+                    ))
+                },
+            )
+            .optional()?
+        } else {
+            None
+        };
+
+        let (selected_alt_structure, alt_entries, alt_truncated) =
+            if let Some((structure_id, structure)) = selected_alt {
+                let mut stmt = conn.prepare(
+                    "SELECT ae.id, ae.parentId, ae.level, tt.text, ae.hasChildren, l.lineIndex \
+                       FROM alt_toc_entry ae \
+                       JOIN tocText tt ON ae.textId = tt.id \
+                       LEFT JOIN line l ON ae.lineId = l.id \
+                      WHERE ae.structureId = ?1 ORDER BY ae.id LIMIT ?2",
+                )?;
+                let nodes = stmt
+                    .query_map(rusqlite::params![structure_id, limit + 1], |r| {
+                        Ok(TocNode {
+                            id: r.get(0)?,
+                            parent_id: r.get(1)?,
+                            level: r.get(2)?,
+                            text: r.get(3)?,
+                            has_children: r.get::<_, i64>(4)? != 0,
+                            line_index: r.get(5)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let truncated = nodes.len() as i64 > limit;
+                (
+                    Some(structure),
+                    nodes.into_iter().take(limit as usize).collect(),
+                    truncated,
+                )
+            } else {
+                (None, Vec::new(), false)
+            };
+
         Ok(BookToc {
             entries,
             truncated,
             alt_structures,
+            selected_alt_structure,
+            alt_entries,
+            alt_truncated,
         })
     }
 
@@ -609,6 +670,9 @@ pub struct BookToc {
     pub entries: Vec<TocNode>,
     pub truncated: bool,
     pub alt_structures: Vec<AltStructure>,
+    pub selected_alt_structure: Option<AltStructure>,
+    pub alt_entries: Vec<TocNode>,
+    pub alt_truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -651,10 +715,10 @@ fn query_links(
     outgoing: bool,
     limit: i64,
 ) -> Result<Vec<LinkRow>> {
-    let (book_col, line_col) = if outgoing {
-        ("lk.sourceBookId", "sl.lineIndex")
+    let (book_col, line_col, range_side) = if outgoing {
+        ("lk.sourceBookId", "sl.lineIndex", 0)
     } else {
-        ("lk.targetBookId", "tl.lineIndex")
+        ("lk.targetBookId", "tl.lineIndex", 1)
     };
     let mut sql = format!(
         "SELECT ct.name, sb.id, sb.title, sl.lineIndex, sl.heRef, sl.content, \
@@ -665,11 +729,15 @@ fn query_links(
            JOIN line sl ON lk.sourceLineId = sl.id \
            JOIN book tb ON lk.targetBookId = tb.id \
            JOIN line tl ON lk.targetLineId = tl.id \
+           LEFT JOIN link_range lr ON lr.linkId = lk.id AND lr.side = {range_side} \
           WHERE {book_col} = ?"
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(book_id)];
     if let Some(li) = line_index {
-        sql.push_str(&format!(" AND {line_col} = ?"));
+        sql.push_str(&format!(
+            " AND {line_col} <= ? AND COALESCE(lr.endLineIndex, {line_col}) >= ?"
+        ));
+        params.push(Box::new(li));
         params.push(Box::new(li));
     }
     if let Some(ct) = connection_type {
@@ -763,7 +831,43 @@ pub fn strip_html_tags(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_html_tags;
+    use super::{strip_html_tags, Db};
+    use rusqlite::Connection;
+    use std::sync::{Mutex, OnceLock};
+
+    fn fixture_db() -> Db {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE book (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+             CREATE TABLE line (id INTEGER PRIMARY KEY, bookId INTEGER NOT NULL, lineIndex INTEGER NOT NULL, heRef TEXT, content TEXT NOT NULL);
+             CREATE TABLE connection_type (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE link (id INTEGER PRIMARY KEY, sourceBookId INTEGER NOT NULL, targetBookId INTEGER NOT NULL, sourceLineId INTEGER NOT NULL, targetLineId INTEGER NOT NULL, targetLineIndex INTEGER NOT NULL, targetBookOrderIndex INTEGER NOT NULL, connectionTypeId INTEGER NOT NULL, isDeclaredBase INTEGER NOT NULL);
+             CREATE TABLE link_range (linkId INTEGER NOT NULL, side INTEGER NOT NULL, endLineId INTEGER NOT NULL, endLineIndex INTEGER NOT NULL);
+             CREATE TABLE default_commentator (bookId INTEGER NOT NULL, commentatorBookId INTEGER NOT NULL, position INTEGER NOT NULL);
+             CREATE TABLE tocText (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
+             CREATE TABLE tocEntry (id INTEGER PRIMARY KEY, parentId INTEGER, level INTEGER NOT NULL, textId INTEGER NOT NULL, hasChildren INTEGER NOT NULL, lineId INTEGER, bookId INTEGER NOT NULL);
+             CREATE TABLE alt_toc_structure (id INTEGER PRIMARY KEY, bookId INTEGER NOT NULL, key TEXT NOT NULL, title TEXT, heTitle TEXT);
+             CREATE TABLE alt_toc_entry (id INTEGER PRIMARY KEY, structureId INTEGER NOT NULL, parentId INTEGER, textId INTEGER NOT NULL, level INTEGER NOT NULL, lineId INTEGER, isLastChild INTEGER NOT NULL, hasChildren INTEGER NOT NULL);",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO book VALUES (1, 'בסיס'), (2, 'מפרש');
+             INSERT INTO line VALUES (10, 1, 2, 'בסיס א', 'טקסט בסיס'), (11, 1, 3, 'בסיס ב', 'טקסט בסיס'), (12, 1, 4, 'בסיס ג', 'טקסט בסיס'), (20, 2, 100, 'מפרש א', 'טקסט מפרש'), (21, 2, 101, 'מפרש ב', 'טקסט מפרש');
+             INSERT INTO connection_type VALUES (1, 'COMMENTARY');
+             INSERT INTO link VALUES (100, 1, 2, 10, 20, 100, 1, 1, 0);
+             INSERT INTO link_range VALUES (100, 0, 12, 4), (100, 1, 21, 101);
+             INSERT INTO default_commentator VALUES (1, 2, 0);
+             INSERT INTO tocText VALUES (1, 'פרק א'), (2, 'פרשה א');
+             INSERT INTO tocEntry VALUES (1, NULL, 0, 1, 0, 10, 1);
+             INSERT INTO alt_toc_structure VALUES (7, 1, 'Parasha', 'פרשה', 'פרשה');
+             INSERT INTO alt_toc_entry VALUES (8, 7, NULL, 2, 0, 11, 1, 0);",
+        )
+        .unwrap();
+        Db {
+            conn: Mutex::new(conn),
+            ref_index: OnceLock::new(),
+        }
+    }
 
     #[test]
     fn strips_tags_and_decodes_entities() {
@@ -771,5 +875,27 @@ mod tests {
         assert_eq!(strip_html_tags("א&#x27;ב"), "א'ב");
         assert_eq!(strip_html_tags("<h1>פרק</h1> א&nbsp;ב"), "פרק א ב");
         assert_eq!(strip_html_tags("&amp;"), "&");
+    }
+
+    #[test]
+    fn links_and_commentaries_include_lines_inside_a_range() {
+        let db = fixture_db();
+
+        let outgoing = db.get_links(1, Some(3), None, "outgoing", 10).unwrap();
+        assert_eq!(outgoing.len(), 1);
+        let incoming = db.get_links(2, Some(101), None, "incoming", 10).unwrap();
+        assert_eq!(incoming.len(), 1);
+
+        let commentaries = db.get_commentaries(1, 3, 3, None, 10).unwrap();
+        assert_eq!(commentaries.items.len(), 1);
+        assert_eq!(commentaries.items[0].on_line_index, 2);
+    }
+
+    #[test]
+    fn toc_returns_selected_alternate_structure_entries() {
+        let toc = fixture_db().get_book_toc(1, 10, Some("Parasha")).unwrap();
+        assert_eq!(toc.selected_alt_structure.unwrap().key, "Parasha");
+        assert_eq!(toc.alt_entries.len(), 1);
+        assert_eq!(toc.alt_entries[0].line_index, Some(3));
     }
 }

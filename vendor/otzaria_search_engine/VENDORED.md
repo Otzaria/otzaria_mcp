@@ -19,8 +19,28 @@ This directory holds a **vendored copy** of the Rust crate from the
 Copied from `~/.pub-cache/hosted/pub.dev/otzaria_search_engine-0.6.7/rust`
 (only the `rust/` crate is needed; the Flutter plugin scaffolding is omitted).
 
+## Local modifications (not in upstream 0.6.7)
+This copy carries **one** additive, upstream-safe patch — it adds a new method and
+changes nothing existing:
+
+- **`SearchEngine::open_read_only(path) -> Result<Self>`** in
+  `rust/src/api/search_engine.rs`. Unlike the stock `SearchEngine::new`, it opens
+  the index with `Index::open` (never `open_or_create`), acquires **no writer
+  lock**, and writes **no** `otzaria_index_meta.json` sidecar — so the MCP is truly
+  read-only and never mutates the user's index. It also returns a `Result` (schema
+  mismatch → `Err`) instead of panicking. The MCP's `mcp/src/search.rs` calls this
+  instead of `new`; a unit test (`read_only_open_does_not_create_index_metadata`)
+  guards the no-write behavior.
+
+This method cannot live in the `mcp` crate because it needs `SearchEngine`'s private
+fields, hence the in-place patch here.
+
 ## Upgrading
 If a future Otzaria release rebuilds the index with a newer schema, re-vendor the
-matching `otzaria_search_engine` version here and rebuild. Confirm compatibility
-by comparing the crate's `INDEX_SCHEMA_VERSION` / `current_schema()` against the
-index's `otzaria_index_meta.json` and `meta.json`.
+matching `otzaria_search_engine` version here and rebuild. Confirm compatibility by
+comparing the crate's `INDEX_SCHEMA_VERSION` / `current_schema()` against the index's
+`otzaria_index_meta.json` and `meta.json`.
+
+**IMPORTANT:** a plain re-vendor will drop the `open_read_only` patch above and break
+the build (`mcp/src/search.rs` calls it). After re-vendoring, re-apply that method
+(or, if upstream has since added an equivalent read-only open, point `search.rs` at it).

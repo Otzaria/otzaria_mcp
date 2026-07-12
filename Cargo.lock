@@ -1344,6 +1344,7 @@ dependencies = [
  "search_engine",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
