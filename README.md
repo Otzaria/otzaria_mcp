@@ -2,7 +2,7 @@
 
 שרת **MCP** (Model Context Protocol) שחושף את ספריית **אוצריא** ל-AI — לחיפוש, ניווט,
 פענוח הפניות, קישורים ומפרשים — **אופליין לחלוטין וקריאה-בלבד**. בהשראת
-[zayit-mcp](https://github.com/), אך בנוי מעל שני עולמות הנתונים של אוצריא:
+[zayit-mcp](https://github.com/Sivan22/zayit-mcp), אך בנוי מעל שני עולמות הנתונים של אוצריא:
 
 - **`seforim.db`** (SQLite, סכימת v15) — ספרים, שורות, הפניות (heRef), עץ קטגוריות,
   ראשי-תיבות, קישורים (15 סוגים) ומטא-דאטה.
@@ -10,20 +10,40 @@
   אוצריא (`otzaria_search_engine` 0.6.7) עבר **vendoring** ומשמש ישירות, כך שהחיפוש
   נאמן במדויק לזה שבאפליקציה (regex-phrase, ניקוד/טעמים, facets, PDF) — בלי שכתוב.
 
-## דרישות מוקדמות
+## התקנה למשתמש הסופי
 
-- **Rust** (toolchain יציב, `cargo`).
-- מותקן **אוצריא** על אותה מכונה — ה-MCP קורא את הנתונים שלה: `seforim.db`, אינדקס
-  Tantivy, ואופציונלית `lexical.db` (למצב fuzzy).
+יש שני מסלולים. **בשני המקרים** צריך רק שני דברים חוץ מה-MCP:
 
-## בנייה
+1. **אוצריא מותקנת** על אותה מכונה — ה-MCP קורא את נתוניה: `seforim.db`, אינדקס
+   Tantivy, ואופציונלית `lexical.db` (למצב fuzzy). לא צריך את קוד המקור של אוצריא, רק
+   שהנתונים קיימים (למשל תיקיית `otzaria_latest`).
+2. **לקוח MCP** (כמו Claude Desktop) עם רישום ה-MCP ב-config (ראו למטה).
+
+### מסלול א' — בינארי מוכן (מומלץ; **בלי Rust**)
+
+הורידו את הבינארי לפלטפורמה שלכם מעמוד ה-Releases (נבנה אוטומטית ע"י ה-CI: לינוקס
+x86_64/aarch64, macOS Intel/Apple-Silicon, Windows x86_64). לאחר ההורדה:
 
 ```bash
+chmod +x otzaria-mcp-macos-aarch64          # הרשאת הרצה (Linux/macOS)
+xattr -d com.apple.quarantine otzaria-mcp-* 2>/dev/null || true   # macOS: הסרת הסגר Gatekeeper (בינארי לא חתום)
+```
+
+הצביעו על הבינארי ב-config של הלקוח (עם `--data-dir`). **אין צורך ב-Rust, cargo, או בנייה.**
+
+### מסלול ב' — בנייה מהמקור
+
+צריך **Rust** (toolchain יציב, `cargo`) ומהדר C (מגיע עם Xcode CLT / gcc / MSVC — עבור
+ה-SQLite המובנה). ואז:
+
+```bash
+git clone <repo> && cd otzaria_mcp
 cargo build --release      # הבינארי: target/release/otzaria-mcp
 ```
 
 הקומפילציה הראשונה כוללת את tantivy ולוקחת מספר דקות. מנוע החיפוש כלול בריפו תחת
-[`vendor/otzaria_search_engine`](vendor/otzaria_search_engine) — אין צורך ב-repo חיצוני.
+[`vendor/otzaria_search_engine`](vendor/otzaria_search_engine) — אין submodule ואין repo חיצוני,
+`git clone` רגיל מספיק.
 
 ## הרצה (stdio)
 
