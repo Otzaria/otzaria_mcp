@@ -274,9 +274,17 @@ pub fn resolve(
 
     for bid in book_ids.iter().copied().take(60) {
         let title = index.title(bid);
+        // heRefs rarely spell locator words ("פרק", "עמוד" from ע"א …): retry the
+        // heRef match with the canonical key's tokens when they differ.
+        let key_address = key.clone().filter(|k| *k != address);
         let found = if let Some(c) = by_line_ref(conn, caps, bid, key.as_deref())? {
             Some(c)
         } else if let Some(c) = by_heref(conn, index, bid, &address)? {
+            Some(c)
+        } else if let Some(c) = match &key_address {
+            Some(k) => by_heref(conn, index, bid, k)?,
+            None => None,
+        } {
             Some(c)
         } else if !address.is_empty() {
             match by_toc(conn, caps, bid, &address)? {
@@ -325,7 +333,10 @@ fn by_line_ref(conn: &Connection, caps: &Caps, book_id: i64, key: Option<&str>) 
     }
     for (k, kind) in [
         (key.to_string(), "exact"),
-        (format!("{} {key}", refkey::PARTIAL_REF_KEY_MARKER), "partial"),
+        (
+            format!("{} {key}", refkey::PARTIAL_REF_KEY_MARKER),
+            "partial",
+        ),
     ] {
         let row: Option<(i64, Option<String>)> = conn
             .query_row(
@@ -385,7 +396,11 @@ fn by_toc(conn: &Connection, caps: &Caps, book_id: i64, address: &str) -> Result
     let mut stmt = conn.prepare(&sql)?;
     let mut best: Found = None;
     for row in stmt.query_map([book_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
     })? {
         let (text, li, he_ref) = row?;
         let Some(k) = refkey::build_ref_key(&crate::text::strip_html_tags(&text)) else {
@@ -516,11 +531,17 @@ mod tests {
         let index = RefIndex::build(&conn);
 
         let c = super::resolve(&conn, &caps(), &index, "ברכות ב., א", 3).unwrap();
-        assert_eq!((c[0].book_id, c[0].line_index, c[0].match_kind), (103, 2, "exact"));
+        assert_eq!(
+            (c[0].book_id, c[0].line_index, c[0].match_kind),
+            (103, 2, "exact")
+        );
 
         // amud-level reference → the first line under it (heRef prefix)
         let c = super::resolve(&conn, &caps(), &index, "ברכות ב:", 3).unwrap();
-        assert_eq!((c[0].book_id, c[0].line_index, c[0].match_kind), (103, 17, "prefix"));
+        assert_eq!(
+            (c[0].book_id, c[0].line_index, c[0].match_kind),
+            (103, 17, "prefix")
+        );
 
         // acronym/alias book name
         let c = super::resolve(&conn, &caps(), &index, "ספר בראשית א א", 3).unwrap();
@@ -532,7 +553,10 @@ mod tests {
 
         // dibbur hamatchil
         let c = super::resolve(&conn, &caps(), &index, "רש\"י על ברכות מאימתי", 3).unwrap();
-        assert_eq!((c[0].book_id, c[0].line_index, c[0].match_kind), (9, 5, "dibur_hamatchil"));
+        assert_eq!(
+            (c[0].book_id, c[0].line_index, c[0].match_kind),
+            (9, 5, "dibur_hamatchil")
+        );
     }
 
     #[test]
@@ -553,6 +577,10 @@ mod tests {
         let m = index.names_matching(&normalize_ref("ברכות"), 10);
         assert!(m[0].2, "exact first");
         assert_eq!(m[0].1, vec![103]);
-        assert!(m.iter().any(|(n, _, exact)| !exact && n.starts_with("ברכות")) || m.len() == 1);
+        assert!(
+            m.iter()
+                .any(|(n, _, exact)| !exact && n.starts_with("ברכות"))
+                || m.len() == 1
+        );
     }
 }

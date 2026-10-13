@@ -11,3 +11,6 @@ pub mod reload;
 pub mod search;
 pub mod server;
 pub mod text;
+
+#[cfg(test)]
+mod fixture_tests;

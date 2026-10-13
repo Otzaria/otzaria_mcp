@@ -22,6 +22,9 @@ use crate::text::{self, LineCodec};
 
 pub use crate::text::strip_html_tags;
 
+/// A decoded line: (lineIndex, line.id, heRef, html).
+pub type LineRow = (i64, i64, Option<String>, String);
+
 /// The connection plus the codec for its compressed rows (one per connection).
 pub struct Inner {
     pub conn: Connection,
@@ -284,7 +287,7 @@ impl Db {
         book_id: i64,
         start: i64,
         end: i64,
-    ) -> Result<Vec<(i64, i64, Option<String>, String)>> {
+    ) -> Result<Vec<LineRow>> {
         let sql = format!(
             "SELECT l.lineIndex, l.id, l.heRef, {} FROM line l {} \
               WHERE l.bookId = ?1 AND l.lineIndex BETWEEN ?2 AND ?3 ORDER BY l.lineIndex",
@@ -306,7 +309,8 @@ impl Db {
             .collect())
     }
 
-    /// Era of every book with a generation (cached).
+    /// Era of every book with a generation (cached). Takes the connection lock on first
+    /// use, so never call it (or [`Self::era_of`]) while holding [`Self::lock`].
     pub fn eras(&self) -> &HashMap<i64, Era> {
         self.eras.get_or_init(|| {
             let mut map: HashMap<i64, Era> = HashMap::new();
@@ -360,11 +364,11 @@ impl Db {
                 } else {
                     key
                 };
-                inner.conn.query_row(
-                    "SELECT value FROM db_meta WHERE key = ?1",
-                    [legacy],
-                    |r| r.get::<_, String>(0),
-                )
+                inner
+                    .conn
+                    .query_row("SELECT value FROM db_meta WHERE key = ?1", [legacy], |r| {
+                        r.get::<_, String>(0)
+                    })
             })
             .ok()
             .and_then(|s| s.trim().parse::<i64>().ok())
@@ -374,7 +378,10 @@ impl Db {
         let inner = self.lock();
         let count = |sql: &str| -> i64 { inner.conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
         let mut connection_types = Vec::new();
-        if let Ok(mut stmt) = inner.conn.prepare("SELECT name FROM connection_type ORDER BY id") {
+        if let Ok(mut stmt) = inner
+            .conn
+            .prepare("SELECT name FROM connection_type ORDER BY id")
+        {
             if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
                 connection_types = rows.flatten().collect();
             }
@@ -400,7 +407,8 @@ impl Db {
         // Fill snippets with the decoded text of each candidate line.
         for c in cands.iter_mut() {
             if c.snippet.is_empty() {
-                let lines = self.lines_in_range(&mut inner, c.book_id, c.line_index, c.line_index)?;
+                let lines =
+                    self.lines_in_range(&mut inner, c.book_id, c.line_index, c.line_index)?;
                 if let Some((_, _, _, html)) = lines.first() {
                     c.snippet = text::snippet(html, 160);
                 }
@@ -507,7 +515,14 @@ impl Db {
                 }
             }
         }
-        out.sort_by_key(|m| (m.match_kind != "exact", !m.is_base_book, index.order(m.book_id), m.book_id));
+        out.sort_by_key(|m| {
+            (
+                m.match_kind != "exact",
+                !m.is_base_book,
+                index.order(m.book_id),
+                m.book_id,
+            )
+        });
         out.truncate(limit as usize);
         Ok(out)
     }
@@ -546,7 +561,9 @@ impl Db {
             ),
             Some(v) => {
                 if !(self.caps.book_versions && self.caps.version_line) {
-                    anyhow::bail!("this seforim.db has no text versions (book_version/version_line)");
+                    anyhow::bail!(
+                        "this seforim.db has no text versions (book_version/version_line)"
+                    );
                 }
                 let found: Option<(i64, String, Option<String>)> = inner
                     .conn
@@ -558,7 +575,9 @@ impl Db {
                     )
                     .optional()?;
                 let Some((vid, title, he_title)) = found else {
-                    anyhow::bail!("book {book_id} has no version titled {v:?} (see get_book_info.versions)");
+                    anyhow::bail!(
+                        "book {book_id} has no version titled {v:?} (see get_book_info.versions)"
+                    );
                 };
                 // As the app: structural lines (heRef NULL — headings) come from the base
                 // text; a content line takes the edition's text, and a segment missing from
@@ -657,7 +676,8 @@ impl Db {
             inner
                 .conn
                 .query_row(&sql, [book_id], |r| {
-                    let flag = |i: usize| -> rusqlite::Result<bool> { Ok(r.get::<_, i64>(i)? != 0) };
+                    let flag =
+                        |i: usize| -> rusqlite::Result<bool> { Ok(r.get::<_, i64>(i)? != 0) };
                     let opt_flag = |i: usize| -> rusqlite::Result<Option<bool>> {
                         Ok(r.get::<_, Option<i64>>(i)?.map(|v| v != 0))
                     };
@@ -744,7 +764,8 @@ impl Db {
             "SELECT t.name FROM book_topic bt JOIN topic t ON bt.topicId = t.id WHERE bt.bookId = ?1",
         )
         .unwrap_or_default();
-        info.acronyms = strings("SELECT term FROM book_acronym WHERE bookId = ?1 ORDER BY term LIMIT 60")?;
+        info.acronyms =
+            strings("SELECT term FROM book_acronym WHERE bookId = ?1 ORDER BY term LIMIT 60")?;
         if self.caps.pub_dates {
             info.pub_dates = strings(
                 "SELECT d.date FROM book_pub_date bd JOIN pub_date d ON d.id = bd.pubDateId WHERE bd.bookId = ?1 ORDER BY d.date",
@@ -844,7 +865,10 @@ impl Db {
         }
         Ok(Some(format!(
             "/{}",
-            path.iter().map(|c| c.title.as_str()).collect::<Vec<_>>().join("/")
+            path.iter()
+                .map(|c| c.title.as_str())
+                .collect::<Vec<_>>()
+                .join("/")
         )))
     }
 
@@ -945,7 +969,10 @@ impl Db {
                           WHERE ae.structureId = ?1 {parent_filter} ORDER BY ae.id LIMIT ?2"
                     ))?;
                     let nodes = stmt
-                        .query_map(rusqlite::params![structure_id, limit + 1, parent_id], toc_node)?
+                        .query_map(
+                            rusqlite::params![structure_id, limit + 1, parent_id],
+                            toc_node,
+                        )?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
                     alt_truncated = nodes.len() as i64 > limit;
                     alt_entries = nodes.into_iter().take(limit as usize).collect();
@@ -1098,7 +1125,9 @@ impl Db {
                 "SELECT id, title FROM category WHERE (parentId = ?1 OR (?1 IS NULL AND parentId IS NULL))",
             )?;
             let children = stmt
-                .query_map([parent], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .query_map([parent], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             match children.into_iter().find(|(_, t)| norm(t) == part) {
                 Some((id, _)) => parent = Some(id),

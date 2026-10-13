@@ -146,7 +146,8 @@ pub struct FullTextSearchParams {
     /// Max results to return (default 20, capped at 100).
     #[serde(default)]
     pub limit: Option<u32>,
-    /// Pagination offset (default 0). With grouping, offset/limit count groups.
+    /// Pagination offset (default 0, at most 10000). With grouping, offset/limit count
+    /// groups.
     #[serde(default)]
     pub offset: Option<u32>,
     /// Result order: "catalogue" (default, library order), "relevance" or "generation"
@@ -361,7 +362,11 @@ fn facet_segment(s: &str) -> String {
 }
 
 /// Turn the user-facing filters into engine facet paths.
-fn build_facets(db: &Db, f: Option<SearchFilterParams>, legacy: Option<String>) -> anyhow::Result<Vec<String>> {
+fn build_facets(
+    db: &Db,
+    f: Option<SearchFilterParams>,
+    legacy: Option<String>,
+) -> anyhow::Result<Vec<String>> {
     let f = f.unwrap_or_default();
     let mut facets: Vec<String> = f.facets.unwrap_or_default();
     facets.extend(legacy);
@@ -396,7 +401,13 @@ fn build_facets(db: &Db, f: Option<SearchFilterParams>, legacy: Option<String>) 
     }
     Ok(facets
         .into_iter()
-        .map(|p| if p.starts_with('/') { p } else { format!("/{p}") })
+        .map(|p| {
+            if p.starts_with('/') {
+                p
+            } else {
+                format!("/{p}")
+            }
+        })
         .collect())
 }
 
@@ -428,7 +439,9 @@ impl OtzariaServer {
         let db = snap.db.clone();
         let stats = run_blocking(move || db.library_stats()).await?;
         let index = match &snap.search {
-            Some(s) => json!({ "available": true, "info": s.info, "line_source": search::line_source_state() }),
+            Some(s) => {
+                json!({ "available": true, "info": s.info, "line_source": search::line_source_state() })
+            }
             None => json!({ "available": false, "reason": snap.search_error }),
         };
         self.respond(
@@ -559,7 +572,7 @@ impl OtzariaServer {
         let mode = Mode::parse(p.mode.as_deref().unwrap_or("advanced")).map_err(invalid)?;
         let mut req = SearchRequest::new(query, mode);
         req.limit = p.limit.unwrap_or(20).clamp(1, 100);
-        req.offset = p.offset.unwrap_or(0);
+        req.offset = search_offset(p.offset)?;
         req.order = p.order.unwrap_or_else(|| "catalogue".to_string());
         req.distance = p.distance;
         req.options = word_options(p.options);
@@ -651,6 +664,8 @@ impl OtzariaServer {
                         },
                     };
                     let mut counts = search.facet_counts(&req, &prefix)?;
+                    // The dimension roots live beside the category tree under "/".
+                    counts.retain(|c| !matches!(c.path.as_str(), "/base" | "/era" | "/author"));
                     counts.sort_by(|a, b| b.count.cmp(&a.count).then(a.path.cmp(&b.path)));
                     let total = counts.len();
                     let rows: Vec<serde_json::Value> = counts
@@ -941,9 +956,36 @@ fn required_text(value: String, field: &str) -> Result<String, ErrorData> {
     Ok(value)
 }
 
+/// Deepest hit a full_text_search page may start at. The engine keeps offset + limit hits
+/// per index segment before it skips the offset, so an unbounded offset (say 4e9) makes
+/// it allocate hundreds of GB and aborts the server.
+const MAX_SEARCH_OFFSET: u32 = 10_000;
+
+fn search_offset(offset: Option<u32>) -> Result<u32, ErrorData> {
+    let offset = offset.unwrap_or(0);
+    if offset > MAX_SEARCH_OFFSET {
+        return Err(invalid(format!(
+            "offset must be at most {MAX_SEARCH_OFFSET}; narrow the query with filters \
+             (search_facet_counts shows where the hits are)"
+        )));
+    }
+    Ok(offset)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{facet_segment, required_text};
+    use super::{facet_segment, required_text, search_offset, MAX_SEARCH_OFFSET};
+
+    #[test]
+    fn search_offset_is_bounded() {
+        assert_eq!(search_offset(None).unwrap(), 0);
+        assert_eq!(
+            search_offset(Some(MAX_SEARCH_OFFSET)).unwrap(),
+            MAX_SEARCH_OFFSET
+        );
+        assert!(search_offset(Some(MAX_SEARCH_OFFSET + 1)).is_err());
+        assert!(search_offset(Some(u32::MAX)).is_err());
+    }
 
     #[test]
     fn rejects_blank_required_text() {

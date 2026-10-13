@@ -155,8 +155,9 @@ fn cut_trailing_range(s: &str) -> &str {
             l -= 1;
         }
         let left_ok = (0..l).any(|start| {
-            let boundary =
-                start == 0 || matches!(chars[start - 1], ',' | '.' | ':') || chars[start - 1].is_whitespace();
+            let boundary = start == 0
+                || matches!(chars[start - 1], ',' | '.' | ':')
+                || chars[start - 1].is_whitespace();
             boundary && range_component(&chars, start) == Some(l - start)
         });
         if left_ok && d > 0 {
@@ -177,7 +178,10 @@ pub fn ref_key_tokens(reference: &str) -> Vec<String> {
         .chars()
         .filter(|&c| !is_quote(c))
         .map(|c| {
-            if c.is_ascii_alphanumeric() || ('\u{0590}'..='\u{05FF}').contains(&c) || c.is_whitespace() {
+            if c.is_ascii_alphanumeric()
+                || ('\u{0590}'..='\u{05FF}').contains(&c)
+                || c.is_whitespace()
+            {
                 c
             } else {
                 ' '
@@ -235,7 +239,10 @@ pub fn expand_query_amud_marks(query: &str) -> String {
     let mut out: Vec<String> = Vec::with_capacity(words.len());
     for (i, w) in words.iter().enumerate() {
         let chars: Vec<char> = w.chars().collect();
-        let is_amud = chars.len() == 3 && chars[0] == 'ע' && is_quote(chars[1]) && matches!(chars[2], 'א' | 'ב');
+        let is_amud = chars.len() == 3
+            && chars[0] == 'ע'
+            && is_quote(chars[1])
+            && matches!(chars[2], 'א' | 'ב');
         if is_amud && i > 0 {
             let prev: String = words[i - 1].chars().filter(|&c| !is_quote(c)).collect();
             if is_hebrew_numeral(&prev) {

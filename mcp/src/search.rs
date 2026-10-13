@@ -99,7 +99,9 @@ fn parse_grouping(s: &str) -> Result<Option<ResultGrouping>> {
         "none" | "" => Ok(None),
         "same_section" => Ok(Some(ResultGrouping::SameSection)),
         "identical_text" => Ok(Some(ResultGrouping::IdenticalText)),
-        other => bail!("unknown grouping '{other}' (expected: none | same_section | identical_text)"),
+        other => {
+            bail!("unknown grouping '{other}' (expected: none | same_section | identical_text)")
+        }
     }
 }
 
@@ -229,7 +231,10 @@ impl SearchRequest {
     fn effective_mode(&self) -> Mode {
         if self.mode == Mode::Exact
             && (self.options.any()
-                || self.negative_query.as_deref().is_some_and(|q| !q.trim().is_empty())
+                || self
+                    .negative_query
+                    .as_deref()
+                    .is_some_and(|q| !q.trim().is_empty())
                 || self.scope != "word_distance"
                 || self.word_match != "all"
                 || self.distance.is_some_and(|d| d > 0))
@@ -312,9 +317,10 @@ impl Search {
             let p: PathBuf = dictionaries_dir?.join(name);
             p.is_file().then(|| p.to_string_lossy().into_owned())
         };
-        let translation = dict("dictionary.json")
-            .is_some_and(|p| engine.set_translation_dictionary_path(p));
-        let acronyms = dict("Acronyms.json").is_some_and(|p| engine.set_acronyms_dictionary_path(p));
+        let translation =
+            dict("dictionary.json").is_some_and(|p| engine.set_translation_dictionary_path(p));
+        let acronyms =
+            dict("Acronyms.json").is_some_and(|p| engine.set_acronyms_dictionary_path(p));
 
         let info = IndexInfo {
             path: index_str,
@@ -398,7 +404,11 @@ impl Search {
         }
         .map_err(|e| anyhow::anyhow!("tantivy search failed: {e:#}"))?;
 
-        let hits: Vec<SearchHit> = page.results.into_iter().map(SearchHit::from_result).collect();
+        let hits: Vec<SearchHit> = page
+            .results
+            .into_iter()
+            .map(SearchHit::from_result)
+            .collect();
         Ok(SearchResponse {
             total: page.total_count,
             group_count: page.group_count,
@@ -577,11 +587,20 @@ pub enum SearchHitSource {
     Pdf,
 }
 
-fn classify(file_path: &str, is_pdf: bool, segment: u64) -> (SearchHitSource, Option<i64>, Option<i64>, Option<i64>) {
+fn classify(
+    file_path: &str,
+    is_pdf: bool,
+    segment: u64,
+) -> (SearchHitSource, Option<i64>, Option<i64>, Option<i64>) {
     if is_pdf {
         (SearchHitSource::Pdf, None, None, Some(segment as i64 + 1))
     } else if let Some(book_id) = parse_official_book_id(file_path) {
-        (SearchHitSource::Official, Some(book_id), Some(segment as i64), None)
+        (
+            SearchHitSource::Official,
+            Some(book_id),
+            Some(segment as i64),
+            None,
+        )
     } else if file_path.starts_with("uid:") {
         (SearchHitSource::User, None, None, None)
     } else {
@@ -678,7 +697,10 @@ mod tests {
         assert!(parse_order("generation").is_ok());
         assert!(parse_scope("same_section").is_ok());
         assert!(parse_grouping("identical_text").unwrap().is_some());
-        assert!(matches!(parse_word_match("at_least:2").unwrap(), (Some(WordMatchMode::AtLeast), Some(2))));
+        assert!(matches!(
+            parse_word_match("at_least:2").unwrap(),
+            (Some(WordMatchMode::AtLeast), Some(2))
+        ));
         assert!(parse_word_match("at_least:x").is_err());
     }
 
@@ -708,7 +730,10 @@ mod tests {
         assert_eq!(hit.source, SearchHitSource::User);
         assert_eq!(hit.book_id, None);
         let hit = SearchHit::from_result(result("id:5", false, 7));
-        assert_eq!((hit.source, hit.book_id, hit.line_index), (SearchHitSource::Official, Some(5), Some(7)));
+        assert_eq!(
+            (hit.source, hit.book_id, hit.line_index),
+            (SearchHitSource::Official, Some(5), Some(7))
+        );
         assert_eq!(hit.snippet, "«א»ב");
         let hit = SearchHit::from_result(result("/x.pdf", true, 0));
         assert_eq!((hit.source, hit.page), (SearchHitSource::Pdf, Some(1)));

@@ -4,13 +4,16 @@
 //!   1. explicit flags:  --db / --index / --lexical-db / --dictionaries-dir
 //!   2. env vars:        OTZARIA_DB / OTZARIA_INDEX / OTZARIA_LEXICAL_DB / OTZARIA_DICTIONARIES_DIR
 //!   3. --data-dir / OTZARIA_DATA_DIR  (two supported layouts, see below)
-//!   4. per-OS defaults, per-user install first, then system-wide install:
-//!        Windows  %APPDATA%\otzaria            then %ProgramData%\otzaria
-//!        macOS    ~/Library/Application Support/otzaria   then /Library/Application Support/otzaria
-//!        Linux    $XDG_DATA_HOME/otzaria (~/.local/share/otzaria)   then /var/lib/otzaria
-//!      with the library at `<root>/books/seforim.db` and the index at `<root>/index`
-//!      (db and index resolved INDEPENDENTLY — the app keeps the index next to the
-//!      library folder, or under the data root for older installs).
+//!   4. per-OS defaults (see below).
+//!
+//! Per-OS data roots, per-user install first, then system-wide install:
+//! - Windows: `%APPDATA%\otzaria`, then `%ProgramData%\otzaria`
+//! - macOS: `~/Library/Application Support/otzaria`, then `/Library/Application Support/otzaria`
+//! - Linux: `$XDG_DATA_HOME/otzaria` (`~/.local/share/otzaria`), then `/var/lib/otzaria`
+//!
+//! Inside a root the library is `books/seforim.db` and the index `index/` (db and index
+//! are resolved INDEPENDENTLY — the app keeps the index next to the library folder, or
+//! under the data root for older installs).
 //!
 //! `--data-dir <root>` supports two layouts, auto-detected by what exists:
 //!   * download root:      `<root>/otzaria/seforim.db` + `<root>/index`
@@ -153,9 +156,9 @@ impl PathArgs {
             for r in &roots {
                 candidates.push(r.join("dictionaries"));
             }
-            candidates.into_iter().find(|p| {
-                p.join("dictionary.json").is_file() || p.join("Acronyms.json").is_file()
-            })
+            candidates
+                .into_iter()
+                .find(|p| p.join("dictionary.json").is_file() || p.join("Acronyms.json").is_file())
         });
 
         Ok(Paths {
@@ -217,7 +220,9 @@ fn os_data_roots() -> Vec<PathBuf> {
     {
         if let Some(d) = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
+            })
         {
             roots.push(d.join("otzaria"));
         }
@@ -250,8 +255,14 @@ mod tests {
         .unwrap();
         assert_eq!(paths.db, root.join("otzaria").join("seforim.db"));
         assert_eq!(paths.index.as_deref(), Some(root.join("index").as_path()));
-        assert_eq!(paths.lexical_db.as_deref(), Some(root.join("otzaria").join("lexical.db").as_path()));
-        assert_eq!(paths.dictionaries_dir.as_deref(), Some(root.join("dictionaries").as_path()));
+        assert_eq!(
+            paths.lexical_db.as_deref(),
+            Some(root.join("otzaria").join("lexical.db").as_path())
+        );
+        assert_eq!(
+            paths.dictionaries_dir.as_deref(),
+            Some(root.join("dictionaries").as_path())
+        );
     }
 
     #[test]

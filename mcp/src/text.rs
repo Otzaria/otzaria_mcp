@@ -110,7 +110,10 @@ impl ZstdCodec {
             .dctx
             .decompress_using_ddict(&mut out, frame, ddict)
             .map_err(|code| {
-                anyhow::anyhow!("zstd decode failed: {}", zstd::zstd_safe::get_error_name(code))
+                anyhow::anyhow!(
+                    "zstd decode failed: {}",
+                    zstd::zstd_safe::get_error_name(code)
+                )
             })?;
         if written != size {
             anyhow::bail!("zstd frame declared {size} bytes and produced {written}");

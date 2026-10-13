@@ -11,7 +11,7 @@
 //! exactly the way the app indexes official books (`TextStorage::LibraryDb`: line text is
 //! read back from seforim.db through the engine's line source at search time).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use otzaria_mcp::db::{Db, Era};
@@ -48,10 +48,16 @@ fn open_db() -> Option<Db> {
 fn v32_schema_and_capabilities() {
     let Some(db) = open_db() else { return };
     let version = db.schema_version().expect("schema_meta.db_version");
-    assert!(version >= 32, "expected a library of db_version >= 32, got {version}");
+    assert!(
+        version >= 32,
+        "expected a library of db_version >= 32, got {version}"
+    );
     assert!(db.db_schema_version().unwrap_or(0) >= 6);
     let c = &db.caps;
-    assert!(c.split_content && c.compressed, "schema 6 keeps zstd text in line_content");
+    assert!(
+        c.split_content && c.compressed,
+        "schema 6 keeps zstd text in line_content"
+    );
     assert!(c.line_ref && c.line_dh && c.link_anchor && c.link_coverage && c.link_suppressed_side);
     let stats = db.library_stats().unwrap();
     assert!(stats.books > 7000, "{stats:?}");
@@ -64,14 +70,26 @@ fn get_text_decodes_compressed_lines_and_versions() {
     let t = db.get_text(1, 2, 2, true, None).unwrap().expect("Genesis");
     assert_eq!(t.lines[0].line_index, 2);
     assert_eq!(t.lines[0].he_ref.as_deref(), Some("בראשית, א, א"));
-    assert!(t.lines[0].content.contains("בְּרֵאשִׁ֖ית") || t.lines[0].content.contains("בראשית"), "{:?}", t.lines[0].content);
+    let plain = otzaria_mcp::refs::normalize_ref(&t.lines[0].content);
+    assert!(
+        plain.contains("בראשית ברא אלהים"),
+        "{:?}",
+        t.lines[0].content
+    );
     assert_eq!(t.next_line_index, Some(4));
     assert!(t.total_lines > 1500);
 
     // An alternate edition stored in version_line.
     let info = db.get_book_info(1).unwrap().unwrap();
-    let v = info.versions.iter().find(|v| v.has_text).expect("Genesis has text versions");
-    let vt = db.get_text(1, 2, 1, true, Some(&v.version_title)).unwrap().unwrap();
+    let v = info
+        .versions
+        .iter()
+        .find(|v| v.has_text)
+        .expect("Genesis has text versions");
+    let vt = db
+        .get_text(1, 2, 1, true, Some(&v.version_title))
+        .unwrap()
+        .unwrap();
     assert!(!vt.lines[0].content.is_empty());
     assert!(db.get_text(1, 2, 1, true, Some("no such version")).is_err());
 }
@@ -84,7 +102,10 @@ fn book_info_has_v32_metadata() {
     assert_eq!(rashi.era, Era::Rishonim);
     assert!(rashi.base_texts.iter().any(|b| b.book_id == 1) || !rashi.authors.is_empty());
     let genesis = db.get_book_info(1).unwrap().unwrap();
-    assert_eq!(genesis.category_path.first().map(|c| c.title.as_str()), Some("תנ״ך"));
+    assert_eq!(
+        genesis.category_path.first().map(|c| c.title.as_str()),
+        Some("תנ״ך")
+    );
     assert!(!genesis.default_commentators.is_empty());
     assert!(!genesis.pub_dates.is_empty() || !genesis.versions.is_empty());
     assert!(genesis.alt_structures.iter().any(|a| a.key == "Parasha"));
@@ -115,8 +136,15 @@ fn resolve_ref_golden_corpus_v32() {
         let cands = db.resolve_ref(reference, 5).expect("resolve_ref");
         assert!(!cands.is_empty(), "no candidate for {reference:?}");
         let top = &cands[0];
-        assert_ne!(top.match_kind, "fallback", "{reference:?} only matched via LIKE fallback");
-        assert_eq!((top.book_id, top.line_index), (*book, *line), "{reference:?} → {top:?}");
+        assert_ne!(
+            top.match_kind, "fallback",
+            "{reference:?} only matched via LIKE fallback"
+        );
+        assert_eq!(
+            (top.book_id, top.line_index),
+            (*book, *line),
+            "{reference:?} → {top:?}"
+        );
         assert!(!top.snippet.is_empty(), "{reference:?} has no snippet");
     }
 }
@@ -135,48 +163,97 @@ fn links_commentaries_and_anchors_follow_the_app_model() {
     let Some(db) = open_db() else { return };
     // Genesis 1:1 — Rashi (3695) is a text-dependent commentary stored base → dependant.
     let c = db.get_commentaries(1, 2, 2, None, 200, 3).unwrap();
-    assert!(c.items.iter().any(|i| i.commentator_book_id == 3695 && !i.text.is_empty()));
+    assert!(c
+        .items
+        .iter()
+        .any(|i| i.commentator_book_id == 3695 && !i.text.is_empty()));
     assert!(!c.default_commentators.is_empty());
 
     let list = db.list_commentators(1, Some((2, 2))).unwrap();
     assert!(list.commentator_count > 5, "{}", list.commentator_count);
     let orders: Vec<u8> = list.eras.iter().map(|g| g.era_order).collect();
-    assert!(orders.windows(2).all(|w| w[0] < w[1]), "eras ordered: {orders:?}");
-    assert!(list.eras.iter().any(|g| g.commentators.iter().any(|c| c.book_id == 3695)));
+    assert!(
+        orders.windows(2).all(|w| w[0] < w[1]),
+        "eras ordered: {orders:?}"
+    );
+    assert!(list
+        .eras
+        .iter()
+        .any(|g| g.commentators.iter().any(|c| c.book_id == 3695)));
 
-    let out = db.get_links(1, Some((2, 2)), None, None, "outgoing", 200, 0).unwrap();
-    assert!(out.iter().any(|l| l.connection_type == "COMMENTARY" && l.book_id == 3695));
-    assert!(out.iter().all(|l| l.direction == "outgoing" && l.at_line_index == 2));
+    let out = db
+        .get_links(1, Some((2, 2)), None, None, "outgoing", 200, 0)
+        .unwrap();
+    assert!(out
+        .iter()
+        .any(|l| l.connection_type == "COMMENTARY" && l.book_id == 3695));
+    assert!(out
+        .iter()
+        .all(|l| l.direction == "outgoing" && l.at_line_index == 2));
 
     // From Rashi's side the same link is the virtual SOURCE pointing back at Genesis.
     let rashi_line = out.iter().find(|l| l.book_id == 3695).unwrap().line_index;
     let back = db
-        .get_links(3695, Some((rashi_line, rashi_line)), None, Some(&[1]), "incoming", 50, 0)
+        .get_links(
+            3695,
+            Some((rashi_line, rashi_line)),
+            None,
+            Some(&[1]),
+            "incoming",
+            50,
+            0,
+        )
         .unwrap();
-    assert!(back.iter().any(|l| l.display_type == "SOURCE" && l.book_id == 1 && l.line_index == 2));
+    assert!(back
+        .iter()
+        .any(|l| l.display_type == "SOURCE" && l.book_id == 1 && l.line_index == 2));
 
     // Type filter, incl. the automatic LINKER links.
     let types = vec!["COMMENTARY".to_string()];
-    let only = db.get_links(1, Some((2, 2)), Some(&types), None, "outgoing", 50, 0).unwrap();
+    let only = db
+        .get_links(1, Some((2, 2)), Some(&types), None, "outgoing", 50, 0)
+        .unwrap();
     assert!(only.iter().all(|l| l.connection_type == "COMMENTARY"));
+    // LINKER links are stored from the citing book; asked for explicitly they are also
+    // returned from the cited side (Genesis 1:1 is cited thousands of times).
+    let linker = vec!["LINKER".to_string()];
+    let cited = db
+        .get_links(1, Some((2, 2)), Some(&linker), None, "incoming", 20, 0)
+        .unwrap();
+    assert_eq!(cited.len(), 20);
+    assert!(cited
+        .iter()
+        .all(|l| l.connection_type == "LINKER" && l.direction == "incoming"));
 
     // Shulchan Aruch OC 1:1 has printed commentary letters as point anchors.
     let a = db.get_line_anchors(382, 4).unwrap().expect("line exists");
-    assert!(a.anchors.iter().any(|x| x.label.as_deref() == Some("א") && x.context.is_some()));
-    assert!(a.anchors.iter().all(|x| x.char_start as usize <= a.visible_length));
+    assert!(a
+        .anchors
+        .iter()
+        .any(|x| x.label.as_deref() == Some("א") && x.context.is_some()));
+    assert!(a
+        .anchors
+        .iter()
+        .all(|x| x.char_start as usize <= a.visible_length));
 }
 
 #[test]
 fn categories_and_toc() {
     let Some(db) = open_db() else { return };
     let roots = db.browse_categories(None, None, 10).unwrap();
-    assert!(roots.subcategories.iter().any(|c| c.title == "תנ״ך" && c.book_count > 20));
+    assert!(roots
+        .subcategories
+        .iter()
+        .any(|c| c.title == "תנ״ך" && c.book_count > 20));
     let torah = db.browse_categories(None, Some("תנ\"ך/תורה"), 10).unwrap();
     assert!(torah.books.iter().any(|b| b.book_id == 1));
     assert_eq!(db.category_facet(2).unwrap().as_deref(), Some("/תנ״ך/תורה"));
 
     let toc = db.get_book_toc(1, 10, Some("Parasha"), None).unwrap();
-    assert!(toc.alt_entries.iter().any(|e| e.text == "נח" && e.line_index == Some(153)));
+    assert!(toc
+        .alt_entries
+        .iter()
+        .any(|e| e.text == "נח" && e.line_index == Some(153)));
 }
 
 // ── full-text search over a tiny index built from v32 books ─────────────────
@@ -185,13 +262,14 @@ const INDEXED_BOOKS: &[i64] = &[1, 103, 382];
 
 /// Build (once per test process) a tiny schema-5 index the way the app indexes official
 /// books, or use `OTZARIA_TEST_INDEX`. Returns the index dir.
-fn test_index(db_path: &PathBuf, db: &Db) -> PathBuf {
+fn test_index(db_path: &Path, db: &Db) -> PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         if let Some(p) = std::env::var_os("OTZARIA_TEST_INDEX") {
             return PathBuf::from(p);
         }
-        let dir = std::env::temp_dir().join(format!("otzaria-mcp-test-index-{}", std::process::id()));
+        // Under cargo's per-target scratch dir, rebuilt on every run (never the app's index).
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("v32-test-index");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         configure_line_source(db_path.to_string_lossy().into_owned()).unwrap();
@@ -202,8 +280,16 @@ fn test_index(db_path: &PathBuf, db: &Db) -> PathBuf {
                 .get_text(book_id, 0, info.total_lines, false, None)
                 .unwrap()
                 .unwrap();
-            let text = t.lines.iter().map(|l| l.content.as_str()).collect::<Vec<_>>().join("\n");
-            let topics = format!("{}/id:{book_id}", db.category_facet(info.category_id).unwrap().unwrap());
+            let text = t
+                .lines
+                .iter()
+                .map(|l| l.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let topics = format!(
+                "{}/id:{book_id}",
+                db.category_facet(info.category_id).unwrap().unwrap()
+            );
             let mut extra = vec![format!("/era/{}", info.era.hebrew_name())];
             if info.is_base_book {
                 extra.push("/base".into());
@@ -244,16 +330,26 @@ fn full_text_search_maps_hits_to_lines_and_reads_text_from_the_db() {
         eprintln!("skip: no OTZARIA_TEST_DB");
         return;
     };
-    assert!(search.info.found_schema_version.unwrap_or(0) >= 5 || search.info.status.contains("compatible"));
+    assert!(
+        search.info.found_schema_version.unwrap_or(0) >= 5
+            || search.info.status.contains("compatible")
+    );
 
     let mut req = SearchRequest::new("בראשית ברא אלהים", Mode::Exact);
     req.limit = 5;
     let resp = search.search(&req).unwrap();
     assert!(resp.total >= 1, "{resp:?}");
-    let hit = resp.hits.iter().find(|h| h.book_id == Some(1)).expect("Genesis hit");
+    let hit = resp
+        .hits
+        .iter()
+        .find(|h| h.book_id == Some(1))
+        .expect("Genesis hit");
     assert_eq!(hit.source, SearchHitSource::Official);
     assert_eq!(hit.line_index, Some(2));
-    assert_eq!(hit.text_status, "ok", "line read back from the compressed db");
+    assert_eq!(
+        hit.text_status, "ok",
+        "line read back from the compressed db"
+    );
     assert!(hit.snippet.contains('«'), "highlighted: {}", hit.snippet);
 
     // Bridge: the hit's (book_id, line_index) is a get_text address.
@@ -266,7 +362,11 @@ fn full_text_search_maps_hits_to_lines_and_reads_text_from_the_db() {
     let r = search.search(&req).unwrap();
     assert!(r.total > 0 && r.hits.iter().all(|h| h.book_id == Some(103)));
     req.facets = vec!["/era/תורה שבכתב".into()];
-    assert_eq!(search.search(&req).unwrap().total, 0, "Genesis has no אמר רבי");
+    assert_eq!(
+        search.search(&req).unwrap().total,
+        0,
+        "Genesis has no אמר רבי"
+    );
 
     // Per-category and per-book counts.
     let req = SearchRequest::new("ברכה", Mode::Advanced);
@@ -276,16 +376,24 @@ fn full_text_search_maps_hits_to_lines_and_reads_text_from_the_db() {
         .into_iter()
         .map(|c| (c.path, c.count))
         .collect();
-    assert!(counts.iter().any(|(p, n)| p == "/תלמוד בבלי" && *n > 0), "{counts:?}");
+    assert!(
+        counts.iter().any(|(p, n)| p == "/תלמוד בבלי" && *n > 0),
+        "{counts:?}"
+    );
     let by_book = search.count_by_book(&req).unwrap();
     assert!(by_book.get("id:103").copied().unwrap_or(0) > 0);
 
     // Advanced word options (prefixes) widen the match; fuzzy tolerates a typo.
-    let plain = search.search(&SearchRequest::new("ברא", Mode::Advanced)).unwrap().total;
+    let plain = search
+        .search(&SearchRequest::new("ברא", Mode::Advanced))
+        .unwrap()
+        .total;
     let mut pre = SearchRequest::new("ברא", Mode::Advanced);
     pre.options.prefixes = true;
     assert!(search.search(&pre).unwrap().total >= plain);
-    let fuzzy = search.search(&SearchRequest::new("בראשיט", Mode::Fuzzy)).unwrap();
+    let fuzzy = search
+        .search(&SearchRequest::new("בראשיט", Mode::Fuzzy))
+        .unwrap();
     assert!(fuzzy.total > 0);
 
     // Paging and grouping.

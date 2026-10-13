@@ -161,6 +161,7 @@ pub struct LinkFilter<'a> {
 
 impl Db {
     /// Range-window link query for one direction. `window` = None means the whole book.
+    #[allow(clippy::too_many_arguments)]
     fn window_links(
         &self,
         inner: &mut Inner,
@@ -198,7 +199,11 @@ impl Db {
             }
             None => {
                 params.push(book_id.into());
-                let col = if outgoing { "sourceBookId" } else { "targetBookId" };
+                let col = if outgoing {
+                    "sourceBookId"
+                } else {
+                    "targetBookId"
+                };
                 format!(
                     "WITH anchors(linkId, anchorLineId) AS (SELECT l.id, {this_line} FROM link l WHERE l.{col} = ?1)"
                 )
@@ -217,6 +222,16 @@ impl Db {
             if caps.link_suppressed_side {
                 types.extend_from_slice(REFERENCE_TYPES);
             }
+            // Beyond the app: a type asked for explicitly (e.g. LINKER, which the app
+            // shows from the citing side only) is also returned from the cited side.
+            let requested: Vec<String> = filter
+                .types
+                .unwrap_or_default()
+                .iter()
+                .filter(|t| t.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+                .cloned()
+                .collect();
+            types.extend(requested.iter().map(String::as_str));
             wheres.push(format!("ct.name IN ({})", quoted(&types)));
             wheres.push(format!(
                 "(l.sourceBookId != l.targetBookId OR ct.name IN ({}))",
@@ -373,7 +388,10 @@ impl Db {
                 // Anchor offsets were computed against the anchored line itself — never
                 // leak them onto covered lines of a range link.
                 let own = if r.anchor_line_id == r.displayed_line_id {
-                    anchors.get(&(r.link_id, this_side)).cloned().unwrap_or_default()
+                    anchors
+                        .get(&(r.link_id, this_side))
+                        .cloned()
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
@@ -430,14 +448,16 @@ impl Db {
         let mut inner = self.lock();
         let mut rows = Vec::new();
         if want_out {
-            let raw = self.window_links(&mut inner, book_id, window, true, &filter, limit, offset)?;
+            let raw =
+                self.window_links(&mut inner, book_id, window, true, &filter, limit, offset)?;
             rows.extend(self.finish_links(&mut inner, raw, true, 160)?);
         }
         if want_in {
             let remaining = limit - rows.len() as i64;
             if remaining > 0 {
-                let raw =
-                    self.window_links(&mut inner, book_id, window, false, &filter, remaining, offset)?;
+                let raw = self.window_links(
+                    &mut inner, book_id, window, false, &filter, remaining, offset,
+                )?;
                 rows.extend(self.finish_links(&mut inner, raw, false, 160)?);
             }
         }
@@ -461,6 +481,8 @@ impl Db {
             types: Some(&types),
             book_ids: commentator_ids,
         };
+        // Initialise the era cache BEFORE taking the connection lock (it locks too).
+        let eras = self.eras();
         let mut inner = self.lock();
         let raw = self.window_links(
             &mut inner,
@@ -490,7 +512,7 @@ impl Db {
                 label: l.display_label,
                 commentator_book_id: l.book_id,
                 commentator_title: l.book_title,
-                era: self.era_of(l.book_id),
+                era: eras.get(&l.book_id).copied().unwrap_or(Era::Other),
                 on_line_index: l.at_line_index,
                 target_line_index: l.line_index,
                 target_line_end_index: l.line_end_index,
@@ -611,9 +633,9 @@ impl Db {
             let mut m = HashMap::new();
             for chunk in ids.chunks(400) {
                 let ph = vec!["?"; chunk.len()].join(",");
-                let mut stmt = inner
-                    .conn
-                    .prepare(&format!("SELECT id, orderIndex FROM book WHERE id IN ({ph})"))?;
+                let mut stmt = inner.conn.prepare(&format!(
+                    "SELECT id, orderIndex FROM book WHERE id IN ({ph})"
+                ))?;
                 for row in stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
                     Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
                 })? {
@@ -729,7 +751,13 @@ impl Db {
                         None => {
                             let before = units[s.saturating_sub(24)..s].concat();
                             let after = units[s..(s + 24).min(units.len())].concat();
-                            (None, Some(format!("{before}⟨{}⟩{after}", label.as_deref().unwrap_or("•"))))
+                            (
+                                None,
+                                Some(format!(
+                                    "{before}⟨{}⟩{after}",
+                                    label.as_deref().unwrap_or("•")
+                                )),
+                            )
                         }
                     };
                     let display_type = if side == 1 && DEPENDENT_TYPES.contains(&ctype.as_str()) {
