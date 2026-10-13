@@ -1,5 +1,15 @@
 # תוכנית: otzaria-mcp — שרת MCP לאוצריא (מתוקנת אחרי ביקורת)
 
+> **עדכון 0.2 (אוקטובר 2026) — ספרייה v32 / סכמה 6, מנוע 3.1.0.** המספרים והסכמה שלמטה
+> מתעדים את v1 (db_version 15, מנוע 0.6.7, אינדקס סכמה 2). מאז: טקסט השורות עבר
+> ל-`line_content` דחוס ב-zstd עם מילון (`zstd_dict`), נוספו `version_line`, `line_ref`,
+> `line_dh`, `link_coverage`, `link_suppressed_side`, נתוני הוצאה ותיאורים; 24 סוגי קישור
+> (`baseProvenance` במקום `isDeclaredBase`); האינדקס בסכמה 5 בלי טקסט הספרים הרשמיים
+> (המנוע קורא אותו מ-`seforim.db`). המימוש עודכן בהתאם ונוספו 5 כלים (14 בסך הכול):
+> `library_info`, `lookup_title`, `list_commentators`, `get_line_anchors`,
+> `search_facet_counts`. פירוט: [CHANGELOG.md](CHANGELOG.md), [README.md](README.md).
+> חיפוש סמנטי — עבודה עתידית (feature אופציונלי; ראו CHANGELOG).
+
 ## Context (למה)
 המשתמש רוצה שרת MCP שחושף את ספריית אוצריא ל-AI, במתכונת דומה ל-`zayit-mcp`
 (`/Users/david/Documents/others/zayit-mcp` — Kotlin/Lucene מעל `seforim.db` של זית).
