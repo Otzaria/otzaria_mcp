@@ -24,6 +24,8 @@ pub struct Snapshot {
     pub search: Option<Arc<Search>>,
     /// data_version reported to clients (identical to `Db::data_version`).
     pub fingerprint: String,
+    /// Why full-text search is unavailable, when it is.
+    pub search_error: Option<String>,
 }
 
 pub struct Library {
@@ -48,11 +50,15 @@ impl Library {
     fn build(paths: &Paths) -> Result<Snapshot> {
         let fingerprint = fingerprint(paths);
         let db = Arc::new(Db::open(paths)?);
-        let search = open_search(paths);
+        let (search, search_error) = match open_search(paths) {
+            Ok(s) => (s, None),
+            Err(e) => (None, Some(e)),
+        };
         Ok(Snapshot {
             db,
             search,
             fingerprint,
+            search_error,
         })
     }
 
@@ -86,21 +92,31 @@ impl Library {
     }
 }
 
-fn open_search(paths: &Paths) -> Option<Arc<Search>> {
+fn open_search(paths: &Paths) -> Result<Option<Arc<Search>>, String> {
     match &paths.index {
-        Some(index_dir) => match Search::open(index_dir, paths.lexical_db.as_deref()) {
+        Some(index_dir) => match Search::open(
+            index_dir,
+            paths.lexical_db.as_deref(),
+            &paths.db,
+            paths.dictionaries_dir.as_deref(),
+        ) {
             Ok(s) => {
-                eprintln!("otzaria-mcp: opened index ({} docs)", s.doc_count());
-                Some(Arc::new(s))
+                eprintln!(
+                    "otzaria-mcp: opened index ({} docs, schema {:?}, engine {})",
+                    s.doc_count(),
+                    s.info.found_schema_version,
+                    s.info.engine_version
+                );
+                Ok(Some(Arc::new(s)))
             }
             Err(e) => {
                 eprintln!("otzaria-mcp: WARNING full-text search disabled: {e:#}");
-                None
+                Err(format!("{e:#}"))
             }
         },
         None => {
             eprintln!("otzaria-mcp: no Tantivy index found; full_text_search disabled");
-            None
+            Err("no Tantivy index was found (pass --index or --data-dir)".to_string())
         }
     }
 }

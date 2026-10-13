@@ -24,10 +24,17 @@ PATH OPTIONS (precedence: flags > env > --data-dir > per-OS defaults):
     --db <path>           Path to seforim.db            [env: OTZARIA_DB]
     --index <path>        Path to the Tantivy index dir [env: OTZARIA_INDEX]
     --lexical-db <path>   Path to lexical.db (fuzzy)    [env: OTZARIA_LEXICAL_DB]
+    --dictionaries-dir <dir>
+                          Folder with dictionary.json / Acronyms.json (advanced-search
+                          translation and acronym options) [env: OTZARIA_DICTIONARIES_DIR]
     --data-dir <root>     Otzaria data root; two layouts auto-detected:
                             <root>/otzaria/seforim.db + <root>/index   (download root)
                             <root>/seforim.db          + <root>/index   (library dir)
                                                         [env: OTZARIA_DATA_DIR]
+    (defaults: %APPDATA%\\otzaria then %ProgramData%\\otzaria on Windows;
+     ~/Library/Application Support/otzaria then /Library/Application Support/otzaria
+     on macOS; ~/.local/share/otzaria then /var/lib/otzaria on Linux —
+     <root>/books/seforim.db and <root>/index)
     --snapshot            Open the DB with immutable=1 (closed snapshot; ignores WAL)
     -h, --help            Print this help
     -V, --version         Print version
@@ -42,7 +49,7 @@ async fn main() -> Result<()> {
 
     let paths = args.with_env().resolve()?;
     eprintln!(
-        "otzaria-mcp: db={} index={} lexical={} snapshot={}",
+        "otzaria-mcp: db={} index={} lexical={} dictionaries={} snapshot={}",
         paths.db.display(),
         paths
             .index
@@ -51,6 +58,11 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "(none)".into()),
         paths
             .lexical_db
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none)".into()),
+        paths
+            .dictionaries_dir
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(none)".into()),
@@ -63,8 +75,9 @@ async fn main() -> Result<()> {
     {
         let snap = lib.current();
         eprintln!(
-            "otzaria-mcp: schema_version={:?} data_version={}",
+            "otzaria-mcp: db_version={:?} db_schema_version={:?} data_version={}",
             snap.db.schema_version(),
+            snap.db.db_schema_version(),
             snap.fingerprint
         );
     }
@@ -97,6 +110,10 @@ fn parse_args() -> Result<Option<PathArgs>> {
                 args.lexical_db = Some(PathBuf::from(next_value(&mut it, "--lexical-db")?))
             }
             "--data-dir" => args.data_dir = Some(PathBuf::from(next_value(&mut it, "--data-dir")?)),
+            "--dictionaries-dir" => {
+                args.dictionaries_dir =
+                    Some(PathBuf::from(next_value(&mut it, "--dictionaries-dir")?))
+            }
             other => anyhow::bail!("unknown argument: {other} (try --help)"),
         }
     }

@@ -1,20 +1,34 @@
-//! Reference resolution ("בראשית א א", "שו\"ע או\"ח א א", "ברכות ב:") → (book_id, line_index).
+//! Reference resolution — find-ref ("בראשית א א", "ברכות ב.", "שו\"ע או\"ח א א",
+//! "ברכות ב ע\"א", a dibbur-hamatchil …) → (book_id, line_index).
 //!
-//! Mirrors the app's find_ref approach: an in-memory index of NORMALIZED book
-//! names (title + heRef + every book_acronym alias) → book ids, then the trailing
-//! address tokens are matched against normalized `line.heRef` within each candidate
-//! book. Normalization strips nikud/te'amim and gershayim, turns Talmud amud markers
-//! `.`→" א" and `:`→" ב", and drops commas/maqaf — applied identically to query and
-//! heRef so they line up. This is the biggest correctness-risk tool; it is covered by
-//! a golden test corpus (see tests/).
+//! Mirrors the app's find-ref pipeline:
+//! 1. **Book**: the longest leading run of the query that names a book — an in-memory index
+//!    of NORMALIZED titles, heRefs and every `book_acronym` alias (a name can map to several
+//!    books; all are tried).
+//! 2. **Line, canonical key** (schema 6): the rest of the query becomes the canonical
+//!    reference key of `crate::refkey` (the app's `ref_key.dart`) and is looked up in the
+//!    `line_ref` hash index — first the full key, then the "partial" key that omits named
+//!    parts of the heRef ("טור שט ג").
+//! 3. **Line, heRef prefix**: otherwise the normalized address is matched against the book's
+//!    normalized `line.heRef`s (exact, else the first line it is a token-prefix of — this is
+//!    what resolves a daf/chapter-level reference like "ברכות ב." to its first line).
+//! 4. **TOC / alternate TOC** heading text ("בראשית נח", "פרשת לך לך").
+//! 5. **Dibbur hamatchil** (`line_dh`) — the address as the opening words of a comment.
+//! 6. Last resort: substring match on raw `line.heRef`.
+//!
+//! Normalization strips nikud/te'amim and gershayim, turns Talmud amud markers `.`→" א"
+//! and `:`→" ב", and drops commas/maqaf — applied identically to the query and to names.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
+
+use crate::db::Caps;
+use crate::refkey;
 
 /// Normalize a reference/name for matching. Applied to book names, acronyms,
 /// `line.heRef`, and the user query alike.
@@ -24,11 +38,12 @@ pub fn normalize_ref(s: &str) -> String {
         match c {
             // Separators → space. Maqaf (U+05BE) must be handled before the nikud
             // range below (it falls inside 0591–05C7) so words don't get glued.
-            ',' | '־' | '-' | '\u{2013}' | '\u{2014}' => out.push(' '),
-            '"' | '\u{05F4}' => {}      // gershayim (ASCII + HEBREW GERSHAYIM)
-            '\'' | '\u{05F3}' => {}     // geresh
-            '.' => out.push_str(" א "), // Talmud daf: amud alef
-            ':' => out.push_str(" ב "), // Talmud daf: amud bet
+            ',' | '\u{05BE}' | '-' | '\u{2013}' | '\u{2014}' | '\u{05C0}' | '|' => out.push(' '),
+            '"' | '\u{05F4}' | '\u{201C}' | '\u{201D}' => {} // gershayim
+            '\'' | '\u{05F3}' | '\u{2018}' | '\u{2019}' => {} // geresh
+            '.' => out.push_str(" א "),                      // Talmud daf: amud alef
+            ':' => out.push_str(" ב "),                      // Talmud daf: amud bet
+            '(' | ')' | '[' | ']' | ';' => out.push(' '),
             '\u{0591}'..='\u{05C7}' => {} // Hebrew nikud + te'amim
             _ => out.push(c),
         }
@@ -44,7 +59,7 @@ fn starts_with_tokens(hay: &str, needle: &str) -> bool {
 
 pub struct RefIndex {
     /// normalized name → book ids (a name like "ברכות" can map to several books).
-    name_to_books: HashMap<String, Vec<i64>>,
+    name_to_books: BTreeMap<String, Vec<i64>>,
     book_heref: HashMap<i64, String>,
     book_title: HashMap<i64, String>,
     /// bookId → (is_base_book, orderIndex) for ranking candidates.
@@ -59,7 +74,7 @@ struct CachedLine {
     he_ref: String,
 }
 
-fn add_name(map: &mut HashMap<String, Vec<i64>>, name: &str, id: i64) {
+fn add_name(map: &mut BTreeMap<String, Vec<i64>>, name: &str, id: i64) {
     let n = normalize_ref(name);
     if n.is_empty() {
         return;
@@ -72,7 +87,7 @@ fn add_name(map: &mut HashMap<String, Vec<i64>>, name: &str, id: i64) {
 
 impl RefIndex {
     pub fn build(conn: &Connection) -> RefIndex {
-        let mut name_to_books: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut name_to_books: BTreeMap<String, Vec<i64>> = BTreeMap::new();
         let mut book_heref = HashMap::new();
         let mut book_title = HashMap::new();
         let mut book_meta = HashMap::new();
@@ -121,13 +136,42 @@ impl RefIndex {
         }
     }
 
+    pub fn title(&self, id: i64) -> String {
+        self.book_title.get(&id).cloned().unwrap_or_default()
+    }
+
+    pub fn is_base(&self, id: i64) -> bool {
+        self.book_meta.get(&id).is_some_and(|m| m.0)
+    }
+
+    pub fn order(&self, id: i64) -> i64 {
+        self.book_meta.get(&id).map_or(i64::MAX, |m| m.1)
+    }
+
+    /// Names equal to `norm` (exact) and then names starting with it (token prefix).
+    pub fn names_matching(&self, norm: &str, max: usize) -> Vec<(String, Vec<i64>, bool)> {
+        let mut out = Vec::new();
+        if let Some(ids) = self.name_to_books.get(norm) {
+            out.push((norm.to_string(), ids.clone(), true));
+        }
+        for (name, ids) in self.name_to_books.range(norm.to_string()..) {
+            if out.len() >= max || !name.starts_with(norm) {
+                break;
+            }
+            if name != norm {
+                out.push((name.clone(), ids.clone(), false));
+            }
+        }
+        out
+    }
+
     fn matching_line(
         &self,
         conn: &Connection,
         book_id: i64,
         canonical: &str,
     ) -> Result<Option<CachedLine>> {
-        let mut cache = self.line_cache.lock().unwrap();
+        let mut cache = self.line_cache.lock().unwrap_or_else(|p| p.into_inner());
         if let Entry::Vacant(entry) = cache.entry(book_id) {
             let mut stmt = conn.prepare(
                 "SELECT lineIndex, heRef FROM line \
@@ -167,20 +211,37 @@ pub struct RefCandidate {
     pub book_id: i64,
     pub book_title: String,
     pub line_index: i64,
-    pub he_ref: String,
+    pub he_ref: Option<String>,
     pub snippet: String,
-    /// "exact" (normalized heRef == query) or "prefix" (query is a leading portion).
+    /// How the line was found: "exact" (canonical key / heRef equal to the query),
+    /// "partial" (key with named parts omitted), "prefix" (first line under the
+    /// reference, e.g. a daf or chapter), "toc" (a TOC / alternate-TOC heading),
+    /// "dibur_hamatchil" (opening words of a comment), or "fallback" (heRef substring).
     pub match_kind: &'static str,
 }
 
-/// Resolve a human reference to candidate (book_id, line_index) locations.
+fn kind_rank(kind: &str) -> u8 {
+    match kind {
+        "exact" => 0,
+        "partial" => 1,
+        "prefix" => 2,
+        "toc" => 3,
+        "dibur_hamatchil" => 4,
+        _ => 5,
+    }
+}
+
+/// Resolve a human reference to candidate (book_id, line_index) locations. Snippets are
+/// left empty for the caller to fill (it owns the line-text decoder).
 pub fn resolve(
     conn: &Connection,
+    caps: &Caps,
     index: &RefIndex,
     query: &str,
     limit: i64,
 ) -> Result<Vec<RefCandidate>> {
-    let q_tokens: Vec<String> = normalize_ref(query)
+    let expanded = refkey::expand_query_amud_marks(query.trim());
+    let q_tokens: Vec<String> = normalize_ref(&expanded)
         .split_whitespace()
         .map(str::to_string)
         .collect();
@@ -204,24 +265,36 @@ pub fn resolve(
     if book_ids.is_empty() {
         return fallback_heref_like(conn, query, limit);
     }
+    // Base texts first, then catalogue order: the strongest candidates are tried first.
+    book_ids.sort_by_key(|id| (!index.is_base(*id), index.order(*id), *id));
 
     let address = q_tokens[consumed..].join(" ");
+    let key = refkey::build_ref_key(&address);
     let mut out: Vec<RefCandidate> = Vec::new();
 
-    for bid in book_ids {
-        if out.len() as i64 >= limit {
-            break;
-        }
-        let title = index.book_title.get(&bid).cloned().unwrap_or_default();
-        let book_href = index.book_heref.get(&bid).cloned().unwrap_or_default();
-        let mut canonical = normalize_ref(&book_href);
-        if !address.is_empty() {
-            canonical.push(' ');
-            canonical.push_str(&address);
-        }
-
-        if let Some(c) = first_line_matching(conn, index, bid, &title, &canonical)? {
-            out.push(c);
+    for bid in book_ids.iter().copied().take(60) {
+        let title = index.title(bid);
+        let found = if let Some(c) = by_line_ref(conn, caps, bid, key.as_deref())? {
+            Some(c)
+        } else if let Some(c) = by_heref(conn, index, bid, &address)? {
+            Some(c)
+        } else if !address.is_empty() {
+            match by_toc(conn, caps, bid, &address)? {
+                Some(c) => Some(c),
+                None => by_dibur(conn, caps, bid, &address)?,
+            }
+        } else {
+            None
+        };
+        if let Some((line_index, he_ref, kind)) = found {
+            out.push(RefCandidate {
+                book_id: bid,
+                book_title: title,
+                line_index,
+                he_ref,
+                snippet: String::new(),
+                match_kind: kind,
+            });
         }
     }
 
@@ -229,104 +302,151 @@ pub fn resolve(
         return fallback_heref_like(conn, query, limit);
     }
 
-    // Rank: exact before prefix; base texts before commentaries; then catalogue order.
+    // Rank: best match kind first; base texts before commentaries; then catalogue order.
     out.sort_by_key(|c| {
-        let (is_base, order) = index
-            .book_meta
-            .get(&c.book_id)
-            .copied()
-            .unwrap_or((false, i64::MAX));
-        let mk = match c.match_kind {
-            "exact" => 0,
-            "prefix" => 1,
-            _ => 2,
-        };
-        (mk, !is_base, order, c.book_id)
+        (
+            kind_rank(c.match_kind),
+            !index.is_base(c.book_id),
+            index.order(c.book_id),
+            c.book_id,
+        )
     });
+    out.truncate(limit.max(1) as usize);
     Ok(out)
 }
 
-/// Find the first line of `book_id` whose normalized heRef equals (exact) or is
-/// prefixed by (prefix) `canonical`. Prefers an exact match if one exists.
-fn first_line_matching(
-    conn: &Connection,
-    index: &RefIndex,
-    book_id: i64,
-    title: &str,
-    canonical: &str,
-) -> Result<Option<RefCandidate>> {
-    let Some(line) = index.matching_line(conn, book_id, canonical)? else {
+type Found = Option<(i64, Option<String>, &'static str)>;
+
+/// Canonical key → `line_ref` (full key, then the partial key).
+fn by_line_ref(conn: &Connection, caps: &Caps, book_id: i64, key: Option<&str>) -> Result<Found> {
+    let Some(key) = key else { return Ok(None) };
+    if !caps.line_ref {
+        return Ok(None);
+    }
+    for (k, kind) in [
+        (key.to_string(), "exact"),
+        (format!("{} {key}", refkey::PARTIAL_REF_KEY_MARKER), "partial"),
+    ] {
+        let row: Option<(i64, Option<String>)> = conn
+            .query_row(
+                "SELECT lr.lineIndex, l.heRef FROM line_ref lr \
+                   JOIN line l ON l.bookId = lr.bookId AND l.lineIndex = lr.lineIndex \
+                  WHERE lr.bookId = ?1 AND lr.refKeyHash = ?2 ORDER BY lr.lineIndex LIMIT 1",
+                rusqlite::params![book_id, refkey::ref_key_hash(&k)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((li, he_ref)) = row {
+            return Ok(Some((li, he_ref, kind)));
+        }
+    }
+    Ok(None)
+}
+
+/// Normalized heRef: exact, else the first line the address is a token-prefix of.
+fn by_heref(conn: &Connection, index: &RefIndex, book_id: i64, address: &str) -> Result<Found> {
+    let book_href = index.book_heref.get(&book_id).cloned().unwrap_or_default();
+    let mut canonical = normalize_ref(&book_href);
+    if !address.is_empty() {
+        canonical.push(' ');
+        canonical.push_str(address);
+    }
+    let Some(line) = index.matching_line(conn, book_id, &canonical)? else {
         return Ok(None);
     };
-    let content = conn.query_row(
-        "SELECT content FROM line WHERE bookId = ?1 AND lineIndex = ?2",
-        rusqlite::params![book_id, line.line_index],
-        |r| r.get::<_, String>(0),
-    )?;
-    let match_kind = if normalize_ref(&line.he_ref) == canonical {
+    let kind = if normalize_ref(&line.he_ref) == canonical {
         "exact"
     } else {
         "prefix"
     };
-    Ok(Some(make_candidate(
-        book_id,
-        title,
-        line.line_index,
-        line.he_ref,
-        content,
-        match_kind,
-    )))
+    Ok(Some((line.line_index, Some(line.he_ref), kind)))
+}
+
+/// A TOC or alternate-TOC heading whose normalized text equals the address (locator
+/// words such as "פרק"/"סימן" ignored on both sides, as in the canonical key).
+fn by_toc(conn: &Connection, caps: &Caps, book_id: i64, address: &str) -> Result<Found> {
+    let Some(want) = refkey::build_ref_key(address) else {
+        return Ok(None);
+    };
+    let strip_parasha = |k: &str| k.strip_prefix("פרשת ").unwrap_or(k).to_string();
+    let want = strip_parasha(&want);
+    let mut sql = String::from(
+        "SELECT tt.text, l.lineIndex, l.heRef FROM tocEntry te JOIN tocText tt ON tt.id = te.textId \
+           JOIN line l ON l.id = te.lineId WHERE te.bookId = ?1",
+    );
+    if caps.alt_toc {
+        sql.push_str(
+            " UNION ALL SELECT tt.text, l.lineIndex, l.heRef FROM alt_toc_entry ae \
+                JOIN alt_toc_structure s ON s.id = ae.structureId \
+                JOIN tocText tt ON tt.id = ae.textId JOIN line l ON l.id = ae.lineId \
+               WHERE s.bookId = ?1",
+        );
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let mut best: Found = None;
+    for row in stmt.query_map([book_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?))
+    })? {
+        let (text, li, he_ref) = row?;
+        let Some(k) = refkey::build_ref_key(&crate::text::strip_html_tags(&text)) else {
+            continue;
+        };
+        if strip_parasha(&k) == want && best.as_ref().is_none_or(|b| li < b.0) {
+            best = Some((li, he_ref, "toc"));
+        }
+    }
+    Ok(best)
+}
+
+/// The address as the opening words of a comment (`line_dh.dhText`, normalized without
+/// gershayim/punctuation).
+fn by_dibur(conn: &Connection, caps: &Caps, book_id: i64, address: &str) -> Result<Found> {
+    if !caps.line_dh || address.chars().count() < 2 {
+        return Ok(None);
+    }
+    let row: Option<(i64, Option<String>)> = conn
+        .query_row(
+            "SELECT d.lineIndex, l.heRef FROM line_dh d \
+               JOIN line l ON l.bookId = d.bookId AND l.lineIndex = d.lineIndex \
+              WHERE d.bookId = ?1 AND d.dhText >= ?2 AND d.dhText < ?2 || char(1114111) \
+              ORDER BY d.lineIndex LIMIT 1",
+            rusqlite::params![book_id, address],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(li, he_ref)| (li, he_ref, "dibur_hamatchil")))
 }
 
 /// Last resort: substring match on raw `line.heRef`.
 fn fallback_heref_like(conn: &Connection, query: &str, limit: i64) -> Result<Vec<RefCandidate>> {
-    let like = format!("%{}%", query.replace(['%', '_'], ""));
+    let q = query.trim();
+    if q.chars().count() < 2 {
+        return Ok(vec![]);
+    }
+    let like = format!("%{}%", crate::db::escape_like(q));
     let mut stmt = conn.prepare(
-        "SELECT l.bookId, b.title, l.lineIndex, l.heRef, l.content \
+        "SELECT l.bookId, b.title, l.lineIndex, l.heRef \
            FROM line l JOIN book b ON l.bookId = b.id \
-          WHERE l.heRef LIKE ?1 \
+          WHERE l.heRef LIKE ?1 ESCAPE '\\' \
           ORDER BY b.orderIndex, l.lineIndex LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![like, limit], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-        ))
-    })?;
-    Ok(rows
-        .flatten()
-        .map(|(bid, title, li, href, content)| {
-            make_candidate(bid, &title, li, href, content, "fallback")
+        Ok(RefCandidate {
+            book_id: r.get(0)?,
+            book_title: r.get(1)?,
+            line_index: r.get(2)?,
+            he_ref: r.get(3)?,
+            snippet: String::new(),
+            match_kind: "fallback",
         })
-        .collect())
-}
-
-fn make_candidate(
-    book_id: i64,
-    title: &str,
-    line_index: i64,
-    he_ref: String,
-    content: String,
-    match_kind: &'static str,
-) -> RefCandidate {
-    let plain = crate::db::strip_html_tags(&content);
-    let snippet: String = plain.chars().take(160).collect();
-    RefCandidate {
-        book_id,
-        book_title: title.to_string(),
-        line_index,
-        he_ref,
-        snippet,
-        match_kind,
-    }
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{normalize_ref, starts_with_tokens, RefIndex};
+    use crate::db::Caps;
     use rusqlite::Connection;
 
     #[test]
@@ -355,24 +475,84 @@ mod tests {
         assert!(!starts_with_tokens("בראשית אב", "בראשית א"));
     }
 
-    #[test]
-    fn resolves_from_the_per_book_normalized_cache() {
+    fn fixture() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE book (id INTEGER PRIMARY KEY, title TEXT NOT NULL, heRef TEXT, isBaseBook INTEGER NOT NULL, orderIndex INTEGER NOT NULL);
              CREATE TABLE book_acronym (bookId INTEGER NOT NULL, term TEXT NOT NULL);
-             CREATE TABLE line (bookId INTEGER NOT NULL, lineIndex INTEGER NOT NULL, heRef TEXT, content TEXT NOT NULL);
-             INSERT INTO book VALUES (1, 'בראשית', 'בראשית', 1, 1);
-             INSERT INTO line VALUES (1, 2, 'בראשית א, א', 'בתחילה');",
+             CREATE TABLE line (id INTEGER PRIMARY KEY, bookId INTEGER NOT NULL, lineIndex INTEGER NOT NULL, heRef TEXT);
+             CREATE TABLE line_ref (bookId INTEGER NOT NULL, refKeyHash INTEGER NOT NULL, lineIndex INTEGER NOT NULL);
+             CREATE TABLE line_dh (bookId INTEGER NOT NULL, dhText TEXT NOT NULL, lineIndex INTEGER NOT NULL, dhDisplay TEXT NOT NULL);
+             CREATE TABLE tocText (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
+             CREATE TABLE tocEntry (id INTEGER PRIMARY KEY, bookId INTEGER NOT NULL, parentId INTEGER, textId INTEGER NOT NULL, level INTEGER NOT NULL, lineId INTEGER, hasChildren INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO book VALUES (1, 'בראשית', 'בראשית', 1, 1), (103, 'ברכות', 'ברכות', 1, 1), (9, 'רש\"י על ברכות', 'רש\"י על ברכות', 0, 5);
+             INSERT INTO book_acronym VALUES (1, 'ספר בראשית');
+             INSERT INTO line VALUES (1, 1, 2, 'בראשית א, א'), (2, 103, 2, 'ברכות, ב., א'), (3, 103, 17, 'ברכות, ב:, א'), (4, 9, 5, 'רש\"י על ברכות, ב., א');
+             INSERT INTO tocText VALUES (1, 'פרק ראשון');
+             INSERT INTO tocEntry VALUES (1, 103, NULL, 1, 1, 2, 0);
+             INSERT INTO line_dh VALUES (9, 'מאימתי קורין', 5, 'מאימתי קורין');",
         )
         .unwrap();
+        // line_ref rows exactly as the library builder writes them (FNV of the key).
+        conn.execute(
+            "INSERT INTO line_ref VALUES (103, ?1, 2)",
+            [crate::refkey::ref_key_hash("ב א א")],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn caps() -> Caps {
+        Caps {
+            line_ref: true,
+            line_dh: true,
+            ..Caps::default()
+        }
+    }
+
+    #[test]
+    fn resolves_via_line_ref_heref_prefix_toc_and_dibur() {
+        let conn = fixture();
         let index = RefIndex::build(&conn);
 
-        let first = super::resolve(&conn, &index, "בראשית א א", 1).unwrap();
-        let second = super::resolve(&conn, &index, "בראשית א א", 1).unwrap();
+        let c = super::resolve(&conn, &caps(), &index, "ברכות ב., א", 3).unwrap();
+        assert_eq!((c[0].book_id, c[0].line_index, c[0].match_kind), (103, 2, "exact"));
 
+        // amud-level reference → the first line under it (heRef prefix)
+        let c = super::resolve(&conn, &caps(), &index, "ברכות ב:", 3).unwrap();
+        assert_eq!((c[0].book_id, c[0].line_index, c[0].match_kind), (103, 17, "prefix"));
+
+        // acronym/alias book name
+        let c = super::resolve(&conn, &caps(), &index, "ספר בראשית א א", 3).unwrap();
+        assert_eq!((c[0].book_id, c[0].line_index), (1, 2));
+
+        // TOC heading text
+        let c = super::resolve(&conn, &caps(), &index, "ברכות פרק ראשון", 3).unwrap();
+        assert_eq!((c[0].line_index, c[0].match_kind), (2, "toc"));
+
+        // dibbur hamatchil
+        let c = super::resolve(&conn, &caps(), &index, "רש\"י על ברכות מאימתי", 3).unwrap();
+        assert_eq!((c[0].book_id, c[0].line_index, c[0].match_kind), (9, 5, "dibur_hamatchil"));
+    }
+
+    #[test]
+    fn resolves_from_the_per_book_normalized_cache() {
+        let conn = fixture();
+        let index = RefIndex::build(&conn);
+        let first = super::resolve(&conn, &Caps::default(), &index, "בראשית א א", 1).unwrap();
+        let second = super::resolve(&conn, &Caps::default(), &index, "בראשית א א", 1).unwrap();
         assert_eq!(first[0].line_index, 2);
         assert_eq!(second[0].line_index, 2);
         assert_eq!(index.line_cache.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn names_matching_lists_exact_then_prefix() {
+        let conn = fixture();
+        let index = RefIndex::build(&conn);
+        let m = index.names_matching(&normalize_ref("ברכות"), 10);
+        assert!(m[0].2, "exact first");
+        assert_eq!(m[0].1, vec![103]);
+        assert!(m.iter().any(|(n, _, exact)| !exact && n.starts_with("ברכות")) || m.len() == 1);
     }
 }

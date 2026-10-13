@@ -1,10 +1,46 @@
 [package]
 name = "search_engine"
-version = "0.1.0"
+version = "3.1.0"
 edition = "2021"
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+# SQLite comes from exactly one of the two features below; enabling both or
+# neither is a compile error (see `src/sqlite_host.rs`). libsqlite3-sys lets
+# `loadable_extension` silently win over `bundled`, so app builds must use
+# `--no-default-features --features sqlite-host` rather than adding to the
+# default.
+default = ["sqlite-bundled"]
+# CLI binaries, tests and build tools: SQLite compiled into this crate.
+sqlite-bundled = ["rusqlite/bundled"]
+# The app: no SQLite inside the library. Every call goes through the API table
+# of the SQLite instance Dart already loaded, handed over by
+# `sqlite3_auto_extension(sqlite_host_entry_address())`.
+sqlite-host = ["rusqlite/loadable_extension"]
+# The production feature, and the one cargokit.yaml builds the application with:
+# the ONNX backend, for the Meivin ONNX graph the application uses. It is the
+# only embedding backend there is. GGUF models and llama.cpp are not supported:
+# no feature compiles llama.cpp or ggml, and a model that is not an `*.onnx`
+# graph is refused rather than served. On Android and iOS, where the sidecar
+# builds no ONNX backend, this build serves no model at all.
+semantic = ["semantic-onnx"]
+# Internal gate for code that talks to the sidecar. Every backend feature below
+# turns it on; on its own it compiles the integration with no backend behind it.
+# It gates code, not the dependency: the sidecar is compiled into every build (see
+# its declaration below).
+semantic-integration = []
+# ONNX graphs on ONNX Runtime (the Meivin model). Nothing is linked: the sidecar
+# loads the ONNX Runtime shared library when a model loads, so the build needs no
+# download and the binary no new dependency. The sidecar builds the backend for
+# desktop targets only; elsewhere it compiles out, and an ONNX model is
+# `BackendUnavailable` there.
+semantic-onnx = ["semantic-integration", "otzaria-semantic-search/onnx-backend"]
+# CI and adapter integration tests use the sidecar's deterministic test backend,
+# with no ONNX Runtime behind it. Production builds must use `semantic`; neither
+# default nor mock builds can silently select it.
+semantic-mock = ["semantic-integration", "otzaria-semantic-search/mock-embedding"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
@@ -19,28 +55,92 @@ too_many_arguments = "allow"
 name = "benchmark_cli"
 path = "src/bin/benchmark_cli.rs"
 
+# The build-machine entry point for S4b. Compiles in every configuration — without a
+# semantic backend it prints why it cannot run rather than failing to exist, so a release
+# pipeline discovers the missing feature from the binary instead of from cargo.
+[[bin]]
+name = "build_semantic_artifact"
+path = "src/bin/build_semantic_artifact.rs"
+
+# The half of a build that needs the corpus and no model, so it links no backend.
+[[bin]]
+name = "export_semantic_plan"
+path = "src/bin/export_semantic_plan.rs"
+
+# How an installed vector set lands on a release index: coverage and resolution.
+[[bin]]
+name = "validate_semantic_vectors"
+path = "src/bin/validate_semantic_vectors.rs"
+
+# Retired with the v1 artifact; it says so and exits. The sharded build's last step is
+# the sidecar's `assemble`.
+[[bin]]
+name = "pack_semantic_artifact"
+path = "src/bin/pack_semantic_artifact.rs"
+
 [dependencies]
 env_logger = "0.11.10"
-flutter_rust_bridge = "=2.12.0"
+flutter_rust_bridge = "=2.13.0"
 tempfile = "3.27.0"
-tantivy= "=0.26.1"
+tantivy= "=0.26.2"
 tantivy-fst = "=0.5.0"
-# Same crate/version tantivy 0.26 builds FuzzyTermQuery automatons from, so
-# fuzzy highlight-term collection matches the query's term expansion exactly.
-levenshtein_automata = "0.2.1"
 jieba-rs = "0.10.1"
 anyhow = "1.0.102"
 once_cell = "1.21.4"
+# Linear token matching for display highlights; phrase gaps use bounded DP.
+regex = "1.13.1"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_derive = "1.0"
 serde_json = "1.0.150"
 htmlescape = "0.3.1"
-tokio = { version = "1.52.3", features = [ "test-util", "macros"] }
 log = "0.4.32"
-futures = "0.3.32"
-async-stream = "0.3.6"
 unicode-segmentation = "1.13.3"
-# Lexical (MagicDictionary) approximate-search path. `bundled` compiles SQLite
-# from source so there is no system libsqlite dependency on Android/iOS.
-rusqlite = { version = "0.32", features = ["bundled"] }
+# Lexical (MagicDictionary) approximate-search path and the library line source.
+# Which SQLite it binds to is chosen by the `sqlite-bundled`/`sqlite-host`
+# features. No other rusqlite features: the host's SQLite (Dart's build) omits
+# trace, progress handler, decltype and the authorizer.
+rusqlite = { version = "0.32", default-features = false }
+# CRC-32 of a line for `lineCheck` (hardware-accelerated; already built for tantivy).
+crc32fast = "1.5"
 lru = "0.12"
+# מקבול הנרמול באינדוקס (add_text_book / add_pdf_book): הנרמול הוא ~85%
+# מזמן ה-CPU של הזנת המנוע ואינו תלוי-סדר בין שורות.
+rayon = "1.10"
+# A release may publish its vector segment compressed (`.oxv.zst`), and installing it
+# expands it; the library line source decodes the per-row frames of
+# `line_content.content` (a `seforim.db` with `zstd_dict`). The version tantivy
+# already builds, with no features: decoding only.
+zstd = { version = "0.13", default-features = false }
+# A vector plan names each embedded text by its full SHA-256. Same crate and major version
+# the semantic sidecar hashes with.
+sha2 = "0.10"
+
+# The semantic sidecar's persisted-vector format and its inference bindings
+# (ONNX Runtime) are part of the index identity.  A branch dependency
+# can silently change any of them; pin the exact reviewed revision and retain it
+# in Cargo.lock for reproducible builds.
+#
+# Not optional, and with no feature of its own: the chunk key the index stores
+# for a line is computed with the sidecar's chunker, and it has to be the same
+# function of the line's text in every build — the release index is built once
+# and ships to every platform, whatever features the build that opens it has.
+# With `default-features = false` that brings the recipe and the formats alone:
+# the inference crates come only with `onnx-backend`, which `semantic-onnx` turns
+# on and the sidecar declares for desktop targets only. The `semantic*` features
+# gate the code that talks to it.
+otzaria-semantic-search = { git = "https://github.com/Otzaria/otzaria-semantic-search", rev = "977d267366b75de9da04764211b78fe80673d79a", default-features = false }
+
+[dev-dependencies]
+# תבניות ההדגשה המשולבות כוללות lookahead (הפרדת תגי inline מתגי שבירה),
+# ש-RegExp של Dart תומך בו ו-`regex` לא — בבדיקות מהדרים אותן עם backtracking
+# כמו בצד ה-Dart.
+fancy-regex = "0.14"
+
+# Vendored copy of tantivy-fst 0.5.0 whose only local change raises the
+# regex-DFA STATE_LIMIT from 1 000 to 8 192 (see vendor/tantivy-fst/README.md).
+# The patch applies to the whole dependency graph, so tantivy's own
+# RegexPhraseQuery compiles against the raised cap too.
+[patch.crates-io]
+tantivy-fst = { path = "vendor/tantivy-fst" }
+# TODO: return to crates.io once a tantivy release includes quickwit-oss/tantivy#3134,
+# #3135, #3136 and #3137. Otzaria/tantivy@otzaria-0.26 is 0.26.2 plus those PRs.
+tantivy = { git = "https://github.com/Otzaria/tantivy", rev = "85b76fe364f11c452bd2ce941521ece474a02227" }

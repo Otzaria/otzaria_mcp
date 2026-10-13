@@ -1,6 +1,6 @@
 [package]
 name = "otzaria-mcp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "MCP server exposing the Otzaria Jewish-texts library (SQLite + Tantivy), read-only, offline."
 license = "MIT"
@@ -12,18 +12,23 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync", "signal", "time"] }
 # rusqlite pinned to the same version/features the `search_engine` crate uses, so the
-# bundled SQLite is unified to a single C library (avoids duplicate-symbol conflicts
-# once search_engine is added in Milestone 1).
+# bundled SQLite is unified to a single C library (avoids duplicate-symbol conflicts).
 rusqlite = { version = "0.32", features = ["bundled"] }
+# seforim.db schema 6 stores line text as zstd frames compressed with a dictionary from
+# the `zstd_dict` table. Same crate/version the engine's line source decodes with.
+zstd = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 schemars = "1.0"
 rmcp = { version = "2.2.0", features = ["transport-io", "schemars"] }
-# Otzaria's actual Tantivy search engine (git submodule, pinned). Reused so the
-# MCP reproduces the app's exact search semantics (Hebrew morphology, regex-phrase,
-# facets) rather than reimplementing them. Read-only use of SearchEngine.
+# Otzaria's actual Tantivy search engine (vendored, pub.dev 3.1.0). Reused so the MCP
+# reproduces the app's exact search semantics (Hebrew morphology, regex-phrase,
+# facets, cross-line phrases, library line source) rather than reimplementing them.
+# Default features = bundled SQLite, no semantic backend.
 search_engine = { path = "../vendor/otzaria_search_engine/rust" }
 
 [dev-dependencies]
 tempfile = "3"
+# Unit tests build dictionary-compressed frames like the library builder does.
+zstd = { version = "0.13", features = ["zdict_builder"] }

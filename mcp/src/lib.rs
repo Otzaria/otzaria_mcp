@@ -3,8 +3,11 @@
 //! binary is a thin wrapper; these modules are also used by the integration tests.
 
 pub mod db;
+pub mod links;
 pub mod paths;
+pub mod refkey;
 pub mod refs;
 pub mod reload;
 pub mod search;
 pub mod server;
+pub mod text;
