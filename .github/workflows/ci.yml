@@ -32,11 +32,11 @@ jobs:
         run: cargo fmt -p otzaria-mcp --check
       - name: clippy
         # --no-deps: lint only our crate, not the vendored search_engine copy.
-        run: cargo clippy -p otzaria-mcp --all-targets --no-deps -- -D warnings
+        run: cargo clippy --locked -p otzaria-mcp --all-targets --no-deps -- -D warnings
       - name: test
-        # The real-data integration tests skip themselves when no Otzaria dataset
-        # is present (CI has none), so only the unit tests actually run here.
-        run: cargo test -p otzaria-mcp
+        # The real-data integration tests skip themselves when OTZARIA_TEST_DB is
+        # unset (CI has no library), so only the unit/fixture tests run here.
+        run: cargo test --locked -p otzaria-mcp
 
   # ── Cross-platform release binaries ─────────────────────────────────────────
   build:
@@ -49,7 +49,8 @@ jobs:
         include:
           - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  name: linux-x86_64,   ext: "" }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: linux-aarch64,  ext: "" }
-          - { os: macos-13,         target: x86_64-apple-darwin,       name: macos-x86_64,   ext: "" }
+          # macos-13 runners were retired; macos-15-intel is the x86_64 image.
+          - { os: macos-15-intel,   target: x86_64-apple-darwin,       name: macos-x86_64,   ext: "" }
           - { os: macos-14,         target: aarch64-apple-darwin,      name: macos-aarch64,  ext: "" }
           - { os: windows-latest,   target: x86_64-pc-windows-msvc,    name: windows-x86_64, ext: ".exe" }
     steps:
@@ -61,7 +62,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build release binary
-        run: cargo build --release -p otzaria-mcp --target ${{ matrix.target }}
+        run: cargo build --locked --release -p otzaria-mcp --target ${{ matrix.target }}
       - name: Stage binary
         shell: bash
         run: |
