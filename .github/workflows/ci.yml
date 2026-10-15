@@ -23,7 +23,7 @@ jobs:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -54,7 +54,7 @@ jobs:
           - { os: macos-15,         target: aarch64-apple-darwin,      name: macos-aarch64,  ext: "" }
           - { os: windows-latest,   target: x86_64-pc-windows-msvc,    name: windows-x86_64, ext: ".exe" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -70,7 +70,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/otzaria-mcp${{ matrix.ext }}" \
              "dist/otzaria-mcp-${{ matrix.name }}${{ matrix.ext }}"
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: otzaria-mcp-${{ matrix.name }}
           path: dist/*
