@@ -708,6 +708,25 @@ pub(crate) fn configure(db_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reconfigure and discard the open connection even when the path is unchanged.
+/// Used when a database may have been atomically replaced in place.
+pub(crate) fn refresh(db_path: &str) -> Result<()> {
+    if db_path.is_empty() {
+        anyhow::bail!("refresh_line_source needs a database path");
+    }
+    let path = PathBuf::from(db_path);
+    let mut g = global();
+    // The global mutex is held by each line-window read, so this waits for active
+    // windows to finish before closing the old inode and clearing its caches.
+    g.drop_store();
+    if g.path.as_deref() != Some(path.as_path()) {
+        g.path = Some(path);
+    }
+    g.generation += 1;
+    g.busy_until = None;
+    Ok(())
+}
+
 pub(crate) fn suspend() {
     let mut g = global();
     g.suspend_depth += 1;

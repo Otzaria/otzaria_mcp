@@ -57,7 +57,7 @@ pub struct GetTextParams {
     #[serde(default)]
     pub strip_html: Option<bool>,
     /// Optional text version/edition (a `version_title` or `he_version_title` from
-    /// get_book_info.versions with has_text=true). Omit for the default text.
+    /// get_book_info.version_details with has_text=true). Omit for the default text.
     #[serde(default)]
     pub version: Option<String>,
 }
@@ -110,13 +110,15 @@ pub struct WordOptionsParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema, Default)]
 pub struct SearchFilterParams {
-    /// Restrict to categories by title path, e.g. "תנ\"ך/תורה" or "/תלמוד בבלי".
+    /// Category paths, e.g. "תנ\"ך/תורה". Categories and book_ids form one OR scope;
+    /// era, author and base_only dimensions each intersect that scope (AND).
     #[serde(default)]
     pub categories: Option<Vec<String>>,
     /// Restrict to categories by id (from browse_categories).
     #[serde(default)]
     pub category_ids: Option<Vec<i64>>,
-    /// Restrict to specific books by id (search inside a book).
+    /// Book ids. With no category filters, search only these books; with categories,
+    /// include these books OR the selected categories (the app's scope-tree semantics).
     #[serde(default)]
     pub book_ids: Option<Vec<i64>>,
     /// Restrict by era: "תורה שבכתב", "חז\"ל", "ראשונים", "אחרונים", "מחברי זמננו"
@@ -533,7 +535,7 @@ impl OtzariaServer {
                        description, source, author(s), generation and era, publication dates and places, \
                        topics, dependence type and collective title, base texts it depends on, default \
                        commentators/targumim, connection flags, nikud/te'amim flags, acronyms/aliases, \
-                       alternate structures, and the available text versions/editions.",
+                       alternate structures, version titles (versions), and edition metadata (version_details).",
         annotations(read_only_hint = true)
     )]
     pub async fn get_book_info(
@@ -545,7 +547,7 @@ impl OtzariaServer {
         let db = snap.db.clone();
         let info = run_blocking(move || db.get_book_info(book_id)).await?;
         match info {
-            Some(i) => self.respond(&snap, to_json(i)?),
+            Some(i) => self.respond(&snap, book_info_payload(i)?),
             None => Err(invalid(format!("no book found with book_id={book_id}"))),
         }
     }
@@ -717,7 +719,7 @@ impl OtzariaServer {
         let db = snap.db.clone();
         let links = run_blocking(move || {
             let types = (!types.is_empty()).then_some(types);
-            db.get_links(
+            let links = db.get_links(
                 book_id,
                 window,
                 types.as_deref(),
@@ -725,7 +727,8 @@ impl OtzariaServer {
                 &direction,
                 limit,
                 offset,
-            )
+            )?;
+            link_payload(&db, links)
         })
         .await?;
         self.respond(&snap, json!({ "count": links.len(), "links": links }))
@@ -933,6 +936,47 @@ fn to_json<T: serde::Serialize>(v: T) -> Result<serde_json::Value, ErrorData> {
     serde_json::to_value(v).map_err(|e| ErrorData::internal_error(e.to_string(), None))
 }
 
+fn book_info_payload(info: crate::db::BookInfo) -> Result<serde_json::Value, ErrorData> {
+    let titles: Vec<_> = info
+        .versions
+        .iter()
+        .map(|v| {
+            v.he_version_title
+                .as_deref()
+                .unwrap_or(&v.version_title)
+                .to_string()
+        })
+        .collect();
+    let mut value = to_json(info)?;
+    value["version_details"] = value["versions"].take();
+    value["versions"] = json!(titles);
+    Ok(value)
+}
+
+fn link_payload(
+    db: &Db,
+    links: Vec<crate::links::LinkRow>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let ids: Vec<_> = links.iter().map(|l| l.link_id).collect();
+    let legacy = db.legacy_link_fields(&ids)?;
+    links
+        .into_iter()
+        .map(|link| {
+            let fields = legacy
+                .get(&link.link_id)
+                .and_then(serde_json::Value::as_object);
+            let mut value = serde_json::to_value(link)?;
+            if let Some(fields) = fields {
+                value
+                    .as_object_mut()
+                    .expect("LinkRow serializes as an object")
+                    .extend(fields.clone());
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
 /// Run a blocking DB/index call off the async runtime, mapping errors to MCP errors.
 async fn run_blocking<T, F>(f: F) -> Result<T, ErrorData>
 where
@@ -975,6 +1019,32 @@ fn search_offset(offset: Option<u32>) -> Result<u32, ErrorData> {
 #[cfg(test)]
 mod tests {
     use super::{facet_segment, required_text, search_offset, MAX_SEARCH_OFFSET};
+
+    #[test]
+    fn legacy_book_versions_keep_titles_and_expose_details_separately() {
+        let db = crate::fixture_tests::fixture_db();
+        let value = super::book_info_payload(db.get_book_info(1).unwrap().unwrap()).unwrap();
+        assert_eq!(value["versions"], serde_json::json!(["פשוט"]));
+        assert_eq!(value["version_details"][0]["version_title"], "Plain");
+        assert_eq!(value["version_details"][0]["has_text"], true);
+    }
+
+    #[test]
+    fn legacy_link_endpoints_keep_stored_orientation_on_covered_and_inverse_lines() {
+        let db = crate::fixture_tests::fixture_db();
+        for (book, window, direction) in [(1, (2, 2), "outgoing"), (2, (1, 1), "incoming")] {
+            let links = db
+                .get_links(book, Some(window), None, None, direction, 10, 0)
+                .unwrap();
+            let value = super::link_payload(&db, links).unwrap();
+            assert_eq!(value[0]["source_book_id"], 1);
+            assert_eq!(value[0]["target_book_id"], 2);
+            assert_eq!(value[0]["source_line_index"], 0);
+            assert_eq!(value[0]["target_line_index"], 0);
+            assert_eq!(value[0]["source_snippet"], "בראשית ברא");
+            assert_eq!(value[0]["target_snippet"], "פירוש ראשון");
+        }
+    }
 
     #[test]
     fn search_offset_is_bounded() {

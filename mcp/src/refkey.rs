@@ -1,5 +1,7 @@
-//! Canonical line-reference keys — a Rust port of the app's `lib/utils/text/ref_key.dart`
+//! Canonical line-reference keys — based on the app's `lib/utils/text/ref_key.dart`
 //! (itself kept identical to SeforimLibrary's builder, which fills `line_ref`).
+//! Quoted ע"א/ע"ב are treated as amud marks only after a Hebrew numeral; elsewhere
+//! they remain the numbers 71/72. Published v32 heRefs use unquoted chapter numbers.
 //!
 //! seforim.db (schema 6) has a `line_ref(bookId, refKeyHash, lineIndex)` index: for every
 //! line, the FNV-1a-64 hash of the canonical key of its `heRef` *after the book title*
@@ -66,7 +68,9 @@ fn remove_marks(s: &str) -> String {
         .collect()
 }
 
-/// `ע"א` / `ע"ב` (with any quote mark, not inside a word) → `א` / `ב`.
+/// `ע"א` / `ע"ב` (with any quote mark) → `א` / `ב` when preceded by a Hebrew
+/// numeral. Without that context the sequence is a Hebrew number (71/72), as in
+/// `תהילים ע"א`.
 fn map_amud_marks(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
@@ -78,6 +82,7 @@ fn map_amud_marks(s: &str) -> String {
             && matches!(chars[i + 2], 'א' | 'ב')
             && (i == 0 || !is_heb_letter(chars[i - 1]))
             && chars.get(i + 3).is_none_or(|&n| !is_heb_letter(n))
+            && previous_token_is_hebrew_numeral(&chars, i)
         {
             out.push(chars[i + 2]);
             i += 3;
@@ -87,6 +92,21 @@ fn map_amud_marks(s: &str) -> String {
         i += 1;
     }
     out
+}
+
+fn previous_token_is_hebrew_numeral(chars: &[char], before: usize) -> bool {
+    let mut end = before;
+    while end > 0 && !is_heb_letter(chars[end - 1]) {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && is_heb_letter(chars[start - 1]) {
+        start -= 1;
+    }
+    if start == end {
+        return false;
+    }
+    is_hebrew_numeral(&chars[start..end].iter().collect::<String>())
 }
 
 /// One numeric component of a trailing range: digits, or 1–3 letters optionally
@@ -169,8 +189,8 @@ fn cut_trailing_range(s: &str) -> &str {
 }
 
 /// Tokens of the canonical key of `reference` (Dart `refKeyTokens`): cut a trailing
-/// range, expand daf marks, drop nikud/te'amim, map ע"א/ע"ב, drop quote marks and
-/// punctuation, lowercase, drop locator words.
+/// range, expand daf marks, drop nikud/te'amim, map contextual ע"א/ע"ב amud marks,
+/// drop quote marks and punctuation, lowercase, drop locator words.
 pub fn ref_key_tokens(reference: &str) -> Vec<String> {
     let head = cut_trailing_range(reference);
     let cleaned = map_amud_marks(&remove_marks(&expand_daf_marks(head)));
@@ -285,6 +305,10 @@ mod tests {
         assert_eq!(build_ref_key("פרק א פסוק ב").as_deref(), Some("א ב"));
         assert_eq!(build_ref_key("בְּרֵאשִׁית א, א").as_deref(), Some("בראשית א א"));
         assert_eq!(build_ref_key("ב ע\"א").as_deref(), Some("ב א"));
+        assert_eq!(build_ref_key("ע\"א א").as_deref(), Some("עא א"));
+        assert_eq!(build_ref_key("ע\"ב א").as_deref(), Some("עב א"));
+        assert_eq!(build_ref_key("פרק ע\"א פסוק א").as_deref(), Some("עא א"));
+        assert_eq!(build_ref_key("ע\"א-ע\"ב").as_deref(), Some("עא"));
         assert_eq!(build_ref_key("לב יא-יג").as_deref(), Some("לב יא"));
         assert_eq!(build_ref_key("ב.-ג.").as_deref(), Some("ב א"));
         assert_eq!(build_partial_ref_key("שט ג").as_deref(), Some("~ שט ג"));

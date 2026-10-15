@@ -189,8 +189,116 @@ pub fn visible_units(html: &str) -> Vec<String> {
 /// Strip HTML tags and decode entities. `line.content` is raw HTML (`<h1>`, `<b>`,
 /// footnote markup, …); most consumers want plain text.
 pub fn strip_html_tags(input: &str) -> String {
-    let joined: String = visible_units(input).concat();
-    joined.trim().to_string()
+    strip_html_tags_limited(input, None)
+}
+
+/// Stream visible text into one output buffer. With a limit, stop as soon as the
+/// trimmed text is known to exceed it, which keeps snippets from scanning the rest
+/// of very long lines.
+fn strip_html_tags_limited(input: &str, limit: Option<usize>) -> String {
+    let capacity = limit.map_or(input.len(), |max| {
+        input
+            .len()
+            .min(max.saturating_mul(4).saturating_add('…'.len_utf8()))
+    });
+    let mut out = String::with_capacity(capacity);
+    let mut cursor = 0;
+    let mut started = false;
+    let mut visible_chars = 0;
+
+    while cursor < input.len() {
+        let Some(relative) = input[cursor..].find(['<', '&']) else {
+            if append_visible_text(
+                &mut out,
+                &input[cursor..],
+                limit,
+                &mut started,
+                &mut visible_chars,
+            ) {
+                return out;
+            }
+            break;
+        };
+        let special = cursor + relative;
+        if append_visible_text(
+            &mut out,
+            &input[cursor..special],
+            limit,
+            &mut started,
+            &mut visible_chars,
+        ) {
+            return out;
+        }
+
+        if input.as_bytes()[special] == b'<' {
+            cursor = input[special + 1..]
+                .find('>')
+                .map_or(input.len(), |end| special + 1 + end + 1);
+            continue;
+        }
+
+        // Match visible_units' ten-unit search window (the ampersand plus at most
+        // nine following Unicode scalar values) without materializing all chars.
+        let body_start = special + 1;
+        let semi = input[body_start..]
+            .char_indices()
+            .take(9)
+            .find_map(|(offset, c)| (c == ';').then_some(body_start + offset));
+        if let Some(semi) = semi {
+            let body = &input[body_start..semi];
+            if let Some(decoded) = decode_entity(body) {
+                if append_visible_text(&mut out, &decoded, limit, &mut started, &mut visible_chars)
+                {
+                    return out;
+                }
+            } else {
+                if append_visible_text(
+                    &mut out,
+                    &input[special..=semi],
+                    limit,
+                    &mut started,
+                    &mut visible_chars,
+                ) {
+                    return out;
+                }
+            }
+            cursor = semi + 1;
+        } else {
+            if append_visible_text(&mut out, "&", limit, &mut started, &mut visible_chars) {
+                return out;
+            }
+            cursor = body_start;
+        }
+    }
+
+    out.trim_end().to_string()
+}
+
+/// Append text after applying the same Unicode whitespace trim as `str::trim`, and
+/// return true once a non-whitespace character proves the limited result is cut.
+fn append_visible_text(
+    out: &mut String,
+    text: &str,
+    limit: Option<usize>,
+    started: &mut bool,
+    visible_chars: &mut usize,
+) -> bool {
+    for c in text.chars() {
+        if !*started && c.is_whitespace() {
+            continue;
+        }
+        *started = true;
+        *visible_chars += 1;
+        if limit.is_some_and(|max| *visible_chars > max) {
+            if !c.is_whitespace() {
+                out.push('…');
+                return true;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    false
 }
 
 /// Truncate to at most `n` chars (char-safe), appending `…` when cut.
@@ -206,7 +314,7 @@ pub fn truncate_text(s: &str, n: usize) -> String {
 
 /// Plain snippet of an HTML line: stripped and truncated.
 pub fn snippet(html: &str, n: usize) -> String {
-    truncate_text(&strip_html_tags(html), n)
+    strip_html_tags_limited(html, Some(n))
 }
 
 #[cfg(test)]
@@ -220,6 +328,13 @@ mod tests {
         assert_eq!(strip_html_tags("<h1>פרק</h1> א&nbsp;ב"), "פרק א ב");
         assert_eq!(strip_html_tags("&amp;"), "&");
         assert_eq!(strip_html_tags("a & b"), "a & b");
+    }
+
+    #[test]
+    fn snippets_stream_trimmed_text_and_keep_truncate_semantics() {
+        assert_eq!(snippet("<b>  אב ג ד</b>", 3), "אב …");
+        assert_eq!(snippet("<b>אב&nbsp; </b>", 3), "אב");
+        assert_eq!(snippet("<b>אב&nbsp; </b>", 2), "אב");
     }
 
     #[test]

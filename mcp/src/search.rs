@@ -21,7 +21,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use search_engine::api::search_engine::{
-    check_index_compatibility, configure_line_source, line_source_status, split_query_words,
+    check_index_compatibility, line_source_status, refresh_line_source, split_query_words,
     FacetCount, ResultGrouping, ResultsOrder, SearchEngine, SearchPageResult, SearchResult,
     SearchScope, TextStatus, WordMatchMode,
 };
@@ -306,8 +306,8 @@ impl Search {
             .to_str()
             .context("seforim.db path is not valid UTF-8")?
             .to_string();
-        configure_line_source(db_str.clone())
-            .with_context(|| format!("configuring the engine's line source at {db_str}"))?;
+        refresh_line_source(db_str.clone())
+            .with_context(|| format!("refreshing the engine's line source at {db_str}"))?;
 
         let mut engine = SearchEngine::open_read_only(&index_str)?;
         let lexical = lexical_db
@@ -546,8 +546,8 @@ pub struct SearchHit {
     /// seforim.db line index for official text books only.
     pub line_index: Option<i64>,
     /// For PDF hits: 1-based page number (segment + 1).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub page: Option<i64>,
+    pub is_pdf: bool,
     pub title: String,
     pub reference: String,
     /// Matched text with «…» around the matched term(s), HTML stripped.
@@ -616,6 +616,7 @@ impl SearchHit {
             book_id,
             line_index,
             page,
+            is_pdf: r.is_pdf,
             title: r.title,
             reference: r.reference,
             snippet: clean_snippet(&r.text),
@@ -731,11 +732,15 @@ mod tests {
         assert_eq!(hit.book_id, None);
         let hit = SearchHit::from_result(result("id:5", false, 7));
         assert_eq!(
-            (hit.source, hit.book_id, hit.line_index),
-            (SearchHitSource::Official, Some(5), Some(7))
+            (&hit.source, hit.book_id, hit.line_index),
+            (&SearchHitSource::Official, Some(5), Some(7))
         );
         assert_eq!(hit.snippet, "«א»ב");
+        let value = serde_json::to_value(&hit).unwrap();
+        assert_eq!(value["is_pdf"], false);
+        assert!(value.get("page").unwrap().is_null());
         let hit = SearchHit::from_result(result("/x.pdf", true, 0));
+        assert!(hit.is_pdf);
         assert_eq!((hit.source, hit.page), (SearchHitSource::Pdf, Some(1)));
     }
 

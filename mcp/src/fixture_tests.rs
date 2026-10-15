@@ -192,3 +192,101 @@ fn text_versions_toc_categories_and_info() {
     let hits = db.search_books("מפ", None, 10).unwrap();
     assert_eq!(hits[0].book_id, 2);
 }
+
+#[test]
+fn range_link_is_deduplicated_before_link_pagination() {
+    let db = fixture_db();
+    {
+        let inner = db.lock();
+        inner
+            .conn
+            .execute_batch(
+                "PRAGMA query_only=OFF;
+             INSERT INTO link VALUES (101, 1, 2, 11, 21, 1, 2, 1, 0);
+             PRAGMA query_only=ON;",
+            )
+            .unwrap();
+    }
+
+    let p1 = db
+        .get_links(1, Some((0, 2)), None, None, "outgoing", 1, 0)
+        .unwrap();
+    let p2 = db
+        .get_links(1, Some((0, 2)), None, None, "outgoing", 1, 1)
+        .unwrap();
+    assert_eq!(p1.len(), 1);
+    assert_eq!(p1[0].link_id, 100);
+    assert_eq!(p1[0].at_line_index, 0, "keep the first covered anchor");
+    assert_eq!(p2.len(), 1, "the next distinct link must be on page two");
+    assert_eq!(p2[0].link_id, 101);
+}
+
+#[test]
+fn range_commentaries_are_deduplicated_before_limit() {
+    let db = fixture_db();
+    {
+        let inner = db.lock();
+        inner
+            .conn
+            .execute_batch(
+                "PRAGMA query_only=OFF;
+             INSERT INTO link VALUES (101, 1, 2, 11, 21, 1, 2, 1, 0);
+             PRAGMA query_only=ON;",
+            )
+            .unwrap();
+    }
+
+    // Coverage duplicates used to consume the SQL limit before the second
+    // commentary could be returned.
+    let comments = db.get_commentaries(1, 0, 2, None, 2, 5).unwrap();
+    assert_eq!(comments.items.len(), 2);
+    assert_eq!(comments.items[0].target_line_index, 0);
+    assert_eq!(comments.items[1].target_line_index, 1);
+}
+
+#[test]
+fn both_directions_use_one_offset_over_a_stable_combined_list() {
+    let db = fixture_db();
+    {
+        let inner = db.lock();
+        inner
+            .conn
+            .execute_batch(
+                "PRAGMA query_only=OFF;
+             INSERT INTO link VALUES (300, 2, 3, 20, 30, 0, 3, 2, 0);
+             INSERT INTO link VALUES (301, 2, 3, 21, 30, 0, 3, 2, 0);
+             INSERT INTO link_range VALUES (300, 0, 21, 1);
+             INSERT INTO link_coverage VALUES (21, 300, 0);
+             PRAGMA query_only=ON;",
+            )
+            .unwrap();
+    }
+
+    let all = db
+        .get_links(2, Some((0, 1)), None, None, "both", 10, 0)
+        .unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].direction, "outgoing");
+    assert_eq!(all[1].direction, "outgoing");
+    assert_eq!(all[2].direction, "incoming");
+    let p1 = db
+        .get_links(2, Some((0, 1)), None, None, "both", 1, 0)
+        .unwrap();
+    let p2 = db
+        .get_links(2, Some((0, 1)), None, None, "both", 1, 1)
+        .unwrap();
+    let p3 = db
+        .get_links(2, Some((0, 1)), None, None, "both", 1, 2)
+        .unwrap();
+    let p4 = db
+        .get_links(2, Some((0, 1)), None, None, "both", 1, 3)
+        .unwrap();
+    assert_eq!(p1.len(), 1);
+    assert_eq!(p1[0].direction, "outgoing");
+    assert_eq!(p2.len(), 1);
+    assert_eq!(p2[0].direction, "outgoing");
+    assert_eq!(p3.len(), 1, "the incoming link must be reachable");
+    assert_eq!(p3[0].direction, "incoming");
+    assert_eq!(p3[0].link_id, all[2].link_id);
+    assert!(p4.is_empty());
+}

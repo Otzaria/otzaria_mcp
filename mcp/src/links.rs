@@ -160,6 +160,79 @@ pub struct LinkFilter<'a> {
 }
 
 impl Db {
+    /// Count unique outgoing links for pagination without loading snippets or anchors.
+    fn count_outgoing_links(
+        &self,
+        inner: &mut Inner,
+        book_id: i64,
+        window: Option<(i64, i64)>,
+        filter: &LinkFilter,
+    ) -> Result<i64> {
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+        let anchors_cte = match window {
+            Some((start, end)) => {
+                params.extend([book_id.into(), start.into(), end.into()]);
+                let coverage = if self.caps.link_coverage {
+                    " UNION SELECT lc.linkId FROM link_coverage lc JOIN win w ON w.id = lc.lineId WHERE lc.side = 0"
+                } else {
+                    ""
+                };
+                format!(
+                    "WITH win(id) AS (SELECT id FROM line WHERE bookId = ?1 AND lineIndex BETWEEN ?2 AND ?3), \
+                     anchors(linkId) AS (SELECT l.id FROM win w JOIN link l ON l.sourceLineId = w.id{coverage})"
+                )
+            }
+            None => {
+                params.push(book_id.into());
+                "WITH anchors(linkId) AS (SELECT l.id FROM link l WHERE l.sourceBookId = ?1)"
+                    .to_string()
+            }
+        };
+
+        let mut wheres = Vec::new();
+        if self.caps.link_suppressed_side {
+            wheres.push(
+                "NOT EXISTS (SELECT 1 FROM link_suppressed_side ss WHERE ss.linkId = l.id AND ss.side = 0)"
+                    .to_string(),
+            );
+        }
+        if let Some(types) = filter.types {
+            if !types.is_empty() {
+                let mut ors = Vec::new();
+                for t in types {
+                    params.push(t.clone().into());
+                    ors.push(format!("?{}", params.len()));
+                }
+                wheres.push(format!("ct.name IN ({})", ors.join(",")));
+            }
+        }
+        if let Some(ids) = filter.book_ids {
+            if !ids.is_empty() {
+                let mut ors = Vec::new();
+                for id in ids {
+                    params.push((*id).into());
+                    ors.push(format!("?{}", params.len()));
+                }
+                wheres.push(format!("l.targetBookId IN ({})", ors.join(",")));
+            }
+        }
+        let where_sql = if wheres.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", wheres.join(" AND "))
+        };
+        let sql = format!(
+            "{anchors_cte} \
+             SELECT COUNT(*) FROM anchors a JOIN link l ON l.id = a.linkId \
+             LEFT JOIN connection_type ct ON ct.id = l.connectionTypeId {where_sql}"
+        );
+        Ok(inner
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| {
+                r.get(0)
+            })?)
+    }
+
     /// Range-window link query for one direction. `window` = None means the whole book.
     #[allow(clippy::too_many_arguments)]
     fn window_links(
@@ -193,8 +266,14 @@ impl Db {
                 };
                 format!(
                     "WITH win(id) AS (SELECT id FROM line WHERE bookId = ?1 AND lineIndex BETWEEN ?2 AND ?3), \
+                     anchor_candidates(linkId, anchorLineId) AS ( \
+                       SELECT l.id, {this_line} FROM win w CROSS JOIN link l ON {this_line} = w.id{coverage}), \
                      anchors(linkId, anchorLineId) AS ( \
-                       SELECT l.id, {this_line} FROM win w CROSS JOIN link l ON {this_line} = w.id{coverage})"
+                       SELECT linkId, anchorLineId FROM ( \
+                         SELECT ac.linkId, ac.anchorLineId, \
+                                ROW_NUMBER() OVER (PARTITION BY ac.linkId ORDER BY ln.lineIndex, ln.id) AS rn \
+                           FROM anchor_candidates ac JOIN line ln ON ln.id = ac.anchorLineId \
+                       ) WHERE rn = 1)"
                 )
             }
             None => {
@@ -447,19 +526,53 @@ impl Db {
         };
         let mut inner = self.lock();
         let mut rows = Vec::new();
+        if want_out && want_in {
+            let offset = offset.max(0);
+            let mut remaining = limit.max(0);
+            if remaining == 0 {
+                return Ok(rows);
+            }
+            let outgoing_count = self.count_outgoing_links(&mut inner, book_id, window, &filter)?;
+            let mut incoming_offset = 0;
+            if offset < outgoing_count {
+                let outgoing_take = remaining.min(outgoing_count - offset);
+                let raw = self.window_links(
+                    &mut inner,
+                    book_id,
+                    window,
+                    true,
+                    &filter,
+                    outgoing_take,
+                    offset,
+                )?;
+                rows.extend(self.finish_links(&mut inner, raw, true, 160)?);
+                remaining -= outgoing_take;
+            } else {
+                incoming_offset = offset - outgoing_count;
+            }
+            if remaining > 0 {
+                let raw = self.window_links(
+                    &mut inner,
+                    book_id,
+                    window,
+                    false,
+                    &filter,
+                    remaining,
+                    incoming_offset,
+                )?;
+                rows.extend(self.finish_links(&mut inner, raw, false, 160)?);
+            }
+            return Ok(rows);
+        }
         if want_out {
             let raw =
                 self.window_links(&mut inner, book_id, window, true, &filter, limit, offset)?;
             rows.extend(self.finish_links(&mut inner, raw, true, 160)?);
         }
         if want_in {
-            let remaining = limit - rows.len() as i64;
-            if remaining > 0 {
-                let raw = self.window_links(
-                    &mut inner, book_id, window, false, &filter, remaining, offset,
-                )?;
-                rows.extend(self.finish_links(&mut inner, raw, false, 160)?);
-            }
+            let raw =
+                self.window_links(&mut inner, book_id, window, false, &filter, limit, offset)?;
+            rows.extend(self.finish_links(&mut inner, raw, false, 160)?);
         }
         Ok(rows)
     }

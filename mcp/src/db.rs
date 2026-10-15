@@ -280,6 +280,84 @@ impl Db {
         Ok(out)
     }
 
+    /// Stored endpoints for the 0.1 JSON fields, fetched and decoded in batches.
+    pub(crate) fn legacy_link_fields(
+        &self,
+        link_ids: &[i64],
+    ) -> Result<HashMap<i64, serde_json::Value>> {
+        struct Endpoint {
+            book_id: i64,
+            title: String,
+            line_id: i64,
+            line_index: i64,
+            he_ref: Option<String>,
+        }
+
+        let mut inner = self.lock();
+        let mut ids = link_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut endpoints = Vec::new();
+        for chunk in ids.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut stmt = inner.conn.prepare(&format!(
+                "SELECT l.id, sb.id, sb.title, sl.id, sl.lineIndex, sl.heRef,
+                        tb.id, tb.title, tl.id, tl.lineIndex, tl.heRef
+                   FROM link l JOIN book sb ON sb.id = l.sourceBookId
+                   JOIN book tb ON tb.id = l.targetBookId
+                   JOIN line sl ON sl.id = l.sourceLineId
+                   JOIN line tl ON tl.id = l.targetLineId
+                  WHERE l.id IN ({placeholders})"
+            ))?;
+            let endpoint = |r: &rusqlite::Row<'_>, start: usize| -> rusqlite::Result<Endpoint> {
+                Ok(Endpoint {
+                    book_id: r.get(start)?,
+                    title: r.get(start + 1)?,
+                    line_id: r.get(start + 2)?,
+                    line_index: r.get(start + 3)?,
+                    he_ref: r.get(start + 4)?,
+                })
+            };
+            endpoints.extend(
+                stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                    Ok((r.get::<_, i64>(0)?, endpoint(r, 1)?, endpoint(r, 6)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        let line_ids: Vec<_> = endpoints
+            .iter()
+            .flat_map(|(_, source, target)| [source.line_id, target.line_id])
+            .collect();
+        let texts = self.texts_by_line_id(&mut inner, &line_ids)?;
+        Ok(endpoints
+            .into_iter()
+            .map(|(id, source, target)| {
+                let snippet = |line_id| {
+                    texts
+                        .get(&line_id)
+                        .map(|t| text::snippet(t, 160))
+                        .unwrap_or_default()
+                };
+                (
+                    id,
+                    serde_json::json!({
+                        "source_book_id": source.book_id,
+                        "source_book_title": source.title,
+                        "source_line_index": source.line_index,
+                        "source_ref": source.he_ref,
+                        "source_snippet": snippet(source.line_id),
+                        "target_book_id": target.book_id,
+                        "target_book_title": target.title,
+                        "target_line_index": target.line_index,
+                        "target_ref": target.he_ref,
+                        "target_snippet": snippet(target.line_id),
+                    }),
+                )
+            })
+            .collect())
+    }
+
     /// Decoded lines `[start, end]` of a book: (lineIndex, line.id, heRef, html).
     pub(crate) fn lines_in_range(
         &self,

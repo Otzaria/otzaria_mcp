@@ -3153,6 +3153,14 @@ pub fn configure_line_source(db_path: String) -> Result<()> {
     crate::line_source::configure(&db_path)
 }
 
+/// Repoints the line source and unconditionally closes its connection and clears
+/// its caches, even when `db_path` is unchanged. This lets callers reopen a
+/// database atomically replaced at the same path. Active line-window reads finish
+/// before the old connection is closed; the next read opens the new file.
+pub fn refresh_line_source(db_path: String) -> Result<()> {
+    crate::line_source::refresh(&db_path)
+}
+
 /// Closes the library database so it can be renamed or replaced, waiting for a
 /// window that is reading it (milliseconds). Returns once the file handle is
 /// released. Calls nest; while suspended, `LibraryDb` results come back
