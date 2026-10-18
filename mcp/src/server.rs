@@ -153,7 +153,8 @@ pub struct FullTextSearchParams {
     #[serde(default)]
     pub offset: Option<u32>,
     /// Result order: "catalogue" (default, library order), "relevance" or "generation"
-    /// (chronological by era).
+    /// (chronological by era). Both follow the order the app stored with the index; books
+    /// it does not list come after the listed ones.
     #[serde(default)]
     pub order: Option<String>,
     /// advanced/exact: max words allowed between adjacent query words (default 0, as in
@@ -502,7 +503,7 @@ impl OtzariaServer {
     #[tool(
         name = "get_text",
         description = "Retrieve lines of a book by book_id starting at a 0-based line_index (decodes the \
-                       library's compressed text). Returns each line's heRef and content, total_lines, and \
+                       library's compressed text and restores schema-7 footnote bodies). Returns each line's heRef and content, total_lines, and \
                        next_line_index for paging. line_index is a line address (the value full_text_search / \
                        resolve_ref / get_book_toc return), not a page number. Pass `version` to read another \
                        edition listed in get_book_info.versions.",
@@ -814,7 +815,7 @@ impl OtzariaServer {
         description = "Word-level link anchors inside one line (link_anchor): for each anchor, its \
                        visible-character range, the anchored words (or the text around a point marker such \
                        as a commentary letter), its label, and the linked book/line/heRef. Returns the line's \
-                       visible text too, so offsets can be checked.",
+                       stored visible text too, excluding bodies separated into line_note, so offsets can be checked.",
         annotations(read_only_hint = true)
     )]
     pub async fn get_line_anchors(

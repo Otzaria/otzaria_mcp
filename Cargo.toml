@@ -6,16 +6,17 @@ default-members = ["mcp"]
 resolver = "2"
 
 # `search_engine` is VENDORED (not a submodule) at vendor/otzaria_search_engine —
-# it is the pub.dev otzaria_search_engine 3.1.0 rust crate, the version the current
-# Otzaria app pins (`otzaria_search_engine: ^3.1.0`, pubspec.lock 3.1.0) and that
-# builds the on-disk Tantivy index (index schema version 5). Matching the engine to
-# the index is required: an older engine refuses a newer index (`engine_too_old`) and
-# a newer one may need a rebuild. See vendor/otzaria_search_engine/VENDORED.md.
+# the otzaria_search_engine rust crate (4.1.0 + merged stable-book-id support,
+# official commit 30e8f1682428d5cc252b3e610f2c9cc06c04b81f, index schema 7).
+# Matching the engine to the index is required: an older engine refuses a
+# newer index (`engine_too_old`) and a newer one may need a rebuild.
+# See vendor/otzaria_search_engine/VENDORED.md.
 
 # The engine's own `[patch.crates-io]` is ignored when it is a dependency, so the two
 # patches it relies on are repeated here, exactly as in its manifest:
 #  * tantivy-fst 0.5.0 with the regex-DFA STATE_LIMIT raised to 8192 (RegexPhraseQuery);
-#  * Otzaria's tantivy fork (0.26.2 + quickwit-oss/tantivy#3134–#3137) at the pinned rev.
+#  * Otzaria's tantivy fork (0.26.2 + quickwit-oss/tantivy#3059, #3134–#3138, #3189–#3191)
+#    at the pinned rev.
 [patch.crates-io]
 tantivy-fst = { path = "vendor/otzaria_search_engine/rust/vendor/tantivy-fst" }
-tantivy = { git = "https://github.com/Otzaria/tantivy", rev = "85b76fe364f11c452bd2ce941521ece474a02227" }
+tantivy = { git = "https://github.com/Otzaria/tantivy", rev = "8b8832069b871e11fe0fd0da1c4c2de8c270596f" }

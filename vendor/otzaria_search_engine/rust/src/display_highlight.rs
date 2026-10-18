@@ -8,15 +8,16 @@
 //! `combined_pattern` remains compatible for a single word. For multiple words
 //! it is the ECMAScript never-match sentinel `(?!)`; callers must use `matcher`.
 //! Morphological bounds belong to each normalized spelling/alternative branch,
-//! rather than the typed word's length. Boundary waiver only applies to the
-//! outer endpoints, preserving the historical root-highlight behavior.
+//! rather than the typed word's length. A waived boundary lets a word carry
+//! its own affixes — at the phrase's outer endpoints as inside it. A caller
+//! waiving a plain word's boundary gets the root anywhere in its token.
 
 use std::collections::{HashMap, HashSet};
 
 use once_cell::sync::Lazy;
 
 use crate::hebrew_query::{
-    aramaic_root_variants, generate_spelling_variations, highlight_affix_patterns, is_word_mark,
+    affix_arms, aramaic_root_variants, generate_spelling_variations, is_word_mark,
     normalize_for_index, split_query_words, word_flags_at, WordFlags, BREAKING_TAG_NAMES,
     MAX_SPELLING_BRANCHES,
 };
@@ -188,8 +189,10 @@ static WORD_SEPARATOR: Lazy<String> = Lazy::new(|| {
     )
 });
 
-/// Cumulative per-word pattern length budget. Display patterns are ~3× longer
-/// than index-term patterns (each letter carries a marks class), so this is
+/// Pattern-body budget for each source (query shape or matched terms).
+/// A hybrid affix+typo word has one bounded source of each kind, so spelling
+/// branches cannot consume the matched-term allowance. Display patterns are
+/// ~3× longer than index-term patterns (each letter carries a marks class), so this is
 /// looser than `hebrew_query::MAX_PATTERN_CHARS`; at least one branch is
 /// always kept. Raised with the search-side budgets (parity), but capped
 /// short of a strict 3× of the index budget — past ~12k chars the app-side
@@ -389,8 +392,13 @@ fn matcher_branches(
             break;
         }
         total += len;
-        for (lead, trail) in highlight_affix_patterns(&root, flags) {
-            branches.push((lead, pattern.clone(), trail));
+        for arm in affix_arms(&root, flags, false) {
+            let core = if arm.core == root {
+                pattern.clone()
+            } else {
+                charwise_display_pattern(&arm.core)
+            };
+            branches.push((arm.lead, core, arm.trail));
         }
     }
     branches
@@ -409,6 +417,8 @@ fn matcher_branches(
 /// - `alternative_words` — synonyms per word position (0-indexed).
 /// - `search_options` — per-word option checkboxes, keyed `"{word}_{index}"`,
 ///   with the same word tokenization used for engine queries.
+/// - `any_order` — the words in any order within one window (see
+///   [`crate::hebrew_query::resolve_proximity`]).
 ///
 /// Returns `None` when the query contains no highlightable words.
 pub fn build_display_highlight(
@@ -417,6 +427,7 @@ pub fn build_display_highlight(
     custom_spacing: &HashMap<String, String>,
     alternative_words: &HashMap<u32, Vec<String>>,
     search_options: &HashMap<String, HashMap<String, bool>>,
+    any_order: bool,
 ) -> Option<DisplayHighlight> {
     let words = split_query_words(query);
     if words.is_empty() {
@@ -457,6 +468,7 @@ pub fn build_display_highlight(
         plans,
         distance,
         custom_spacing,
+        any_order,
     )
 }
 
@@ -469,12 +481,18 @@ fn assemble_display_highlight(
     plans: Vec<Vec<(String, String, String)>>,
     distance: u32,
     custom_spacing: &HashMap<String, String>,
+    any_order: bool,
 ) -> Option<DisplayHighlight> {
     if word_patterns.is_empty() {
         return None;
     }
 
-    let spacing = spacing_for_gaps(custom_spacing, distance, word_patterns.len());
+    let proximity = crate::hebrew_query::resolve_proximity(
+        spacing_for_gaps(custom_spacing, distance, word_patterns.len()),
+        distance,
+        custom_spacing,
+        any_order,
+    );
     let combined_pattern = if word_patterns.len() == 1 {
         word_patterns[0].clone()
     } else {
@@ -485,7 +503,7 @@ fn assemble_display_highlight(
 
     let matcher = crate::highlight_matcher::PreparedHighlightMatcher::new(
         plans,
-        spacing,
+        proximity,
         word_boundary_eligible.clone(),
     )
     .ok()?;
@@ -507,7 +525,7 @@ fn assemble_display_highlight(
 /// [`build_word_display_pattern`]: the budget keeps `word` itself first, then
 /// the terms closest to it in length — cutting longest-first dropped the typed
 /// word whenever it had thousands of variants.
-fn build_terms_display_pattern(terms: &[String], word: &str) -> String {
+fn build_terms_display_pattern(terms: &[String], word: &str, budget: usize) -> String {
     let word_len = word.chars().count();
     // Count UTF-8 characters once per term, not for every sort comparison.
     let mut by_priority: Vec<(&str, usize)> = terms
@@ -522,7 +540,7 @@ fn build_terms_display_pattern(terms: &[String], word: &str) -> String {
     for (term, term_len) in by_priority {
         let branch = charwise_display_pattern(term);
         let len = branch.chars().count();
-        if !kept.is_empty() && total + len > MAX_DISPLAY_PATTERN_CHARS {
+        if !kept.is_empty() && total + len > budget {
             break;
         }
         total += len;
@@ -538,6 +556,21 @@ fn build_terms_display_pattern(terms: &[String], word: &str) -> String {
     }
 }
 
+/// The display branches applied to normalized index terms. Mark classes and
+/// typographic quote forms cannot occur in those terms; keeping them in this
+/// temporary classifier multiplies compilation work without adding coverage.
+fn normalized_term_coverage_pattern(plan: &[(String, String, String)]) -> String {
+    let branches: Vec<String> = plan
+        .iter()
+        .map(|(lead, root, trail)| format!("(?:{lead})(?:{root})(?:{trail})"))
+        .collect();
+    format!("\\A(?:{})\\z", branches.join("|"))
+        .replace(ATTACHED_MARKS_CLASS, "")
+        .replace(OPTIONAL_QUOTES, "[\"']{0,2}")
+        .replace(GERSHAYIM_DISPLAY_CLASS, "(?:\"|'{2})")
+        .replace(GERESH_DISPLAY_CLASS, "'")
+}
+
 /// Builds display-highlight patterns from the *index terms the query actually
 /// matches* — one `Vec<String>` per query word, aligned with
 /// [`split_query_words`] over the engine-normalized query (the same order
@@ -545,16 +578,17 @@ fn build_terms_display_pattern(terms: &[String], word: &str) -> String {
 ///
 /// Per word, the pattern source depends on the active options:
 ///
-/// - **Typo tolerance** (with or without other options): the matched index
-///   terms — Levenshtein variants the query-shape builder cannot reproduce —
-///   are painted as whole tokens. Token boundaries are kept unless a
-///   boundary-breaking expansion is also active, in which case they are waived
-///   so the variant still highlights inside an inflected form.
-/// - **Boundary-breaking expansion without typo** (prefix / suffix / partial):
-///   the compact query-shape pattern highlights only the typed substring/root
-///   with boundaries waived. Unlike the term list it is not budget-truncated,
-///   so every occurrence highlights — the term list can drop visible words when
-///   the option matches thousands of index tokens.
+/// - **Typo tolerance without expansion**: the matched index terms —
+///   Levenshtein variants the query-shape builder cannot reproduce — are
+///   painted as whole tokens, boundaries kept.
+/// - **Boundary-breaking expansion** (prefix / suffix / partial): the compact
+///   query-shape pattern highlights only the typed substring/root with
+///   boundaries waived. Unlike the term list it is not budget-truncated, so
+///   every occurrence highlights — the term list can drop visible words when
+///   the option matches thousands of index tokens. With typo tolerance, the
+///   matched terms the word's own branches do not accept are added as whole
+///   tokens, with their own matched-term budget. Each source is bounded;
+///   combining them can use up to twice the per-source allowance.
 /// - **No expansion** (plain / spelling): the matched whole tokens, boundaries
 ///   kept.
 ///
@@ -569,6 +603,7 @@ pub fn build_display_highlight_from_terms(
     alternative_words: &HashMap<u32, Vec<String>>,
     search_options: &HashMap<String, HashMap<String, bool>>,
     per_word_terms: &[Vec<String>],
+    any_order: bool,
 ) -> Option<DisplayHighlight> {
     let normalized = normalize_for_index(query);
     let words = split_query_words(&normalized);
@@ -590,8 +625,7 @@ pub fn build_display_highlight_from_terms(
         // הרחבה ששוברת גבול-מילה (קידומת/סיומת/חלק-ממילה): ה-query-shape
         // קומפקטי, מכסה כל התאמה ומדגיש רק את החלק שהוקלד — בניגוד למונחי-
         // האינדקס שחסומים בתקציב ומדגישים מילים שלמות. מונחי-האינדקס נשמרים
-        // לשגיאות-כתיב (וריאנטי Levenshtein שה-query-shape אינו יודע להפיק);
-        // כשגם הרחבה פעילה מוותרים על גבול-המילה כדי שהווריאנטים לא ייפסלו.
+        // לשגיאות-כתיב (וריאנטים שה-query-shape אינו יודע להפיק).
         let has_expansion = flags.prefix
             || flags.suffix
             || flags.gram_prefix
@@ -599,18 +633,39 @@ pub fn build_display_highlight_from_terms(
             || flags.partial
             || flags.aramaic_prefix;
         // מונחי-האינדקס הם טוקנים שלמים, כולל הקידומת/הסיומת — בלי חלון.
-        let (pattern, boundary_eligible, plan) =
-            if !matched.is_empty() && !(has_expansion && !flags.typo) {
-                let pattern = build_terms_display_pattern(matched, word);
-                let plan = vec![(String::new(), pattern.clone(), String::new())];
-                (pattern, !has_expansion, plan)
-            } else {
-                (
-                    build_word_display_pattern(word, &flags, alts)?,
-                    !has_expansion,
-                    matcher_branches(word, &flags, alts),
-                )
-            };
+        let (pattern, boundary_eligible, plan) = if !matched.is_empty() && !has_expansion {
+            let pattern = build_terms_display_pattern(matched, word, MAX_DISPLAY_PATTERN_CHARS);
+            let plan = vec![(String::new(), pattern.clone(), String::new())];
+            (pattern, true, plan)
+        } else {
+            let mut pattern = build_word_display_pattern(word, &flags, alts)?;
+            let mut plan = matcher_branches(word, &flags, alts);
+            if flags.typo && !pattern.is_empty() {
+                // מונח שענפי המילה כבר תופסים היה ממלא את התקציב ודוחק את וריאנטי-הטעות.
+                let covered_pattern = normalized_term_coverage_pattern(&plan);
+                let covered = regex::RegexBuilder::new(&covered_pattern)
+                    .case_insensitive(true)
+                    .build()
+                    .ok();
+                let typo_terms: Vec<String> = matched
+                    .iter()
+                    .filter(|term| !covered.as_ref().is_some_and(|re| re.is_match(term)))
+                    .cloned()
+                    .collect();
+                // Keep the original matched-term allowance independently of
+                // the query shape. Full/defective spelling can fill the shape
+                // budget even when the index contains only two typo tokens.
+                // Covered forms need no term slots; every typo kept by the old
+                // terms-only builder can therefore still fit here.
+                let typo_pattern =
+                    build_terms_display_pattern(&typo_terms, word, MAX_DISPLAY_PATTERN_CHARS);
+                if !typo_pattern.is_empty() {
+                    pattern = format!("(?:{pattern}|{typo_pattern})");
+                    plan.push((String::new(), typo_pattern, String::new()));
+                }
+            }
+            (pattern, !has_expansion, plan)
+        };
         if pattern.is_empty() {
             continue;
         }
@@ -625,6 +680,7 @@ pub fn build_display_highlight_from_terms(
         plans,
         distance,
         custom_spacing,
+        any_order,
     )
 }
 
@@ -948,8 +1004,15 @@ mod tests {
     }
 
     fn build(query: &str) -> DisplayHighlight {
-        build_display_highlight(query, 0, &HashMap::new(), &HashMap::new(), &HashMap::new())
-            .expect("pattern")
+        build_display_highlight(
+            query,
+            0,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+        )
+        .expect("pattern")
     }
 
     fn options_for(
@@ -1012,6 +1075,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            false,
         )
         .unwrap();
         assert_eq!(hl.matcher.find_matches("שלום א ב עולם", &[]).len(), 1);
@@ -1039,6 +1103,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
+                false,
             )
             .unwrap();
             if !hl.matcher.find_matches(text, &[]).is_empty() {
@@ -1153,6 +1218,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            false,
         )
         .unwrap();
         assert!(
@@ -1219,9 +1285,15 @@ mod tests {
     #[test]
     fn custom_spacing_overrides_distance() {
         let spacing = HashMap::from([("0-1".to_string(), "3".to_string())]);
-        let hl =
-            build_display_highlight("שלום עולם", 1, &spacing, &HashMap::new(), &HashMap::new())
-                .unwrap();
+        let hl = build_display_highlight(
+            "שלום עולם",
+            1,
+            &spacing,
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+        )
+        .unwrap();
         assert_eq!(hl.matcher.find_matches("שלום א ב ג עולם", &[]).len(), 1);
         assert!(hl.matcher.find_matches("שלום א ב ג ד עולם", &[]).is_empty());
     }
@@ -1235,6 +1307,7 @@ mod tests {
             &spacing,
             &HashMap::new(),
             &HashMap::new(),
+            false,
         )
         .unwrap();
         // Gap 0-1 has no key → falls back to the max custom value (4).
@@ -1273,7 +1346,8 @@ mod tests {
     fn spelling_option_fans_variants() {
         let options = options_for("שלום", 0, "כתיב מלא/חסר");
         let hl =
-            build_display_highlight("שלום", 0, &HashMap::new(), &HashMap::new(), &options).unwrap();
+            build_display_highlight("שלום", 0, &HashMap::new(), &HashMap::new(), &options, false)
+                .unwrap();
         assert!(hl.combined_pattern.starts_with("(?:"));
         assert!(hl.combined_pattern.contains('|'));
         // The defective spelling (שלם) must be one of the branches.
@@ -1293,8 +1367,15 @@ mod tests {
             "חלק ממילה",
         ] {
             let options = options_for("ספר", 0, option);
-            let hl = build_display_highlight("ספר", 0, &HashMap::new(), &HashMap::new(), &options)
-                .unwrap();
+            let hl = build_display_highlight(
+                "ספר",
+                0,
+                &HashMap::new(),
+                &HashMap::new(),
+                &options,
+                false,
+            )
+            .unwrap();
             assert_eq!(hl.word_boundary_eligible, vec![false], "option: {option}");
             // The pattern stays the plain root — the boundary flag alone
             // widens matching to inflected words.
@@ -1312,9 +1393,15 @@ mod tests {
 
     fn combined_matches(query: &str, distance: u32, option: &str, text: &str) -> bool {
         let options = all_words_option(query, option);
-        let hl =
-            build_display_highlight(query, distance, &HashMap::new(), &HashMap::new(), &options)
-                .unwrap();
+        let hl = build_display_highlight(
+            query,
+            distance,
+            &HashMap::new(),
+            &HashMap::new(),
+            &options,
+            false,
+        )
+        .unwrap();
         !hl.matcher.find_matches(text, &[]).is_empty()
     }
 
@@ -1381,6 +1468,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            false,
         )
         .unwrap();
         !hl.matcher.find_matches(text, &[]).is_empty()
@@ -1431,6 +1519,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            false,
         )
         .unwrap();
         assert_eq!(hl.combined_pattern, "(?!)");
@@ -1451,9 +1540,15 @@ mod tests {
     #[test]
     fn alternatives_become_branches() {
         let alternatives = HashMap::from([(0u32, vec!["חכם".to_string()])]);
-        let hl =
-            build_display_highlight("צדיק", 0, &HashMap::new(), &alternatives, &HashMap::new())
-                .unwrap();
+        let hl = build_display_highlight(
+            "צדיק",
+            0,
+            &HashMap::new(),
+            &alternatives,
+            &HashMap::new(),
+            false,
+        )
+        .unwrap();
         assert!(hl.combined_pattern.starts_with("(?:"));
         assert!(hl
             .combined_pattern
@@ -1469,7 +1564,8 @@ mod tests {
                     0,
                     &HashMap::new(),
                     &HashMap::new(),
-                    &HashMap::new()
+                    &HashMap::new(),
+                    false
                 )
                 .is_none(),
                 "query: {query:?}"
@@ -1487,19 +1583,27 @@ mod tests {
     fn terms_pattern_sorts_longest_first() {
         // Leftmost-first alternation: ספר before הספרים would truncate the
         // longer word's highlight to its inner substring.
-        let p = build_terms_display_pattern(&["ספר".to_string(), "הספרים".to_string()], "ספר");
+        let p = build_terms_display_pattern(
+            &["ספר".to_string(), "הספרים".to_string()],
+            "ספר",
+            MAX_DISPLAY_PATTERN_CHARS,
+        );
         assert_eq!(p, format!("(?:{}|{})", charwise("הספרים"), charwise("ספר")));
     }
 
     #[test]
     fn terms_pattern_dedups_and_bounds_budget() {
-        let dup = build_terms_display_pattern(&["ספר".to_string(), "ספר".to_string()], "ספר");
+        let dup = build_terms_display_pattern(
+            &["ספר".to_string(), "ספר".to_string()],
+            "ספר",
+            MAX_DISPLAY_PATTERN_CHARS,
+        );
         assert_eq!(dup, charwise("ספר"));
 
         // Terms far beyond the char budget: the pattern stays bounded but
         // never empty.
         let many: Vec<String> = (0..2_000).map(|i| format!("מלה{i:04}")).collect();
-        let p = build_terms_display_pattern(&many, "ספר");
+        let p = build_terms_display_pattern(&many, "ספר", MAX_DISPLAY_PATTERN_CHARS);
         assert!(!p.is_empty());
         // The budget bounds the branch bodies; `|` separators and the `(?:)`
         // wrapper add at most one char per branch plus the group frame.
@@ -1514,7 +1618,7 @@ mod tests {
         let mut terms: Vec<String> = (0..2_000).map(|i| format!("מימים{i:04}")).collect();
         terms.push("מי".to_string());
         terms.push("מים".to_string());
-        let p = build_terms_display_pattern(&terms, "מי");
+        let p = build_terms_display_pattern(&terms, "מי", MAX_DISPLAY_PATTERN_CHARS);
         let re = regex::Regex::new(&format!("^(?:{p})$")).unwrap();
         assert!(re.is_match("מי"));
         assert!(re.is_match("מים"));
@@ -1531,6 +1635,7 @@ mod tests {
             &HashMap::new(),
             &options,
             &[vec!["מסה".to_string()]],
+            false,
         )
         .unwrap();
         assert_eq!(hl.combined_pattern, charwise("מסה"));
@@ -1544,7 +1649,8 @@ mod tests {
         let options = options_for("ספר", 0, "חלק ממילה");
 
         let query_shape =
-            build_display_highlight("ספר", 0, &HashMap::new(), &HashMap::new(), &options).unwrap();
+            build_display_highlight("ספר", 0, &HashMap::new(), &HashMap::new(), &options, false)
+                .unwrap();
         assert_eq!(query_shape.word_boundary_eligible, vec![false]);
 
         let from_terms = build_display_highlight_from_terms(
@@ -1554,6 +1660,7 @@ mod tests {
             &HashMap::new(),
             &options,
             &[vec!["הספרים".to_string(), "ספר".to_string()]],
+            false,
         )
         .unwrap();
         // מילת חלק-ממילה מדגישה את התת-מחרוזת שהוקלדה (כמו ה-query-shape),
@@ -1581,11 +1688,107 @@ mod tests {
             &HashMap::new(),
             &options,
             &[vec!["ספר".to_string(), "םפר".to_string()]],
+            false,
         )
         .unwrap();
         // הווריאנט השגוי נשמר בתבנית, והגבול מוותר (לא נדחה בתוך צורה מורחבת).
         assert!(hl.combined_pattern.contains(&charwise("םפר")));
         assert_eq!(hl.word_boundary_eligible, vec![false]);
+    }
+
+    #[test]
+    fn normalized_term_classifier_preserves_display_coverage() {
+        let words = ["ספר", "קונטרסים", "רמב\"ם", "תוס'", "Book"];
+        let options = [
+            "קידומות",
+            "סיומות",
+            "קידומות דקדוקיות",
+            "סיומות דקדוקיות",
+            "חלק ממילה",
+            "קידומות ארמיות",
+        ];
+        for word in words {
+            for option in options {
+                let flags = WordFlags::from_map(&HashMap::from([
+                    (option.to_string(), true),
+                    ("כתיב מלא/חסר".to_string(), true),
+                ]));
+                let plan = matcher_branches(word, &flags, &["חכם".into()]);
+                let display = plan
+                    .iter()
+                    .map(|(lead, root, trail)| format!("(?:{lead})(?:{root})(?:{trail})"))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                let display = regex::RegexBuilder::new(&format!("\\A(?:{display})\\z"))
+                    .case_insensitive(true)
+                    .build()
+                    .unwrap();
+                let normalized = regex::RegexBuilder::new(&normalized_term_coverage_pattern(&plan))
+                    .case_insensitive(true)
+                    .build()
+                    .unwrap();
+                for term in display_terms(word, &flags, &["חכם".into()]) {
+                    for prefix in ["", "ה", "ד", "אב", "אבגדה"] {
+                        for suffix in ["", "א", "ים", "אב", "אבגדהוז"] {
+                            let term = format!("{prefix}{term}{suffix}");
+                            let normalized_term = normalize_for_index(&term);
+                            assert_eq!(
+                                display.is_match(&normalized_term),
+                                normalized.is_match(&normalized_term),
+                                "word={word}, option={option}, term={normalized_term}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_keeps_the_old_typo_allowance_when_spelling_fills_its_budget() {
+        let word = "קונטרסים";
+        let options = HashMap::from([(
+            format!("{word}_0"),
+            ["קידומות", "סיומות", "שגיאות כתיב", "כתיב מלא/חסר"]
+                .iter()
+                .map(|o| (o.to_string(), true))
+                .collect(),
+        )]);
+        let letters: Vec<char> = "אבגדהוזחטיכלמנסעפצקרשת".chars().collect();
+        let mut terms = Vec::new();
+        for a in &letters {
+            for b in &letters {
+                terms.push(format!("כונטרסים{a}{b}"));
+            }
+        }
+        terms.extend(["כונטרסים".into(), "קונטרשים".into()]);
+        let old = build_terms_display_pattern(&terms, word, MAX_DISPLAY_PATTERN_CHARS);
+        let old = regex::Regex::new(&format!("\\A(?:{old})\\z")).unwrap();
+        let hl = build_display_highlight_from_terms(
+            word,
+            0,
+            &HashMap::new(),
+            &HashMap::new(),
+            &options,
+            &[terms.clone()],
+            false,
+        )
+        .unwrap();
+        // Two independent bounded sources, including alternation frames.
+        assert!(hl.word_patterns[0].chars().count() <= 2 * MAX_DISPLAY_PATTERN_CHARS + 128);
+        for term in terms.iter().filter(|t| old.is_match(t)) {
+            assert!(
+                !hl.matcher.find_matches(term, &[]).is_empty(),
+                "lost prior typo: {term}"
+            );
+        }
+        for text in ["הקונטרסים", "הקונטרסימא", "כונטרסים", "קונטרשים"]
+        {
+            assert!(
+                !hl.matcher.find_matches(text, &[]).is_empty(),
+                "lost form: {text}"
+            );
+        }
     }
 
     #[test]
@@ -1598,6 +1801,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &[Vec::new(), vec!["עולם".to_string()]],
+            false,
         )
         .unwrap();
         assert_eq!(hl.word_patterns.len(), 2);
@@ -1618,10 +1822,12 @@ mod tests {
             &HashMap::new(),
             &options,
             &[],
+            false,
         )
         .unwrap();
         let query_shape =
-            build_display_highlight("שלום", 0, &HashMap::new(), &HashMap::new(), &options).unwrap();
+            build_display_highlight("שלום", 0, &HashMap::new(), &HashMap::new(), &options, false)
+                .unwrap();
         assert_eq!(from_terms.combined_pattern, query_shape.combined_pattern);
         assert_eq!(
             from_terms.word_boundary_eligible,
@@ -1634,9 +1840,15 @@ mod tests {
         // A word made of optional letters explodes 2^n in the old Dart code;
         // here the branch count must respect the spelling budget.
         let options = options_for("ויוויוויו", 0, "כתיב מלא/חסר");
-        let hl =
-            build_display_highlight("ויוויוויו", 0, &HashMap::new(), &HashMap::new(), &options)
-                .unwrap();
+        let hl = build_display_highlight(
+            "ויוויוויו",
+            0,
+            &HashMap::new(),
+            &HashMap::new(),
+            &options,
+            false,
+        )
+        .unwrap();
         let branch_count = hl.word_patterns[0].matches('|').count() + 1;
         assert!(branch_count <= MAX_SPELLING_BRANCHES);
     }

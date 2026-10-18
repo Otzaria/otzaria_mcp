@@ -809,7 +809,9 @@ impl Db {
     /// (or, for a point anchor, the text around the marker) and the link's other side.
     pub fn get_line_anchors(&self, book_id: i64, line_index: i64) -> Result<Option<LineAnchors>> {
         let mut inner = self.lock();
-        let lines = self.lines_in_range(&mut inner, book_id, line_index, line_index)?;
+        // Stored anchors exclude the bodies removed into line_note. Keep both the
+        // reported text and its offsets in that original coordinate system.
+        let lines = self.raw_lines_in_range(&mut inner, book_id, line_index, line_index)?;
         let Some((_, line_id, he_ref, html)) = lines.into_iter().next() else {
             return Ok(None);
         };
@@ -994,7 +996,7 @@ pub struct LineAnchors {
     pub he_ref: Option<String>,
     /// Length of `text` in anchor coordinates (visible chars).
     pub visible_length: usize,
-    /// The line's visible text (HTML stripped) — anchor offsets index into it.
+    /// Stored visible text (HTML stripped, no separated note bodies); offsets index into it.
     pub text: String,
     pub anchors: Vec<LineAnchor>,
 }

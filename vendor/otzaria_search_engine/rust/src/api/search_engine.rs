@@ -5,20 +5,22 @@ use log::{debug, error, info, warn};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tantivy::collector::{Collector, Count, FacetCollector, SegmentCollector, TopDocs};
+use tantivy::directory::{Directory, Lock};
 use tantivy::index::{SegmentId, SegmentMeta};
 use tantivy::indexer::{MergeCandidate, MergePolicy, NoMergePolicy};
 use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, DfaWrapper, EmptyQuery, FuzzyTermQuery,
-    Occur, PhraseQuery, TermQuery, TermSetQuery,
+    Occur, TermQuery, TermSetQuery,
 };
 use tantivy::query::{Query, RegexPhraseQuery};
 use tantivy::schema::Value;
@@ -29,21 +31,36 @@ use tantivy::{schema::*, Index};
 use tantivy::{DocId, SegmentOrdinal, SegmentReader};
 use tantivy_fst::Automaton;
 
+use crate::api::library_indexing::{
+    IndexingCancellationToken, LibraryBookInput, LibraryBookResult,
+};
+use crate::book_order::{
+    self, numbers_in_segments, order_file_stamp, BookNumbers, BookOrderColumn, BookOrderSort,
+    BookPlace, OrderKind, OrderMapping, OrderTables,
+};
 use crate::cross_line;
+use crate::derived_columns::{section_offset, SectionIdColumn, SECTION_OFFSET_FIELD};
 use crate::display_highlight;
-use crate::gap_phrase::{GapVerifiedPhraseQuery, TermListPhraseQuery};
+use crate::doc_store::{load_document, segment_to_store, DocumentLoader};
+use crate::gap_phrase::{GapVerifiedPhraseQuery, Proximity, TermListPhraseQuery, WordWindows};
 use crate::hebrew_query;
 use crate::hebrew_query::VocalizedFlags;
 use crate::hebrew_tokenizer::HebrewTokenizer;
+use crate::highlight_cache::{DisplayPattern, HighlightCache};
 use crate::highlight_matcher as display_highlight_matcher;
+use crate::id_lookup::IdSetQuery;
 use crate::index_directory::{atomic_replace, IndexDirectory};
+use crate::lexical_cancellation::{LexicalCancellations, LexicalRequest, LexicalSearchCancelled};
 use crate::lexicons::{
     AcronymLexicon, TranslationLexicon, MAX_ACRONYM_EXPANSIONS, MAX_TRANSLATION_EXPANSIONS,
 };
 use crate::magic::{MagicDictionary, MAX_LEXICAL_FORMS};
+use crate::page_cache::{self, PageCache, PageKey};
+use crate::quote_expansion::{self, AutomatonQuery, QuoteTransparent};
 use crate::search_cancellation::{self, SearchCancellation, SearchCheckpoint};
 use crate::section_scope::{SectionFilteredQuery, SectionIdsCollector};
 use crate::semantic_keys::{self, ChunkKeyRecipe};
+use crate::term_automaton::{self, TermDfa};
 use otzaria_semantic_search::semantic::chunk_key::LineRef;
 
 #[cfg(feature = "semantic-integration")]
@@ -82,7 +99,6 @@ use otzaria_semantic_search::semantic::types::{
 };
 #[cfg(feature = "semantic-integration")]
 use otzaria_semantic_search::semantic::versioning::{ModelIdentity, ModelPackage, TextIdentity};
-#[cfg(feature = "semantic-integration")]
 use std::sync::{PoisonError, RwLock};
 
 // ── Public data types ──────────────────────────────────────────────────────────
@@ -155,7 +171,11 @@ pub enum ResultGrouping {
 ///   a document's `segment` is the 0-based position of its row among the book's
 ///   rows ordered by `lineIndex`. Each line keeps a check of its exact text
 ///   (`lineCheck`), which the row read back must match. The lines the call lists in
-///   `stored_lines` are stored as for `InIndex` instead.
+///   `stored_lines` are stored as for `InIndex` instead. A personal book
+///   (`uid:<bookId>`) is read the same way from the user-books database configured
+///   with [`configure_user_books_line_source`], and a book of an attached database
+///   (`db:<slug>:<bookId>`) from the one configured with
+///   [`configure_attached_line_source`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextStorage {
     LibraryDb,
@@ -198,10 +218,21 @@ pub struct LineSourceStatus {
     /// read or its row count differed from the book's lines. Only grows within a
     /// process.
     pub library_fallbacks: u64,
+    /// A user-books database path has been configured
+    /// ([`configure_user_books_line_source`]).
+    pub user_books_configured: bool,
+    /// A connection to the user-books database is currently open.
+    pub user_books_open: bool,
+    /// `generation` of the user-books source.
+    pub user_books_generation: u64,
+    /// `library_fallbacks` of personal (`uid:`) books.
+    pub user_books_fallbacks: u64,
 }
 
 pub struct DocumentInput {
-    pub id: u64,
+    /// The 0-based position of the line in its book. The engine composes the document id
+    /// from it and the book's number: `(bookNumber << 32) + ordinal + 1`.
+    pub ordinal: u32,
     pub title: String,
     pub reference: String,
     pub topics: String,
@@ -211,8 +242,7 @@ pub struct DocumentInput {
     pub file_path: String,
     /// Book-level **canonical** fingerprint for the `contentHash` column —
     /// [`compute_book_fingerprint`]: the raw text *plus* the metadata baked
-    /// into the index (title, topics, catalogue order, generation order,
-    /// extra facets). The same value is stamped on every document of a book,
+    /// into the index (title, topics, extra facets). Recorded once for the book,
     /// so [`SearchEngine::get_book_fingerprints`] can compare an index
     /// against the current library source, including metadata-only changes.
     /// Never compare it against [`compute_content_fingerprint`] (text only) —
@@ -221,21 +251,22 @@ pub struct DocumentInput {
     pub content_hash: Option<u64>,
     /// Text-only fingerprint ([`compute_content_fingerprint`] over the raw
     /// book text) for the `textHash` column — unlike `content_hash` it does
-    /// not shift when catalogue order or other metadata changes, so
+    /// not shift when metadata changes, so
     /// [`SearchEngine::get_book_text_fingerprints`] detects content drift
     /// only. `None`/`0` means "no fingerprint recorded".
     pub text_hash: Option<u64>,
+    /// An opaque hash of the book's source (the library database's `book.contentHash`),
+    /// stored as given for [`SearchEngine::get_book_stamps`]. `None`/`0`: none.
+    pub source_hash: Option<u64>,
     /// הטקסט המנוקד של השורה (נרמול [`normalize_vocalized_text_for_indexing`])
     /// עבור השדה `textVocalized`. `None` לשורה ללא ניקוד/טעמים — השורה
     /// פשוט לא תשתתף בחיפוש מנוקד. מסלול [`SearchEngine::add_text_book`]
     /// מחשב זאת בעצמו; השדה קיים לצינורות שמוסיפים מסמכים מוכנים.
     pub text_vocalized: Option<String>,
-    /// מזהה הסעיף (בלוק הכותרת) של השורה — ראו השדה `sectionId` בסכימה.
-    /// `None` = השורה סעיף לעצמה (`id` משמש כמזהה), כך שחיפוש "תחת אותה
-    /// כותרת" מתנהג כמו "באותה פסקה" עבור מסמכים שהוזנו בלי מזהה סעיף.
-    pub section_id: Option<u64>,
-    /// סדר הדור של הספר (נמוך = מוקדם). `None` ממוין לסוף הרשימה.
-    pub generation_order: Option<u32>,
+    /// The section (heading block) of the line, as the 0-based ordinal of the line that
+    /// opens it. `None`: the line is a section of its own, so "under the same heading"
+    /// behaves as "in the same line" for documents given no section.
+    pub section_ordinal: Option<u32>,
     /// נתיבי facet נוספים לצד `topics` — ממדי סינון (מחבר/תקופה/ספר-יסוד),
     /// למשל `"/author/רש\"י"`, `"/era/ראשונים"`, `"/base"`. ראו
     /// [`FACET_DIMENSION_ROOTS`] לסמנטיקת הסינון (OR בתוך ממד, AND בין
@@ -245,6 +276,35 @@ pub struct DocumentInput {
     /// `LibraryDb` is refused here — only [`SearchEngine::add_text_book`] can tie a
     /// line to its library row.
     pub text_storage: Option<TextStorage>,
+}
+
+/// One book's place for [`SearchEngine::set_book_order`]: by `catalogue_order`, and by
+/// `generation_order` then `catalogue_order` (low first).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BookOrderEntry {
+    pub file_path: String,
+    pub catalogue_order: u32,
+    pub generation_order: u32,
+}
+
+/// What the index records about one book: [`SearchEngine::get_book_stamps`]. A stamp is 0
+/// when the book was written without it, or when its documents disagree on it (a partial
+/// rewrite): either way it proves nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BookStamps {
+    pub file_path: String,
+    /// The high half of the book's document ids, assigned by the engine.
+    pub book_number: u32,
+    /// Live documents of the book.
+    pub documents: u32,
+    /// [`compute_book_fingerprint`]: text and metadata.
+    pub content_hash: u64,
+    /// [`compute_content_fingerprint`] of the book's raw text.
+    pub text_hash: u64,
+    /// [`compute_book_metadata_fingerprint`].
+    pub metadata_hash: u64,
+    /// The caller's `source_hash`, stored as given.
+    pub source_hash: u64,
 }
 
 /// One extracted PDF page for [`SearchEngine::add_pdf_book`]: the page's
@@ -1078,6 +1138,9 @@ pub struct SemanticSearchResult {
     /// As [`SearchResult::text_status`]: anything but `Ok` leaves `snippet_html`
     /// unpainted (`Stale`) or empty (`Unavailable`).
     pub text_status: TextStatus,
+    /// The window of a long line the semantic hit matched (0: the line's first); past 0,
+    /// `snippet_html` shows that window. Pass it on as [`SemanticHighlightTarget::window`].
+    pub matched_window: u8,
 }
 
 /// Result envelope for semantic/hybrid searches. `lexical_total_count` is the
@@ -1128,6 +1191,9 @@ pub struct SemanticSearchResponse {
 pub struct SemanticHighlightTarget {
     pub file_path: String,
     pub id: u64,
+    /// [`SemanticSearchResult::matched_window`]: the window of the line that is marked.
+    #[frb(default = 0)]
+    pub window: u8,
 }
 
 /// A target's line centred on its clause nearest the query, escaped, the clause in `<mark>`; empty
@@ -1291,6 +1357,7 @@ pub struct SemanticQueryTypeAlphas {
 /// | `candidate_window_multiplier` | 2 | 1 to 10 |
 /// | `foundational_bonus` | 0.002 | 0 to 1 |
 /// | `foundational_candidate_share` | 0.5 | 0 to 1 |
+/// | `window_penalty` | 0.04 | 0 to 0.2 |
 ///
 /// A value outside its range, or one that is not a number, is refused before the search runs,
 /// with a [`SemanticError`] of kind `InvalidInput` whose `field` names the option
@@ -1353,6 +1420,10 @@ pub struct SemanticRankingOptions {
     /// the main query's candidates; 0 runs none. Skipped when the facets already name `/base`.
     #[frb(default = 0.5)]
     pub foundational_candidate_share: f64,
+    /// Taken off the cosine of a vector of a long line's window past its first, before the
+    /// scan keeps its best: such a window matches a part of a line rather than the line.
+    #[frb(default = 0.04)]
+    pub window_penalty: f64,
 }
 
 impl SemanticRankingOptions {
@@ -1383,6 +1454,7 @@ impl SemanticRankingOptions {
             candidate_window_multiplier: 2.0,
             foundational_bonus: 0.002,
             foundational_candidate_share: 0.5,
+            window_penalty: 0.04,
         }
     }
 }
@@ -1654,24 +1726,27 @@ fn parse_model_identity(json: &str) -> Result<ModelIdentity, SemanticError> {
     })
 }
 
-/// Refuses vectors built under another chunking than the one this build keys the index's
-/// lines under, the one compiled in: none of their keys could resolve, so they are refused
-/// by name rather than opened, or installed, to answer nothing.
+/// Refuses vectors whose chunking this build cannot resolve: only the compiled-in one, with
+/// long-line windows or without them (the column's), is accepted.
 #[cfg(feature = "semantic-integration")]
 fn ensure_keyed_chunking(
     model: &ModelIdentity,
     refused: &dyn Fn(&dyn std::fmt::Display) -> String,
 ) -> Result<(), SemanticError> {
-    let keyed_under = ChunkKeyRecipe::current().chunking_identity;
-    if model.chunking_identity == keyed_under {
+    if semantic_keys::keyed_chunking(model.chunking_identity).is_some() {
         return Ok(());
     }
+    let keyed_under: Vec<String> = semantic_keys::keyed_chunkings()
+        .iter()
+        .map(|chunking| chunking.identity().to_string())
+        .collect();
     Err(SemanticError::new(
         SemanticErrorKind::ArtifactIncompatible,
         refused(&format!(
-            "model.chunking_identity is {}, and this build keys the index's lines under \
-             chunking {keyed_under}, so no line could be resolved",
-            model.chunking_identity
+            "model.chunking_identity is {}, and this build resolves lines under chunking {}, \
+             so no line could be resolved",
+            model.chunking_identity,
+            keyed_under.join(" or ")
         )),
     )
     .with_field("model.chunking_identity"))
@@ -2159,6 +2234,7 @@ fn ranking_profile(options: &SemanticRankingOptions) -> Result<RankingProfile, S
         candidate_window_multiplier: options.candidate_window_multiplier as f32,
         foundational_bonus: options.foundational_bonus as f32,
         foundational_candidate_share: options.foundational_candidate_share as f32,
+        window_penalty: options.window_penalty as f32,
         query_cache_enabled: preset.query_cache_enabled,
         embedding_cache_enabled: preset.embedding_cache_enabled,
         telemetry_enabled: preset.telemetry_enabled,
@@ -2300,7 +2376,8 @@ impl SemanticRequest<'_> {
         facets.dedup();
         // Opened before it is sampled, or the first search's read opening it would change the
         // sample and start a second session.
-        let _ = crate::line_source::with_store(|_| Ok(()));
+        // The user-books part of the key does not change when that store opens.
+        let _ = crate::line_source::with_store(crate::line_source::Source::Library, |_| Ok(()));
         SessionKey {
             query: self.query.to_string(),
             facets,
@@ -2333,6 +2410,8 @@ struct SessionEntry {
     siblings: Vec<Option<DocAddress>>,
     /// The text status of a lexical candidate's line.
     text_status: TextStatus,
+    /// See [`SemanticSearchResult::matched_window`].
+    window: u8,
 }
 
 /// What a session keeps besides its results: the last expansion's envelope, and how to
@@ -2372,7 +2451,7 @@ impl Default for SessionState {
             stale_primaries_dropped: 0,
             unverified: 0,
             capped_request: None,
-            library_generation: (0, None, false),
+            library_generation: Default::default(),
         }
     }
 }
@@ -2523,6 +2602,23 @@ struct SemanticSnippetPainter {
 
 #[cfg(feature = "semantic-integration")]
 impl SemanticSnippetPainter {
+    /// [`Self::paint`] of the embedded `window` a result shows in place of its `line`; the
+    /// whole line instead when a lexical match marks nothing in the window.
+    fn paint_shown(
+        &self,
+        line: &str,
+        window: Option<&str>,
+        lexically_confirmed: bool,
+    ) -> (String, bool) {
+        if let Some(window) = window {
+            let painted = self.paint(window, lexically_confirmed);
+            if painted.1 || !lexically_confirmed {
+                return painted;
+            }
+        }
+        self.paint(line, lexically_confirmed)
+    }
+
     /// Returns the display markup for `text` and whether it carries highlights.
     ///
     /// Mirrors [`SearchEngine::build_results_with_generator`]: tantivy's
@@ -2577,6 +2673,28 @@ impl SemanticSnippetPainter {
             _ => (bounded_plain_snippet(text, self.hl.max_chars), false),
         }
     }
+}
+
+/// A shown line for `embedded_window_texts`: address, book, id, stored text, matched window.
+#[cfg(feature = "semantic-integration")]
+type EmbeddedLine<'a> = (DocAddress, &'a str, u64, &'a str, u8);
+
+/// Window `window` of a long line, spaces collapsed, with `…` where the line goes on before
+/// and after it; `None` for the first window and for one the line does not embed.
+#[cfg(feature = "semantic-integration")]
+fn long_line_window_text(text: &str, window: u8) -> Option<String> {
+    let (span, length) = semantic_keys::window_span(text, window)?;
+    let piece: String = text
+        .trim()
+        .chars()
+        .skip(span.start)
+        .take(span.len())
+        .collect();
+    let mut shown = format!("…{}", hebrew_query::collapse_whitespace(piece.trim()));
+    if span.end < length {
+        shown.push('…');
+    }
+    Some(shown)
 }
 
 /// A display-safe stand-in for a snippet: a bounded, HTML-escaped prefix, so a
@@ -2736,9 +2854,8 @@ pub enum ResultsOrder {
     Generation,
 }
 
-/// Per-word index-term sets plus the intermediate-word allowance, used by the
-/// snippet renderer to keep only highlights that form an in-order *phrase*
-/// occurrence.
+/// Per-word index-term sets plus their [`Proximity`], used by the snippet
+/// renderer to keep only highlights that form a *phrase* occurrence.
 ///
 /// tantivy's `SnippetGenerator` highlights term-by-term: it paints every
 /// occurrence of every query term with no positional constraint. For the
@@ -2747,18 +2864,17 @@ pub enum ResultsOrder {
 /// search matched only the adjacent phrase "משה ואהרן". This filter drops such
 /// stray highlights so the snippet paints exactly what the search matched.
 ///
-/// `gaps[i]` is the maximum number of intermediate index tokens allowed
-/// between query words `i` and `i+1` — the same per-pair intermediate-word
-/// model `display_highlight` and the engine's phrase verification use, so the
-/// results snippet, the search, and the book agree.
+/// The proximity is the one `display_highlight` and the engine's phrase
+/// verification use (per-pair gaps, or one any-order window), so the results
+/// snippet, the search, and the book agree.
 struct PhraseHighlight {
-    /// One index-term set per query word, in query (= phrase) order.
+    /// One index-term set per query word, in query order.
     per_word_terms: Vec<HashSet<String>>,
-    /// Per adjacent pair; length `per_word_terms.len() - 1`.
-    gaps: Vec<u32>,
+    /// Ordered gaps have length `per_word_terms.len() - 1`.
+    proximity: Proximity,
     /// The analyzer that tokenizes snippet fragments for re-highlighting —
-    /// must match the field the terms came from (`"hebrew"` for `text`,
-    /// `"hebrew_vocalized"` for `textVocalized`).
+    /// must match the field the terms came from ([`DISPLAY_ANALYZER`] for `text`,
+    /// [`VOCALIZED_DISPLAY_ANALYZER`] for `textVocalized`).
     analyzer: &'static str,
     /// The search also matches the phrase across a line break (see [`cross_line`]): a
     /// hit without an in-line occurrence is shown joined with its next line.
@@ -2800,8 +2916,8 @@ impl HighlightPlan {
 
 /// What [`SearchEngine::build_advanced_query`] returns: the executable query,
 /// one joined regex pattern per word (for highlight-term materialization), the
-/// resolved per-pair gap allowances (fold `custom_spacing`/`distance` in — the
-/// phrase highlight filter's gap allowances), and whether single-word
+/// resolved proximity (folds `custom_spacing`/`distance`/any-order in — the
+/// phrase highlight filter's allowances), and whether single-word
 /// collection truncated. The fifth element carries the acronym-expansion
 /// alternatives ("ראשי תיבות") as per-word literal-pattern lists — the
 /// highlight builders materialize their terms so a document matched through
@@ -2809,7 +2925,7 @@ impl HighlightPlan {
 type AdvancedQueryBuild = (
     Box<dyn Query>,
     Vec<String>,
-    Vec<u32>,
+    Proximity,
     bool,
     Vec<Vec<String>>,
 );
@@ -2848,7 +2964,7 @@ pub struct HighlightMatch {
 /// times query word count, including near misses and arbitrary phrase gaps.
 #[frb(opaque)]
 pub struct HighlightMatcher {
-    plan: display_highlight_matcher::PreparedHighlightMatcher,
+    plan: Arc<display_highlight_matcher::PreparedHighlightMatcher>,
 }
 
 impl HighlightMatcher {
@@ -2871,6 +2987,30 @@ impl HighlightMatcher {
             self.plan
                 .find_word_matches(&data, &require_token_boundaries),
         )
+    }
+}
+
+impl From<display_highlight::DisplayHighlight> for DisplayPattern {
+    fn from(hl: display_highlight::DisplayHighlight) -> Self {
+        Self {
+            combined_pattern: hl.combined_pattern,
+            word_patterns: hl.word_patterns,
+            word_boundary_eligible: hl.word_boundary_eligible,
+            matcher: Arc::new(hl.matcher),
+        }
+    }
+}
+
+impl DisplayPattern {
+    fn to_api(&self) -> HighlightPattern {
+        HighlightPattern {
+            combined_pattern: self.combined_pattern.clone(),
+            word_patterns: self.word_patterns.clone(),
+            word_boundary_eligible: self.word_boundary_eligible.clone(),
+            matcher: Some(HighlightMatcher {
+                plan: Arc::clone(&self.matcher),
+            }),
+        }
     }
 }
 
@@ -2910,6 +3050,28 @@ fn convert_highlight_matches(
 const DEFAULT_WRITER_HEAP_SIZE: usize = 50_000_000;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 const DEFAULT_WRITER_HEAP_SIZE: usize = 300_000_000;
+
+/// Threads that collect one search's segments in parallel: half the cores, to
+/// leave room for indexing and the UI; phones keep searching on one thread.
+fn search_executor_threads() -> usize {
+    if cfg!(any(target_os = "android", target_os = "ios")) {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (cores / 2).clamp(1, 8)
+}
+
+/// Gives `index` the search thread pool of [`search_executor_threads`]. Must run
+/// before a reader is built: a searcher keeps the executor of its index.
+fn set_search_executor(index: &mut Index) {
+    let threads = search_executor_threads();
+    if threads > 1 {
+        if let Err(err) = index.set_multithread_executor(threads) {
+            warn!("search stays single-threaded: {err}");
+        }
+    }
+}
+
 // Economy indexing (see `set_economy_indexing`): the mobile budget — 3
 // threads with small arenas — applied on demand on desktop too.
 const ECONOMY_WRITER_HEAP_SIZE: usize = 50_000_000;
@@ -2958,11 +3120,17 @@ const INDEX_FORMAT: &str = "otzaria-search-index";
 // A change to `normalize_text_for_indexing` or to the row preparation
 // (`line_source::prepare_row`) needs a bump: that is what keeps `TextStatus::Ok` true,
 // the promise that the displayed text is exactly what was indexed.
-pub(crate) const INDEX_SCHEMA_VERSION: u32 = 5;
+//
+// v6: disk savings. `id` and `filePath` carry no fieldnorms; `id` is not indexed; the
+// doc store keeps `reference`, `id` and the stored texts (see `doc_store`); the book
+// fingerprints sit on one document of a book; `sectionId`/`generationSort` are derived
+// (see `derived_columns`); and the fields no longer index a quote-free twin beside a
+// quoted word (see `quote_expansion`). A version 5 index is rebuilt.
+pub(crate) const INDEX_SCHEMA_VERSION: u32 = 7;
 /// The oldest schema version this engine opens, searches and writes to as it was built.
 /// Every version from it to [`INDEX_SCHEMA_VERSION`] is one this engine reads, each with
 /// the one schema [`schema_of_version`] gives it; an older one is `rebuild_required`.
-const MIN_READABLE_SCHEMA_VERSION: u32 = 5;
+const MIN_READABLE_SCHEMA_VERSION: u32 = 7;
 /// The column that holds each line's chunk key: see [`crate::semantic_keys`].
 const CHUNK_KEY_FIELD: &str = "chunkKey";
 const TANTIVY_INDEX_VERSION: &str = "0.26.2";
@@ -2984,9 +3152,6 @@ pub(crate) const LINE_TEXT_VERSION: u32 = 1;
 /// כאחד. 128 בייט ≈ 64 אותיות עבריות: פי כמה מכל מילה לגיטימית (כולל
 /// גרשיים וניקוד), ומתחת לכל ריצת-זבל אמיתית (base64 שזלג לקורפוס).
 const MAX_TOKEN_BYTES: usize = 128;
-const DEFAULT_GENERATION_ORDER: u32 = 5;
-const GENERATION_SORT_SHIFT: u32 = 56;
-const GENERATION_SORT_ID_MASK: u64 = (1u64 << GENERATION_SORT_SHIFT) - 1;
 
 /// Upper bound on distinct dictionary terms collected for highlighting an
 /// advanced (regex) query. Bounds work when a pattern (e.g. partial match)
@@ -3019,6 +3184,11 @@ const LEXICAL_FUZZY_PHRASE_SLOP: u32 = 1;
 // ranking they never use. Recall is unchanged either way (the exact term is a
 // subset of the fuzzy automaton match), and exact/advanced never use these.
 const FUZZY_BOOST_EXACT: Score = 1000.0;
+/// Relevance tiers of an advanced single-word search ranked by relevance:
+/// the typed form, then affixed forms, then spelling variants, then the rest
+/// (see `hebrew_query::match_tier`). Only the order matters; a document's
+/// clauses sum, so each tier outweighs every lower one combined.
+const ADVANCED_TIER_BOOSTS: [Score; 4] = [1000.0, 100.0, 10.0, 1.0];
 const FUZZY_BOOST_EXACT_REL: Score = 1.0;
 const FUZZY_BOOST_LEXICAL: Score = 30.0;
 const FUZZY_BOOST_FUZZY: Score = 1.0;
@@ -3031,12 +3201,8 @@ const LEXICAL_FUZZY_EXPANDED_PHRASE_BOOST: bool = false;
 
 /// The schema fields resolved together by [`SearchEngine::all_fields`]:
 /// `(title, reference, text, id, segment, isPdf, filePath, topics,
-/// contentHash, textHash, textVocalized, sectionId, generationSort,
-/// lineHash)`.
+/// textVocalized, sectionOffset, lineHash)`. The stamps are [`StampFields`].
 type SchemaFields = (
-    Field,
-    Field,
-    Field,
     Field,
     Field,
     Field,
@@ -3050,26 +3216,50 @@ type SchemaFields = (
     Field,
 );
 
-/// The high half of every document id in one book: `(catalogue_order + 1) << 32`.
-///
-/// Refuses the last catalogue position rather than computing it. `u32::MAX + 1` is `2^32`,
-/// and shifting that left by 32 overflows a `u64` — wrapping to a base of **zero** in
-/// release, which is not a catalogue position at all: every book at position 0 would share
-/// its prefix with the raw ordinals, and `semantic_corpus` would refuse the whole index for
-/// an id scheme it could not order. One unusable position out of four billion, named here
-/// instead of discovered there.
-fn catalogue_id_base(catalogue_order: u32) -> Result<u64> {
-    if catalogue_order == u32::MAX {
-        anyhow::bail!(
-            "catalogue_order {catalogue_order} is the one value that cannot form a document \
-             id: (catalogue_order + 1) << 32 overflows u64"
-        );
-    }
-    Ok((u64::from(catalogue_order) + 1) << 32)
+/// The stamp columns of a book: the values it was written with, on one of its documents.
+#[derive(Clone, Copy)]
+struct StampFields {
+    content: Field,
+    text: Field,
+    metadata: Field,
+    source: Field,
 }
 
-fn generation_sort_key(generation_order: u32, id: u64) -> u64 {
-    (u64::from(generation_order.min(255)) << GENERATION_SORT_SHIFT) | (id & GENERATION_SORT_ID_MASK)
+impl StampFields {
+    fn of(schema: &Schema) -> Result<Self> {
+        Ok(Self {
+            content: schema.get_field("contentHash")?,
+            text: schema.get_field("textHash")?,
+            metadata: schema.get_field(METADATA_HASH_FIELD)?,
+            source: schema.get_field(SOURCE_HASH_FIELD)?,
+        })
+    }
+}
+
+/// A book's stamps as written: 0 is "none".
+#[frb(ignore)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Stamps {
+    content: u64,
+    text: u64,
+    metadata: u64,
+    source: u64,
+}
+
+/// Records a book's stamps on one of its documents, the columns' only value for the book: a
+/// value repeated on every line cost 64 bits a line once blocks of the column straddle two
+/// books. 0, "none", is not written.
+fn stamp_book(document: &mut TantivyDocument, fields: StampFields, stamps: Stamps) {
+    for (field, value) in [
+        (fields.content, stamps.content),
+        (fields.text, stamps.text),
+        (fields.metadata, stamps.metadata),
+        (fields.source, stamps.source),
+    ] {
+        if value != 0 {
+            document.add_u64(field, value);
+        }
+    }
 }
 
 /// Records `key` in the `chunkKey` column, when the index has one this build writes: `0`
@@ -3153,10 +3343,10 @@ pub fn configure_line_source(db_path: String) -> Result<()> {
     crate::line_source::configure(&db_path)
 }
 
-/// Repoints the line source and unconditionally closes its connection and clears
-/// its caches, even when `db_path` is unchanged. This lets callers reopen a
-/// database atomically replaced at the same path. Active line-window reads finish
-/// before the old connection is closed; the next read opens the new file.
+/// otzaria-mcp local addition (see VENDORED.md): repoints the line source and
+/// unconditionally closes its connection and clears its caches, even when `db_path` is
+/// unchanged, so a database atomically replaced at the same path is reopened. Active
+/// line-window reads and scans finish first; the next read opens the new file.
 pub fn refresh_line_source(db_path: String) -> Result<()> {
     crate::line_source::refresh(&db_path)
 }
@@ -3188,8 +3378,68 @@ pub fn resume_line_source_owned(owner_port: i64) -> Result<()> {
     Ok(())
 }
 
+/// Points the second line source at the personal-books database (`user_books.db`)
+/// that `uid:<bookId>` [`TextStorage::LibraryDb`] documents read their text from;
+/// `None` closes it (waiting for a window that is reading it) and unconfigures it.
+/// Opened lazily and read-only like the library database. The app may keep writing
+/// it (WAL): a commit is seen by the next window, and a row that no longer matches
+/// its line comes back [`TextStatus::Stale`]. [`suspend_line_source`] does not
+/// apply to it.
+pub fn configure_user_books_line_source(db_path: Option<String>) -> Result<()> {
+    crate::line_source::configure_user_books(db_path.as_deref())
+}
+
+/// Points the line source of the attached database `slug` at its file, which
+/// `db:<slug>:<bookId>` [`TextStorage::LibraryDb`] documents read their text from; `None`
+/// closes it (waiting for a window or scan that is reading it) and unconfigures it, after
+/// which its documents come back [`TextStatus::Unavailable`]. Opened lazily, read-only and
+/// hardened like the app's untrusted connections; `immutable` opens it with
+/// `immutable=1` (the app's `AttachedLibrary.immutable`), and SQLite then never notices a
+/// change to the file. The open file cannot be replaced or deleted on Windows: configure
+/// `None` before the app updates, replaces or removes the file, and the path again after.
+/// Any number of slugs may be configured at once. [`suspend_line_source`] does not apply.
+pub fn configure_attached_line_source(
+    slug: String,
+    db_path: Option<String>,
+    immutable: bool,
+) -> Result<()> {
+    crate::line_source::configure_attached(&slug, db_path.as_deref(), immutable)
+}
+
+/// State of the attached database `slug`'s line source.
+pub struct AttachedLineSourceStatus {
+    /// A database path is configured ([`configure_attached_line_source`]).
+    pub configured: bool,
+    /// A connection is currently open.
+    pub open: bool,
+    /// Bumped whenever cached knowledge of the database is discarded.
+    pub generation: u64,
+    /// Books of this database asked for as [`TextStorage::LibraryDb`] that were stored
+    /// [`TextStorage::InIndex`] instead. Only grows within a process.
+    pub library_fallbacks: u64,
+}
+
+pub fn attached_line_source_status(slug: String) -> AttachedLineSourceStatus {
+    match crate::line_source::attached_status(&slug) {
+        Some(status) => AttachedLineSourceStatus {
+            configured: status.configured,
+            open: status.open,
+            generation: status.generation,
+            library_fallbacks: status.library_fallbacks,
+        },
+        None => AttachedLineSourceStatus {
+            configured: false,
+            open: false,
+            generation: 0,
+            library_fallbacks: 0,
+        },
+    }
+}
+
 pub fn line_source_status() -> LineSourceStatus {
-    let status = crate::line_source::status();
+    use crate::line_source::Source;
+    let status = crate::line_source::status(Source::Library);
+    let user_books = crate::line_source::status(Source::UserBooks);
     LineSourceStatus {
         configured: status.configured,
         open: status.open,
@@ -3197,6 +3447,10 @@ pub fn line_source_status() -> LineSourceStatus {
         host_api_ready: crate::sqlite_host::is_ready(),
         generation: status.generation,
         library_fallbacks: status.library_fallbacks,
+        user_books_configured: user_books.configured,
+        user_books_open: user_books.open,
+        user_books_generation: user_books.generation,
+        user_books_fallbacks: user_books.library_fallbacks,
     }
 }
 
@@ -3218,7 +3472,8 @@ pub fn sqlite_host_entry_address() -> usize {
 /// default intermediate-word allowance, `custom_spacing` is keyed
 /// `"i-(i+1)"`, `alternative_words` is keyed by word position, and
 /// `search_options` is keyed `"{word}_{index}"` using the same tokenization
-/// as engine queries.
+/// as engine queries. `any_order` (default false) matches the words in any
+/// order within one window, like the advanced search's flag.
 ///
 /// Returns `None` when the query contains no highlightable words.
 #[frb(sync)]
@@ -3228,6 +3483,7 @@ pub fn generate_highlight_pattern(
     custom_spacing: HashMap<String, String>,
     alternative_words: HashMap<u32, Vec<String>>,
     search_options: HashMap<String, HashMap<String, bool>>,
+    any_order: Option<bool>,
 ) -> Option<HighlightPattern> {
     display_highlight::build_display_highlight(
         &query,
@@ -3235,12 +3491,15 @@ pub fn generate_highlight_pattern(
         &custom_spacing,
         &alternative_words,
         &search_options,
+        any_order.unwrap_or(false),
     )
     .map(|hl| HighlightPattern {
         combined_pattern: hl.combined_pattern,
         word_patterns: hl.word_patterns,
         word_boundary_eligible: hl.word_boundary_eligible,
-        matcher: Some(HighlightMatcher { plan: hl.matcher }),
+        matcher: Some(HighlightMatcher {
+            plan: Arc::new(hl.matcher),
+        }),
     })
 }
 
@@ -3378,7 +3637,7 @@ pub fn is_probably_garbage_pdf_text(normalized_text: String) -> bool {
 /// to detect books whose *content* changed without reindexing everything.
 ///
 /// שימו לב: [`SearchEngine::get_book_fingerprints`] מחזיר את החתימה
-/// **הקנונית** [`compute_book_fingerprint`], הכוללת גם metadata (סדר קטלוגי
+/// **הקנונית** [`compute_book_fingerprint`], הכוללת גם metadata (כותרת
 /// וכו') — השוואה שלה מול הפונקציה הזו (טקסט בלבד) תזהה כל ספר כ"השתנה".
 ///
 /// Never returns 0 — that value is reserved for "no fingerprint recorded".
@@ -3414,10 +3673,9 @@ fn content_fingerprint(text: &str) -> u64 {
 }
 
 /// חתימת האינדוקס הקנונית לספר טקסט: הטקסט הגולמי + כל ה-metadata שמוטבע
-/// באינדקס — כותרת, נתיב קטגוריה, סדר קטלוגי, סדר דורות וממדי הסינון.
-/// שינוי בכל אחד מהם, גם ללא שינוי טקסט, משנה את החתימה — כך שהשוואה מול
-/// [`SearchEngine::get_book_fingerprints`] מזהה גם ספר שרק ה-metadata שלו
-/// התעדכן (אחרת האינדקס נשאר עם facets/מיון/כותרת ישנים).
+/// במסמכי הספר — כותרת, נתיב קטגוריה וממדי הסינון. שינוי בכל אחד מהם, גם ללא
+/// שינוי טקסט, משנה את החתימה. מקום הספר בקטלוג ובדורות אינו בה: הוא מיפוי
+/// ([`SearchEngine::set_book_order`]) ששינויו אינו מצריך אינדוקס מחדש.
 ///
 /// ה-extra_facets ממוינים ומנוקי-כפילויות — סדרם אינו משפיע על האינדקס.
 /// Never returns 0. Pure string computation — safe to call synchronously.
@@ -3426,42 +3684,47 @@ pub fn compute_book_fingerprint(
     text: String,
     title: String,
     topics: String,
-    catalogue_order: u32,
-    generation_order: u32,
     extra_facets: Option<Vec<String>>,
 ) -> u64 {
-    book_fingerprint(
-        &text,
-        &title,
-        &topics,
-        catalogue_order,
-        generation_order,
-        extra_facets.unwrap_or_default(),
-    )
+    book_fingerprint(&text, &title, &topics, extra_facets.unwrap_or_default())
 }
 
 /// Borrowing form of [`compute_book_fingerprint`] so the indexing path
 /// never clones a whole book to hash it.
-fn book_fingerprint(
-    text: &str,
-    title: &str,
-    topics: &str,
-    catalogue_order: u32,
-    generation_order: u32,
-    mut extra_facets: Vec<String>,
-) -> u64 {
-    extra_facets.sort_unstable();
-    extra_facets.dedup();
+fn book_fingerprint(text: &str, title: &str, topics: &str, extra_facets: Vec<String>) -> u64 {
     let mut fnv = Fnv::new();
     fnv.feed_field(text.as_bytes());
+    feed_metadata(&mut fnv, title, topics, extra_facets);
+    fnv.finish()
+}
+
+/// The `metadataHash` of a book: everything its documents carry besides its text — title,
+/// category path and the extra facets, sorted and deduplicated as the index keeps them.
+/// [`SearchEngine::get_book_stamps`] returns the value each book was written with, so a
+/// book whose metadata changed is found without reading its text. Never returns 0.
+#[frb(sync)]
+pub fn compute_book_metadata_fingerprint(
+    title: String,
+    topics: String,
+    extra_facets: Option<Vec<String>>,
+) -> u64 {
+    metadata_fingerprint(&title, &topics, extra_facets.unwrap_or_default())
+}
+
+fn metadata_fingerprint(title: &str, topics: &str, extra_facets: Vec<String>) -> u64 {
+    let mut fnv = Fnv::new();
+    feed_metadata(&mut fnv, title, topics, extra_facets);
+    fnv.finish()
+}
+
+fn feed_metadata(fnv: &mut Fnv, title: &str, topics: &str, mut extra_facets: Vec<String>) {
+    extra_facets.sort_unstable();
+    extra_facets.dedup();
     fnv.feed_field(title.as_bytes());
     fnv.feed_field(topics.as_bytes());
-    fnv.feed_field(&catalogue_order.to_le_bytes());
-    fnv.feed_field(&generation_order.to_le_bytes());
     for facet in &extra_facets {
         fnv.feed_field(facet.as_bytes());
     }
-    fnv.finish()
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -3635,6 +3898,50 @@ impl LineDedupHasher {
     }
 }
 
+/// What a text book's documents carry besides its lines.
+pub(crate) struct TextBookMeta {
+    pub title: String,
+    pub topics: String,
+    pub file_path: String,
+    pub extra_facets: Vec<String>,
+    /// The caller's `sourceHash`, 0 for none.
+    pub source_hash: u64,
+}
+
+/// A text book's documents, built by [`SearchEngine::prepare_text_book`].
+#[frb(ignore)]
+pub(crate) struct PreparedTextBook {
+    pub documents: Vec<TantivyDocument>,
+    /// The book's number: the high half of its ids.
+    pub book_number: u32,
+    /// The book's `contentHash` ([`book_fingerprint`]).
+    pub content_hash: u64,
+    /// The book's `textHash` ([`content_fingerprint`]).
+    pub text_hash: u64,
+    /// The book's `metadataHash` ([`metadata_fingerprint`]).
+    pub metadata_hash: u64,
+    pub source_hash: u64,
+    pub text_storage: TextStorage,
+    pub prepare_time: std::time::Duration,
+    pub keys_time: std::time::Duration,
+}
+
+impl PreparedTextBook {
+    /// Moves the documents into `writer`, in line order; returns how many.
+    pub(crate) fn enqueue(&mut self, writer: &IndexWriter) -> Result<u32> {
+        let count = self.documents.len() as u32;
+        for document in self.documents.drain(..) {
+            writer.add_document(document)?;
+        }
+        Ok(count)
+    }
+}
+
+/// How many lines `text.split('\n')` yields.
+fn line_count(text: &str) -> usize {
+    text.bytes().filter(|&b| b == b'\n').count() + 1
+}
+
 /// The display copies of a document whose text is kept in the index. `textStored` is
 /// written even when empty: its absence is what marks a library-database document.
 fn add_stored_text(
@@ -3650,9 +3957,30 @@ fn add_stored_text(
 }
 
 /// The library book id of an official book's `file_path` (`id:<bookId>`).
+#[cfg(feature = "semantic-integration")]
 pub(crate) fn library_book_id(file_path: &str) -> Option<i64> {
-    let id: i64 = file_path.strip_prefix("id:")?.parse().ok()?;
-    (id >= 0 && format!("id:{id}") == file_path).then_some(id)
+    match line_source_book(file_path)? {
+        (crate::line_source::Source::Library, id) => Some(id),
+        _ => None,
+    }
+}
+
+/// The line source and book id of a `file_path` whose rows a database holds:
+/// `id:<bookId>` (library), `uid:<bookId>` (user books) or `db:<slug>:<bookId>` (an
+/// attached database), in canonical form only.
+pub(crate) fn line_source_book(file_path: &str) -> Option<(crate::line_source::Source, i64)> {
+    use crate::line_source::Source;
+    let (source, digits) = if let Some(digits) = file_path.strip_prefix("id:") {
+        (Source::Library, digits)
+    } else if let Some(digits) = file_path.strip_prefix("uid:") {
+        (Source::UserBooks, digits)
+    } else {
+        // As the app's `attachedSlugOfKey`: the id follows the last `:`.
+        let (slug, digits) = file_path.strip_prefix("db:")?.rsplit_once(':')?;
+        (Source::attached(slug)?, digits)
+    };
+    let id: i64 = digits.parse().ok()?;
+    (id >= 0 && id.to_string() == digits).then_some((source, id))
 }
 
 /// `DocumentInput` always stores its text: nothing ties a ready-made document's `segment`
@@ -3664,34 +3992,40 @@ fn refuse_library_storage(docs: &[DocumentInput]) -> Result<()> {
     {
         anyhow::bail!(
             "TextStorage::LibraryDb is only accepted by add_text_book/add_text_book_bytes \
-             (document {} of {:?})",
-            doc.id,
+             (line {} of {:?})",
+            doc.ordinal,
             doc.file_path
         );
     }
     Ok(())
 }
 
-fn require_library_book_id(file_path: &str) -> Result<i64> {
-    library_book_id(file_path).with_context(|| {
+fn require_library_book_id(file_path: &str) -> Result<(crate::line_source::Source, i64)> {
+    line_source_book(file_path).with_context(|| {
         format!(
-            "TextStorage::LibraryDb needs a file_path of the form id:<bookId>, got {file_path:?}"
+            "TextStorage::LibraryDb needs a file_path of the form id:<bookId>, \
+             uid:<bookId> or db:<slug>:<bookId>, got {file_path:?}"
         )
     })
 }
 
-/// `LibraryDb` when the configured line source holds exactly `lines` rows for the book;
+/// `LibraryDb` when the book's line source holds exactly `lines` rows for the book;
 /// otherwise `InIndex`, since a document's `segment` would not be its row's ordinal (a row
 /// containing `\n` splits into two lines) or nothing can tell.
-fn library_storage_or_fallback(book_id: i64, lines: usize, title: &str) -> TextStorage {
-    let rows = crate::line_source::with_store_for_indexing(|store| store.book_row_count(book_id));
+fn library_storage_or_fallback(
+    (source, book_id): (crate::line_source::Source, i64),
+    lines: usize,
+    title: &str,
+) -> TextStorage {
+    let rows =
+        crate::line_source::with_store_for_indexing(source, |store| store.book_row_count(book_id));
     match rows {
         Ok(rows) if rows == lines as u64 => TextStorage::LibraryDb,
         rows => {
-            crate::line_source::note_library_fallback();
+            crate::line_source::note_library_fallback(source);
             warn!(
-                "add_text_book '{title}' (id:{book_id}): {lines} lines against library rows \
-                 {rows:?}; storing its text in the index"
+                "add_text_book '{title}' ({source:?} {book_id}): {lines} lines against \
+                 database rows {rows:?}; storing its text in the index"
             );
             TextStorage::InIndex
         }
@@ -4040,7 +4374,10 @@ pub(crate) fn live_chunk_key_field(schema: &Schema, index_path: &Path) -> Option
 /// older version in turn. A schema none of them is stays refused, as the `SchemaError`
 /// `open_or_create` returns.
 fn open_or_create_index(directory: IndexDirectory) -> tantivy::Result<Index> {
-    let mut opened = Index::open_or_create(directory.clone(), current_schema());
+    let mut opened = Index::builder()
+        .schema(current_schema())
+        .settings(new_index_settings())
+        .open_or_create(directory.clone());
     for version in (MIN_READABLE_SCHEMA_VERSION..INDEX_SCHEMA_VERSION).rev() {
         if !matches!(opened, Err(tantivy::TantivyError::SchemaError(_))) {
             break;
@@ -4050,6 +4387,21 @@ fn open_or_create_index(directory: IndexDirectory) -> tantivy::Result<Index> {
     }
     opened
 }
+
+/// Doc-store settings of a new index; an existing index keeps those it was created with.
+/// zstd over 16K blocks: a cold random read is ~45µs against ~108µs at 64K, for ~7% more store.
+fn new_index_settings() -> tantivy::IndexSettings {
+    tantivy::IndexSettings {
+        docstore_compression: tantivy::store::Compressor::Zstd(tantivy::store::ZstdCompressor {
+            compression_level: Some(DOCSTORE_ZSTD_LEVEL),
+        }),
+        docstore_blocksize: DOCSTORE_BLOCK_SIZE,
+        ..tantivy::IndexSettings::default()
+    }
+}
+
+const DOCSTORE_ZSTD_LEVEL: i32 = 3;
+const DOCSTORE_BLOCK_SIZE: usize = 16_384;
 
 fn index_metadata_path(index_path: &Path) -> PathBuf {
     index_path.join(INDEX_METADATA_FILE_NAME)
@@ -4117,6 +4469,8 @@ fn index_schema() -> Schema {
         ),
     );
     schema_builder.add_text_field("reference", STORED);
+    // `title`, `isPdf` and `filePath` are read from their columns (see `doc_store`), and
+    // `segment` is stored only where `id` does not imply it.
     schema_builder.add_text_field(
         "title",
         TextOptions::default()
@@ -4125,13 +4479,22 @@ fn index_schema() -> Schema {
                     .set_tokenizer("raw")
                     .set_fieldnorms(false),
             )
-            .set_stored(),
+            .set_fast(None),
     );
-    // INDEXED is required for delete_term / upsert by id to work.
-    schema_builder.add_u64_field("id", STORED | FAST | INDEXED);
+    // Not indexed: a lookup by id scans the column instead (see `id_lookup`).
+    schema_builder.add_u64_field("id", FAST | STORED);
     schema_builder.add_u64_field("segment", STORED);
-    schema_builder.add_bool_field("isPdf", STORED);
-    schema_builder.add_text_field("filePath", STRING | FAST | STORED);
+    schema_builder.add_bool_field("isPdf", FAST);
+    schema_builder.add_text_field(
+        "filePath",
+        TextOptions::default()
+            .set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_tokenizer("raw")
+                    .set_fieldnorms(false),
+            )
+            .set_fast(None),
+    );
     // Book-level content fingerprint, stamped identically on all documents of
     // a book. FAST-only: read columnar by get_book_fingerprints, never searched
     // or returned. 0 = no fingerprint recorded.
@@ -4139,13 +4502,19 @@ fn index_schema() -> Schema {
     // חתימת טקסט-בלבד של הספר (content_fingerprint על הטקסט הגולמי), זהה על
     // כל מסמכי הספר. FAST בלבד — נקראת עמודתית ע"י get_book_text_fingerprints.
     schema_builder.add_u64_field("textHash", FAST);
+    // The book's metadata (`compute_book_metadata_fingerprint`) and the caller's opaque
+    // source hash, on the same one document as the fingerprints.
+    schema_builder.add_u64_field(METADATA_HASH_FIELD, FAST);
+    schema_builder.add_u64_field(SOURCE_HASH_FIELD, FAST);
     // מזהה סעיף: כל השורות שתחת אותה כותרת (אותו בלוק reference) נושאות
     // אותו ערך, ייחודי גלובלית — id_base של הספר + אינדקס בלוק הכותרת
     // (ב-PDF: מספר העמוד). FAST בלבד: מסלול "תחת אותה כותרת"
     // (SearchScope::SameSection) קורא אותו עמודתית לחיתוך סעיפים; אינו
     // מאוחסן ואינו מחופש ישירות.
-    schema_builder.add_u64_field("sectionId", FAST);
-    schema_builder.add_u64_field("generationSort", FAST);
+    // `sectionId` is derived from `id` and this (see `derived_columns`): a value relative
+    // to the book compresses to a few bits. The generation of a book is not in the index:
+    // see `book_order`.
+    schema_builder.add_u64_field(SECTION_OFFSET_FIELD, FAST);
     // חתימת דה-דופליקציה של גוף השורה (ראו line_dedup_hash). FAST בלבד:
     // נקראת עמודתית ע"י קיבוץ IdenticalText; אינה מאוחסנת ואינה מחופשת.
     schema_builder.add_u64_field("lineHash", FAST);
@@ -4182,6 +4551,8 @@ fn index_schema() -> Schema {
 }
 
 pub(crate) const TEXT_STORED_FIELD: &str = "textStored";
+const METADATA_HASH_FIELD: &str = "metadataHash";
+const SOURCE_HASH_FIELD: &str = "sourceHash";
 pub(crate) const LINE_CHECK_FIELD: &str = "lineCheck";
 const TEXT_VOCALIZED_STORED_FIELD: &str = "textVocalizedStored";
 
@@ -4224,14 +4595,15 @@ struct CachedTermSet {
     truncated: bool,
 }
 
-/// Ceiling on the summed per-segment `doc_freq` a single-word term set may
-/// accumulate. This — not the term count — is the true cost guard: executing
-/// the resulting `TermSetQuery` unions one postings list per matched term per
-/// segment into a BitSet, O(Σ doc_freq). The term-count ceiling
-/// (`max_expansions`) remains only as a memory guard on the materialized
-/// `Vec<Term>`. Initial value pending empirical calibration via
-/// `benchmark_cli` (VARIATION_CEILING_RESEARCH.md §3.א).
-const SINGLE_WORD_POSTINGS_BUDGET: u64 = 1_000_000;
+/// Ceiling on the summed `doc_freq` (over all segments) of the terms a
+/// single-word term set keeps. This — not the term count — is the true cost
+/// guard: executing the resulting `TermSetQuery` unions one postings list per
+/// matched term per segment into a BitSet, O(Σ doc_freq). The term-count
+/// ceiling (`max_expansions`) remains only as a memory guard on the
+/// materialized `Vec<Term>`. On the full library 8M keeps every realistic
+/// expansion whole (אמר + affixes: 2.6M, ~60ms to count) and stops only
+/// pathological ones (ב with prefix+suffix windows: 64M).
+const SINGLE_WORD_POSTINGS_BUDGET: u64 = 8_000_000;
 
 /// Term ceiling for one *word position* of a phrase on the degrade path
 /// ([`TermListPhraseQuery`]). Unlike tantivy's `RegexPhraseQuery` ceiling —
@@ -4332,58 +4704,110 @@ pub struct SearchEngine {
     /// Passage highlights already computed: see [`Self::semantic_passage_highlights`].
     #[cfg(feature = "semantic-integration")]
     semantic_highlights: crate::semantic_highlight::HighlightCache,
+    /// Ranked hits and counts of recent searches: see [`crate::page_cache`].
+    page_cache: PageCache,
+    /// Highlight term sets and display patterns: see [`crate::highlight_cache`].
+    highlight_cache: HighlightCache,
+    /// Request ids of running lexical searches: see [`crate::lexical_cancellation`].
+    lexical_cancellations: LexicalCancellations,
+    /// Which book holds which number (see [`crate::book_order`]): read from the index when
+    /// first needed.
+    book_numbers: Mutex<Option<BookNumbers>>,
+    /// Set whenever this engine (re)takes the writer: another engine may have written and
+    /// handed out numbers while it did not hold it.
+    numbers_stale: AtomicBool,
+    /// The order mapping [`Self::set_book_order`] stores.
+    book_order: RwLock<BookOrderState>,
+    /// The rank tables of the current mapping and book numbers.
+    order_tables: Mutex<Option<CachedOrderTables>>,
 }
 
+/// How [`SearchEngine::write_inputs_with`] makes a document's id.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ids {
+    /// From the book's number and the line's ordinal.
+    Composed,
+    /// This id, for the one document written: tests written before book numbers existed,
+    /// and tests of ids the engine never composes.
+    #[cfg(test)]
+    Raw(u64),
+}
+
+/// Which documents [`SearchEngine::write_inputs_with`] records a book's stamps on.
+#[derive(Clone, Copy)]
+enum Stamping {
+    /// The first of each book in the batch (again when its stamps differ).
+    FirstInBatch,
+    /// Line 0 only: one line written at a time would otherwise stamp every line.
+    LineZero,
+}
+
+/// The order mapping as an engine holds it.
+struct BookOrderState {
+    revision: u64,
+    places: Arc<HashMap<String, BookPlace>>,
+    /// Process-unique, so a cache entry ranked under another mapping is never served.
+    epoch: u64,
+    /// The mapping file as it was read or written, to notice another engine replacing it.
+    stamp: Option<(SystemTime, u64)>,
+}
+
+impl BookOrderState {
+    fn of(mapping: OrderMapping, stamp: Option<(SystemTime, u64)>) -> Self {
+        Self {
+            revision: mapping.revision,
+            places: Arc::new(mapping.places),
+            epoch: book_order::next_epoch(),
+            stamp,
+        }
+    }
+
+    fn read(index_dir: &Path) -> Self {
+        // Stamped first: a file replaced after the read is read again next time.
+        let stamp = order_file_stamp(index_dir);
+        Self::of(OrderMapping::load(index_dir), stamp)
+    }
+}
+
+struct CachedOrderTables {
+    epoch: u64,
+    numbers_version: u64,
+    tables: Arc<OrderTables>,
+}
+
+/// Analyzers that keep the quote-free twin of a quoted word (`רמב"ם` → `רמבם` at the
+/// same position): what snippets and phrase highlights tokenize text with, so a query
+/// reaching `רמב"ם` through `רמבם` paints it, and what `lineEdge` terms are made with.
+pub(crate) const DISPLAY_ANALYZER: &str = "hebrew_display";
+pub(crate) const VOCALIZED_DISPLAY_ANALYZER: &str = "hebrew_vocalized_display";
+
 /// The analyzers every field and query of the index is tokenized with.
-fn register_hebrew_tokenizers(index: &Index) {
-    // אנליזטורי השדות (מצב אינדוקס): מילה עם גרש/גרשיים מוטמעת גם
-    // בצורתה הנקייה באותה עמדה — חיפוש `רמבם` מוצא `רמב"ם`.
-    // RemoveLongFilter על *כל* האנליזטורים — כולל צד השאילתה, אחרת
-    // ספירת הטוקנים ב-PhraseQuery סוטה מהאינדקס: זבל base64 שזלג
-    // לקורפוס (נמדדו ריצות של 4,618 תווים) לא נכנס למילון הטרמים.
-    // 128 בייט ≈ 64 אותיות עבריות — פי כמה מכל מילה לגיטימית.
-    index.tokenizers().register(
-        "hebrew",
-        TextAnalyzer::builder(HebrewTokenizer {
-            emit_quote_free: true,
-            keep_marks: false,
-        })
-        .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
-        .filter(LowerCaser)
-        .build(),
-    );
-    index.tokenizers().register(
-        "hebrew_vocalized",
-        TextAnalyzer::builder(HebrewTokenizer {
-            emit_quote_free: true,
-            keep_marks: true,
-        })
-        .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
-        .filter(LowerCaser)
-        .build(),
-    );
-    // גרסאות צד-שאילתה: בלי הפליטה הכפולה — שאילתה מטוקננת לטוקן אחד
-    // לכל מילה (מסלול ה-exact בונה PhraseQuery לפי מספר הטוקנים).
-    index.tokenizers().register(
-        "hebrew_query",
-        TextAnalyzer::builder(HebrewTokenizer {
-            emit_quote_free: false,
-            keep_marks: false,
-        })
-        .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
-        .filter(LowerCaser)
-        .build(),
-    );
-    index.tokenizers().register(
-        "hebrew_vocalized_query",
-        TextAnalyzer::builder(HebrewTokenizer {
-            emit_quote_free: false,
-            keep_marks: true,
-        })
-        .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
-        .filter(LowerCaser)
-        .build(),
-    );
+/// `index_twins`: the fields' analyzers emit the quote-free twin, as up to schema 5 —
+/// only for tests comparing such an index with one without.
+fn register_hebrew_tokenizers_with(index: &Index, index_twins: bool) {
+    // The fields index each word once; a query reaches its quoted spellings through
+    // `quote_expansion`, and the query analyzers never split a word in two.
+    // RemoveLongFilter על *כל* האנליזטורים — כולל צד השאילתה, אחרת ספירת הטוקנים
+    // ב-PhraseQuery סוטה מהאינדקס (זבל base64 שזלג לקורפוס לא נכנס למילון).
+    for (name, emit_quote_free, keep_marks) in [
+        ("hebrew", index_twins, false),
+        ("hebrew_vocalized", index_twins, true),
+        (DISPLAY_ANALYZER, true, false),
+        (VOCALIZED_DISPLAY_ANALYZER, true, true),
+        ("hebrew_query", false, false),
+        ("hebrew_vocalized_query", false, true),
+    ] {
+        index.tokenizers().register(
+            name,
+            TextAnalyzer::builder(HebrewTokenizer {
+                emit_quote_free,
+                keep_marks,
+            })
+            .filter(RemoveLongFilter::limit(MAX_TOKEN_BYTES))
+            .filter(LowerCaser)
+            .build(),
+        );
+    }
 }
 
 /// Installs a stderr logger (once per process) so the engine's `info!`
@@ -4404,11 +4828,22 @@ impl SearchEngine {
     /// Deliberately **not** `#[frb(sync)]` — opening the index mmaps and reads every
     /// segment footer; a synchronous binding blocks the calling Dart isolate throughout.
     pub fn new(path: &str) -> Self {
+        Self::open_with(path, false)
+    }
+
+    /// An engine whose index holds the quote-free twins schema 5 indexed: for tests that
+    /// compare answers with and without them.
+    #[cfg(test)]
+    pub(crate) fn with_quote_free_twins(path: &str) -> Self {
+        Self::open_with(path, true)
+    }
+
+    fn open_with(path: &str, index_twins: bool) -> Self {
         init_engine_logger();
         debug!("new path={}", path);
         let directory =
             IndexDirectory::open(Path::new(path)).expect("unable to open mmap directory");
-        let index = match open_or_create_index(directory) {
+        let mut index = match open_or_create_index(directory) {
             Ok(index) => index,
             Err(tantivy::TantivyError::SchemaError(err)) => panic!(
                 "index at {path} was built with an incompatible schema ({err}); \
@@ -4417,7 +4852,8 @@ impl SearchEngine {
             Err(err) => panic!("Failed to open index at {path}: {err}"),
         };
         let schema = index.schema();
-        register_hebrew_tokenizers(&index);
+        register_hebrew_tokenizers_with(&index, index_twins);
+        set_search_executor(&mut index);
         let index_reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
@@ -4475,7 +4911,29 @@ impl SearchEngine {
             semantic_sessions: SemanticSessionCache::default(),
             #[cfg(feature = "semantic-integration")]
             semantic_highlights: Default::default(),
+            page_cache: PageCache::default(),
+            highlight_cache: HighlightCache::default(),
+            lexical_cancellations: LexicalCancellations::default(),
+            book_numbers: Mutex::new(None),
+            numbers_stale: AtomicBool::new(true),
+            book_order: RwLock::new(BookOrderState::read(Path::new(path))),
+            order_tables: Mutex::new(None),
         }
+    }
+
+    /// Merges every committed segment into one, so a test can compare on-disk sizes that
+    /// do not depend on how the writer's threads happened to split the documents.
+    #[cfg(test)]
+    pub(crate) fn merge_into_one_segment(&mut self) {
+        let writer = self.writer_mut().unwrap();
+        writer.commit().unwrap();
+        let segments = self.index.searchable_segment_ids().unwrap();
+        let writer = self.writer_mut().unwrap();
+        if segments.len() > 1 {
+            writer.merge(&segments).wait().unwrap();
+        }
+        writer.garbage_collect_files().wait().unwrap();
+        self.index_reader.reload().unwrap();
     }
 
     /// otzaria-mcp local addition (see VENDORED.md): opens an EXISTING index strictly
@@ -4493,9 +4951,10 @@ impl SearchEngine {
 
     /// An engine over an index opened by the caller, with no writer and no metadata written:
     /// benchmarks on an index another process owns (and [`Self::open_read_only`]).
-    pub(crate) fn from_read_only_index(index: Index, path: &Path) -> Result<Self> {
+    pub(crate) fn from_read_only_index(mut index: Index, path: &Path) -> Result<Self> {
         let schema = index.schema();
-        register_hebrew_tokenizers(&index);
+        register_hebrew_tokenizers_with(&index, false);
+        set_search_executor(&mut index);
         let index_reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -4528,7 +4987,295 @@ impl SearchEngine {
             semantic_sessions: SemanticSessionCache::default(),
             #[cfg(feature = "semantic-integration")]
             semantic_highlights: Default::default(),
+            page_cache: PageCache::default(),
+            highlight_cache: HighlightCache::default(),
+            lexical_cancellations: LexicalCancellations::default(),
+            book_numbers: Mutex::new(None),
+            numbers_stale: AtomicBool::new(true),
+            book_order: RwLock::new(BookOrderState::read(path)),
+            order_tables: Mutex::new(None),
         })
+    }
+
+    /// Adds `file_path` at `catalogue_order`/`generation_order` to the order mapping, keeping
+    /// every other book's place: how tests written against catalogue-composed ids place
+    /// their books.
+    #[cfg(test)]
+    pub(crate) fn place_book_for_tests(
+        &self,
+        file_path: &str,
+        catalogue_order: u32,
+        generation_order: u32,
+    ) {
+        let places = Arc::clone(
+            &self
+                .book_order
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .places,
+        );
+        let place = BookPlace {
+            catalogue_order,
+            generation_order,
+        };
+        if places.get(file_path) == Some(&place) {
+            return;
+        }
+        let mut entries: Vec<BookOrderEntry> = places
+            .iter()
+            .filter(|entry| entry.0.as_str() != file_path)
+            .map(|(path, place)| BookOrderEntry {
+                file_path: path.clone(),
+                catalogue_order: place.catalogue_order,
+                generation_order: place.generation_order,
+            })
+            .collect();
+        entries.push(BookOrderEntry {
+            file_path: file_path.to_owned(),
+            catalogue_order,
+            generation_order,
+        });
+        self.set_book_order(entries).unwrap();
+    }
+
+    /// [`Self::add_text_book`] for a test written against catalogue-composed ids: the book
+    /// gets number `catalogue_order + 1`, and is placed as [`Self::place_book_for_tests`]
+    /// does.
+    #[cfg(test)]
+    pub(crate) fn add_text_book_placed(
+        &mut self,
+        title: String,
+        topics: String,
+        file_path: String,
+        catalogue_order: u32,
+        generation_order: u32,
+        text: String,
+        extra_facets: Option<Vec<String>>,
+        text_storage: TextStorage,
+        stored_lines: Option<Vec<u32>>,
+    ) -> Result<u32> {
+        self.force_book_number_for_tests(&file_path, catalogue_order + 1);
+        self.place_book_for_tests(&file_path, catalogue_order, generation_order);
+        self.add_text_book(
+            title,
+            topics,
+            file_path,
+            text,
+            extra_facets,
+            text_storage,
+            stored_lines,
+            None,
+        )
+    }
+
+    /// [`Self::add_text_book_bytes`] with the book placed as [`Self::place_book_for_tests`]
+    /// does.
+    #[cfg(test)]
+    pub(crate) fn add_text_book_bytes_placed(
+        &mut self,
+        title: String,
+        topics: String,
+        file_path: String,
+        catalogue_order: u32,
+        generation_order: u32,
+        text: Vec<u8>,
+        extra_facets: Option<Vec<String>>,
+        text_storage: TextStorage,
+        stored_lines: Option<Vec<u32>>,
+    ) -> Result<u32> {
+        self.force_book_number_for_tests(&file_path, catalogue_order + 1);
+        self.place_book_for_tests(&file_path, catalogue_order, generation_order);
+        self.add_text_book_bytes(
+            title,
+            topics,
+            file_path,
+            text,
+            extra_facets,
+            text_storage,
+            stored_lines,
+            None,
+        )
+    }
+
+    /// [`Self::add_pdf_book`] with the book placed as [`Self::place_book_for_tests`] does.
+    #[cfg(test)]
+    pub(crate) fn add_pdf_book_placed(
+        &mut self,
+        title: String,
+        topics: String,
+        file_path: String,
+        catalogue_order: u32,
+        generation_order: u32,
+        pages: Vec<PdfPageInput>,
+        extra_facets: Option<Vec<String>>,
+    ) -> Result<u32> {
+        self.force_book_number_for_tests(&file_path, catalogue_order + 1);
+        self.place_book_for_tests(&file_path, catalogue_order, generation_order);
+        self.add_pdf_book(title, topics, file_path, pages, extra_facets)
+    }
+
+    /// [`Self::add_document`] for a test written against a caller-composed `id`, which the
+    /// document gets: the id's high half becomes the book's number, and a `generation_order`
+    /// places the book (catalogue = that number). An id below `1 << 32` has no book number,
+    /// as before numbers existed: it is written as it is, sorting before every book, and
+    /// cannot carry a generation.
+    #[cfg(test)]
+    pub(crate) fn add_document_at(
+        &mut self,
+        id: u64,
+        title: &str,
+        reference: &str,
+        topics: &str,
+        text: &str,
+        segment: u64,
+        is_pdf: bool,
+        file_path: &str,
+        section_id: Option<u64>,
+        generation_order: Option<u32>,
+        extra_facets: Option<Vec<String>>,
+    ) -> Result<()> {
+        self.write_document_at(
+            false,
+            id,
+            title,
+            reference,
+            topics,
+            text,
+            segment,
+            is_pdf,
+            file_path,
+            section_id,
+            generation_order,
+            extra_facets,
+        )
+    }
+
+    /// [`Self::upsert_document`] by the id [`Self::add_document_at`] gives.
+    #[cfg(test)]
+    pub(crate) fn upsert_document_at(
+        &mut self,
+        id: u64,
+        title: &str,
+        reference: &str,
+        topics: &str,
+        text: &str,
+        segment: u64,
+        is_pdf: bool,
+        file_path: &str,
+        section_id: Option<u64>,
+        generation_order: Option<u32>,
+        extra_facets: Option<Vec<String>>,
+    ) -> Result<()> {
+        self.write_document_at(
+            true,
+            id,
+            title,
+            reference,
+            topics,
+            text,
+            segment,
+            is_pdf,
+            file_path,
+            section_id,
+            generation_order,
+            extra_facets,
+        )
+    }
+
+    #[cfg(test)]
+    fn write_document_at(
+        &mut self,
+        upsert: bool,
+        id: u64,
+        title: &str,
+        reference: &str,
+        topics: &str,
+        text: &str,
+        segment: u64,
+        is_pdf: bool,
+        file_path: &str,
+        section_id: Option<u64>,
+        generation_order: Option<u32>,
+        extra_facets: Option<Vec<String>>,
+    ) -> Result<()> {
+        let number = (id >> 32) as u32;
+        if number == 0 {
+            assert!(
+                generation_order.is_none(),
+                "a raw id below 1 << 32 has no book to place in a generation"
+            );
+            let document = Self::single_input(
+                0,
+                title,
+                reference,
+                topics,
+                text,
+                segment,
+                is_pdf,
+                file_path,
+                section_id.map(|section| section as u32),
+                extra_facets,
+            );
+            return self.write_inputs_with(
+                vec![document],
+                upsert,
+                Ids::Raw(id),
+                Stamping::LineZero,
+            );
+        }
+        self.force_book_number_for_tests(file_path, number);
+        if let Some(generation_order) = generation_order {
+            self.place_book_for_tests(file_path, number, generation_order);
+        }
+        let line = |id: u64| ((id & 0xFFFF_FFFF) as u32).saturating_sub(1);
+        let document = Self::single_input(
+            line(id),
+            title,
+            reference,
+            topics,
+            text,
+            segment,
+            is_pdf,
+            file_path,
+            section_id.map(line),
+            extra_facets,
+        );
+        self.write_inputs_with(vec![document], upsert, Ids::Composed, Stamping::LineZero)
+    }
+
+    /// A one-line document of `file_path` with exactly `id`, whatever the book's number: for
+    /// tests of indexes whose ids the engine did not compose.
+    #[cfg(all(test, feature = "semantic-integration"))]
+    pub(crate) fn add_raw_document_for_tests(&mut self, id: u64, file_path: &str, text: &str) {
+        let document =
+            Self::single_input(0, "t", "r", "/root", text, 0, false, file_path, None, None);
+        self.write_inputs_with(vec![document], false, Ids::Raw(id), Stamping::LineZero)
+            .unwrap();
+    }
+
+    /// Gives `file_path` book number `number`, as a test written against catalogue-composed
+    /// ids expects it (`catalogue_order + 1`).
+    #[cfg(test)]
+    pub(crate) fn force_book_number_for_tests(&self, file_path: &str, number: u32) {
+        let mut numbers = self
+            .book_numbers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        numbers
+            .get_or_insert_with(|| BookNumbers::new(&self.index_path))
+            .force_for_tests(file_path, number);
+    }
+
+    /// The order searches rank by, for tests that build a line search themselves.
+    #[cfg(test)]
+    pub(crate) fn order_tables_for_tests(&self) -> (u64, Arc<OrderTables>) {
+        self.order_tables().unwrap()
+    }
+
+    /// The number the engine gave `file_path`, for tests that compose expected ids.
+    #[cfg(test)]
+    pub(crate) fn book_number_for_tests(&self, file_path: &str) -> u32 {
+        self.book_number(file_path).unwrap()
     }
 
     /// Forget every semantic session, so the next search computes its first page afresh.
@@ -4641,6 +5388,8 @@ impl SearchEngine {
     /// advanced search.
     #[frb(sync)]
     pub fn set_magic_dictionary_path(&mut self, path: String) -> bool {
+        // The fuzzy display pattern paints the dictionary's forms.
+        self.highlight_cache.clear();
         #[cfg(feature = "semantic-integration")]
         let _sessions = crate::semantic_session::InvalidateOnDrop(&self.semantic_sessions);
         match MagicDictionary::open(Path::new(&path)) {
@@ -6118,9 +6867,30 @@ impl SearchEngine {
                 .iter()
                 .filter_map(|entry| entry.hydrated.as_ref().map(|(address, _)| *address))
                 .collect();
-            let mut page_texts = self
-                .texts_at(&session.searcher, &page_addresses)?
-                .into_iter();
+            let page_texts = self.texts_at(&session.searcher, &page_addresses)?;
+            let page_lines: Vec<EmbeddedLine<'_>> = page
+                .iter()
+                .filter_map(|entry| {
+                    let (address, document) = entry.hydrated.as_ref()?;
+                    Some((
+                        *address,
+                        document.file_path.as_str(),
+                        entry.item.id,
+                        entry.window,
+                    ))
+                })
+                .zip(&page_texts)
+                .map(|((address, book, id, window), (text, status))| {
+                    let text = if *status == TextStatus::Ok {
+                        text.as_str()
+                    } else {
+                        ""
+                    };
+                    (address, book, id, text, window)
+                })
+                .collect();
+            let windows = self.embedded_window_texts(&session.searcher, &page_lines)?;
+            let mut page_texts = page_texts.into_iter().zip(windows);
             // Same budget the lexical API's default highlight uses, so both
             // paths bound the display string identically.
             let snippet_budget = HighlightConfig::default().max_chars;
@@ -6160,16 +6930,17 @@ impl SearchEngine {
                 stale_siblings_dropped = stale_siblings_dropped.saturating_add(page_stale_siblings);
 
                 // Tantivy's copy for a hydrated item, the lexical candidate's otherwise.
-                let (title, reference, text, segment, is_pdf, file_path, text_status) =
+                let (title, reference, text, window, segment, is_pdf, file_path, text_status) =
                     match &entry.hydrated {
                         Some((_, document)) => {
-                            let (text, status) = page_texts
+                            let ((text, status), window) = page_texts
                                 .next()
-                                .unwrap_or((String::new(), TextStatus::Unavailable));
+                                .unwrap_or(((String::new(), TextStatus::Unavailable), None));
                             (
                                 document.title.clone(),
                                 document.reference.clone(),
                                 text,
+                                window,
                                 document.segment,
                                 document.is_pdf,
                                 document.file_path.clone(),
@@ -6180,6 +6951,7 @@ impl SearchEngine {
                             item.title.clone(),
                             item.reference.clone(),
                             item.text.clone(),
+                            None,
                             item.segment,
                             item.is_pdf,
                             item.file_path.clone(),
@@ -6191,14 +6963,22 @@ impl SearchEngine {
                         // A BM25 score is present exactly when Tantivy returned this
                         // line for the lexical query, which is what licenses the
                         // phrase-fallback term painting inside `paint`.
-                        (Some(painter), TextStatus::Ok) => {
-                            painter.paint(&text, item.lexical_score.is_some())
-                        }
+                        (Some(painter), TextStatus::Ok) => painter.paint_shown(
+                            &text,
+                            window.as_deref(),
+                            item.lexical_score.is_some(),
+                        ),
                         (_, TextStatus::Unavailable) => (String::new(), false),
                         // `SemanticOnly` runs no lexical query, so there is nothing
                         // to paint with — the line still crosses FFI bounded. A stale
                         // line is never painted.
-                        _ => (bounded_plain_snippet(&text, snippet_budget), false),
+                        _ => (
+                            bounded_plain_snippet(
+                                window.as_deref().unwrap_or(&text),
+                                snippet_budget,
+                            ),
+                            false,
+                        ),
                     };
 
                 results.push(SemanticSearchResult {
@@ -6225,6 +7005,7 @@ impl SearchEngine {
                     },
                     needs_hydration: false,
                     text_status,
+                    matched_window: entry.window,
                 });
             }
 
@@ -6369,7 +7150,33 @@ impl SearchEngine {
                 addresses.len() - 1
             }));
         }
-        let texts = self.texts_at(&searcher, &addresses)?;
+        let mut texts = self.texts_at(&searcher, &addresses)?;
+        let lines: Vec<EmbeddedLine<'_>> = targets
+            .iter()
+            .zip(&slots)
+            .filter_map(|(target, slot)| {
+                let slot = (*slot)?;
+                let (text, status) = &texts[slot];
+                let text = if *status == TextStatus::Ok {
+                    text.as_str()
+                } else {
+                    ""
+                };
+                Some((
+                    addresses[slot],
+                    target.file_path.as_str(),
+                    target.id,
+                    text,
+                    target.window,
+                ))
+            })
+            .collect();
+        let windows = self.embedded_window_texts(&searcher, &lines)?;
+        for ((text, _), window) in texts.iter_mut().zip(windows) {
+            if let Some(window) = window {
+                *text = window;
+            }
+        }
         let epoch = self.semantic_sessions.epoch();
         let normalized = HebrewNormalizer::new().normalize(query);
         let budget = HighlightConfig::default().max_chars as usize;
@@ -6710,11 +7517,13 @@ impl SearchEngine {
                 .unwrap_or(TextStatus::Ok);
             // Its fields are the item's own, and its text a second copy of the line.
             item.provenance = None;
+            let window = records.get(&line).map_or(0, |record| record.window);
             let entry = SessionEntry {
                 item,
                 hydrated,
                 siblings: sibling_addresses,
                 text_status,
+                window,
             };
             SemanticSearchSession::take(additions, line, &siblings, group, Some(entry));
         }
@@ -6771,6 +7580,7 @@ impl SearchEngine {
                         request.facets.to_vec(),
                         request.match_nikud,
                         request.match_taamim,
+                        None,
                     )?,
                     SemanticLexicalMode::Fuzzy => self.count_smart_fuzzy(
                         request.query,
@@ -6966,6 +7776,7 @@ impl SearchEngine {
                     facets.to_vec(),
                     match_nikud,
                     match_taamim,
+                    None,
                 )?,
                 SemanticLexicalMode::Fuzzy => self.count_smart_fuzzy(
                     query,
@@ -7065,6 +7876,7 @@ impl SearchEngine {
                     source: SemanticResultSource::Lexical,
                     needs_hydration: false,
                     text_status: item.text_status,
+                    matched_window: 0,
                 }
             })
             .collect();
@@ -7092,27 +7904,103 @@ impl SearchEngine {
 
     // ── Write API ──────────────────────────────────────────────────────────────
 
-    /// Add a single document. Does not commit.
-    /// Writes no content fingerprint (`contentHash` = 0) — batch ingestion via
-    /// [`Self::add_documents_batch`] is the fingerprint-aware path.
+    /// Add a single line of a book. Does not commit. The id is the engine's: line `ordinal`
+    /// (0-based) of the book `file_path`, whose number is assigned on its first write.
+    /// Line 0 records the book's `metadataHash`; no fingerprint (`contentHash` = 0): batch
+    /// ingestion via [`Self::add_documents_batch`] is the fingerprint-aware path.
     ///
-    /// `_text` is normalized here ([`normalize_text_for_indexing`]) — the API
+    /// `text` is normalized here ([`normalize_text_for_indexing`]) — the API
     /// is exposed over FFI, so the "input is already normalized" assumption
     /// is enforced rather than documented. Already-normalized text passes
     /// through the fast paths at negligible cost.
     pub fn add_document(
         &mut self,
-        _id: u64,
-        _title: &str,
-        _reference: &str,
-        _topics: &str,
-        _text: &str,
-        _segment: u64,
-        _is_pdf: bool,
-        _file_path: &str,
-        _section_id: Option<u64>,
-        _generation_order: Option<u32>,
-        _extra_facets: Option<Vec<String>>,
+        ordinal: u32,
+        title: &str,
+        reference: &str,
+        topics: &str,
+        text: &str,
+        segment: u64,
+        is_pdf: bool,
+        file_path: &str,
+        section_ordinal: Option<u32>,
+        extra_facets: Option<Vec<String>>,
+    ) -> Result<()> {
+        let document = Self::single_input(
+            ordinal,
+            title,
+            reference,
+            topics,
+            text,
+            segment,
+            is_pdf,
+            file_path,
+            section_ordinal,
+            extra_facets,
+        );
+        self.write_inputs_with(vec![document], false, Ids::Composed, Stamping::LineZero)
+    }
+
+    /// The [`DocumentInput`] of [`Self::add_document`]: a line carrying marks also gets its
+    /// vocalized copy, normalized from the raw text.
+    #[allow(clippy::too_many_arguments)]
+    fn single_input(
+        ordinal: u32,
+        title: &str,
+        reference: &str,
+        topics: &str,
+        text: &str,
+        segment: u64,
+        is_pdf: bool,
+        file_path: &str,
+        section_ordinal: Option<u32>,
+        extra_facets: Option<Vec<String>>,
+    ) -> DocumentInput {
+        DocumentInput {
+            ordinal,
+            title: title.to_owned(),
+            reference: reference.to_owned(),
+            topics: topics.to_owned(),
+            text: text.to_owned(),
+            segment,
+            is_pdf,
+            file_path: file_path.to_owned(),
+            content_hash: None,
+            text_hash: None,
+            source_hash: None,
+            text_vocalized: hebrew_query::contains_attached_marks(text).then(|| text.to_owned()),
+            section_ordinal,
+            extra_facets,
+            text_storage: None,
+        }
+    }
+
+    /// Add many documents in a single FFI call. Does not commit.
+    /// For initial bulk loads – no duplicate checking. Each document's id is composed by the
+    /// engine from its book's number and `ordinal`, as for [`Self::add_document`]; the
+    /// stamps of a book are recorded on its first document in the batch.
+    ///
+    /// `text` is normalized here ([`normalize_text_for_indexing`]) and a
+    /// supplied `text_vocalized` through its vocalized counterpart — the API
+    /// is exposed over FFI, so the "input is already normalized" assumption
+    /// is enforced rather than documented. Already-normalized input passes
+    /// through the fast paths at negligible cost.
+    pub fn add_documents_batch(&mut self, docs: Vec<DocumentInput>) -> Result<()> {
+        self.write_inputs(docs, false)
+    }
+
+    /// Writes ready-made documents; `upsert` first deletes the documents holding their ids
+    /// (of two documents with one id the later wins, as when each deleted its own id).
+    fn write_inputs(&mut self, docs: Vec<DocumentInput>, upsert: bool) -> Result<()> {
+        self.write_inputs_with(docs, upsert, Ids::Composed, Stamping::FirstInBatch)
+    }
+
+    fn write_inputs_with(
+        &mut self,
+        docs: Vec<DocumentInput>,
+        upsert: bool,
+        ids: Ids,
+        stamping: Stamping,
     ) -> Result<()> {
         let (
             title_f,
@@ -7123,109 +8011,96 @@ impl SearchEngine {
             is_pdf_f,
             file_path_f,
             topics_f,
-            content_hash_f,
-            text_hash_f,
             text_vocalized_f,
             section_id_f,
-            generation_sort_f,
             line_hash_f,
         ) = self.all_fields()?;
-        let topics_facet = Facet::from_text(_topics)?;
-        let normalized_text = hebrew_query::normalize_text_for_indexing(_text);
-        let mut document = doc!(
-            title_f        => _title,
-            reference_f    => _reference,
-            text_f         => normalized_text.as_str(),
-            id_f           => _id,
-            segment_f      => _segment,
-            is_pdf_f       => _is_pdf,
-            file_path_f    => _file_path,
-            topics_f       => topics_facet,
-            content_hash_f => 0u64,
-            text_hash_f    => 0u64,
-            section_id_f   => _section_id.unwrap_or(_id),
-            generation_sort_f => generation_sort_key(
-                _generation_order.unwrap_or(DEFAULT_GENERATION_ORDER),
-                _id
-            ),
-            line_hash_f    => line_dedup_hash(&normalized_text)
-        );
-        // Not a line of a book, so no key: only `add_text_book` knows a line's neighbours.
-        set_chunk_key(&mut document, self.chunk_key_field, 0);
-        for facet in _extra_facets.iter().flatten() {
-            document.add_facet(topics_f, Facet::from_text(facet)?);
-        }
-        // שורה שנושאת סימנים משתתפת גם בחיפוש המנוקד; הבדיקה על הקלט הגולמי
-        // (הנרמול הרגיל מסיר את הסימנים) והעותק המנוקד מנורמל בנפרד.
-        let vocalized = hebrew_query::contains_attached_marks(_text)
-            .then(|| hebrew_query::normalize_vocalized_text_for_indexing(_text));
-        if let Some(vocalized) = &vocalized {
-            document.add_text(text_vocalized_f, vocalized);
-        }
-        add_stored_text(
-            &mut document,
-            self.stored_text_fields()?,
-            &normalized_text,
-            vocalized.as_deref(),
-        );
-        self.writer_mut()?.add_document(document)?;
-        Ok(())
-    }
-
-    /// Add many documents in a single FFI call. Does not commit.
-    /// For initial bulk loads – no duplicate checking.
-    ///
-    /// `text` is normalized here ([`normalize_text_for_indexing`]) and a
-    /// supplied `text_vocalized` through its vocalized counterpart — the API
-    /// is exposed over FFI, so the "input is already normalized" assumption
-    /// is enforced rather than documented. Already-normalized input passes
-    /// through the fast paths at negligible cost.
-    pub fn add_documents_batch(&mut self, docs: Vec<DocumentInput>) -> Result<()> {
-        let (
-            title_f,
-            reference_f,
-            text_f,
-            id_f,
-            segment_f,
-            is_pdf_f,
-            file_path_f,
-            topics_f,
-            content_hash_f,
-            text_hash_f,
-            text_vocalized_f,
-            section_id_f,
-            generation_sort_f,
-            line_hash_f,
-        ) = self.all_fields()?;
+        let stamp_fields = StampFields::of(&self.schema)?;
         let chunk_key_f = self.chunk_key_field;
         let stored_fields = self.stored_text_fields()?;
         // Validated before anything is written, so a bad document cannot leave half
         // a batch in the writer.
         refuse_library_storage(&docs)?;
+        self.ensure_writer()?;
+        let mut bases: HashMap<String, u64> = HashMap::new();
+        let mut docs: Vec<(u64, DocumentInput)> = docs
+            .into_iter()
+            .map(|doc| {
+                #[cfg(test)]
+                if let Ids::Raw(id) = ids {
+                    return Ok((id, doc));
+                }
+                let base = match bases.get(&doc.file_path) {
+                    Some(&base) => base,
+                    None => {
+                        let base = self.id_base(&doc.file_path)?;
+                        bases.insert(doc.file_path.clone(), base);
+                        base
+                    }
+                };
+                Ok((base + u64::from(doc.ordinal) + 1, doc))
+            })
+            .collect::<Result<_>>()?;
+        if upsert {
+            // One deletion for the batch, which scans the `id` column once.
+            let mut seen = HashSet::new();
+            docs.reverse();
+            docs.retain(|(id, _)| seen.insert(*id));
+            docs.reverse();
+            if !seen.is_empty() {
+                self.writer_mut()?
+                    .delete_query(Box::new(IdSetQuery::new(seen)))?;
+            }
+        }
+        let mut stamped: HashMap<String, Stamps> = HashMap::new();
         let writer = self.writer_mut()?;
-        for doc in docs {
+        for (id, doc) in docs {
+            let base = id & !0xFFFF_FFFF;
             let topics_facet = Facet::from_text(&doc.topics)?;
             let normalized_text = hebrew_query::normalize_text_for_indexing(&doc.text);
             let line_hash = line_dedup_hash(&normalized_text);
+            let section_id = match ids {
+                Ids::Composed => doc
+                    .section_ordinal
+                    .map_or(id, |section| base + u64::from(section) + 1),
+                #[cfg(test)]
+                Ids::Raw(_) => doc.section_ordinal.map_or(id, u64::from),
+            };
+            let stamps = Stamps {
+                content: doc.content_hash.unwrap_or(0),
+                text: doc.text_hash.unwrap_or(0),
+                metadata: metadata_fingerprint(
+                    &doc.title,
+                    &doc.topics,
+                    doc.extra_facets.clone().unwrap_or_default(),
+                ),
+                source: doc.source_hash.unwrap_or(0),
+            };
             let mut document = doc!(
                 title_f        => doc.title,
                 reference_f    => doc.reference,
                 text_f         => normalized_text.as_str(),
-                id_f           => doc.id,
-                segment_f      => doc.segment,
+                id_f           => id,
                 is_pdf_f       => doc.is_pdf,
-                file_path_f    => doc.file_path,
+                file_path_f    => doc.file_path.as_str(),
                 topics_f       => topics_facet,
-                content_hash_f => doc.content_hash.unwrap_or(0),
-                text_hash_f    => doc.text_hash.unwrap_or(0),
-                section_id_f   => doc.section_id.unwrap_or(doc.id),
-                generation_sort_f => generation_sort_key(
-                    doc.generation_order.unwrap_or(DEFAULT_GENERATION_ORDER),
-                    doc.id
-                ),
+                section_id_f   => section_offset(id, section_id),
                 line_hash_f    => line_hash
             );
+            if let Some(stored) = segment_to_store(id, doc.segment) {
+                document.add_u64(segment_f, stored);
+            }
+            // Not a line of a book's text, so no key: only `add_text_book` knows a line's
+            // neighbours.
             set_chunk_key(&mut document, chunk_key_f, 0);
+            let stamp_here = match stamping {
+                Stamping::FirstInBatch => stamped.get(doc.file_path.as_str()) != Some(&stamps),
+                Stamping::LineZero => doc.ordinal == 0,
+            };
+            if stamp_here {
+                stamp_book(&mut document, stamp_fields, stamps);
+                stamped.insert(doc.file_path.clone(), stamps);
+            }
             for facet in doc.extra_facets.iter().flatten() {
                 document.add_facet(topics_f, Facet::from_text(facet)?);
             }
@@ -7250,23 +8125,28 @@ impl SearchEngine {
     /// Indexes a whole text book in ONE FFI call. Does not commit.
     ///
     /// Splits `text` into lines, tracks the `<h…>` heading reference trail,
-    /// normalizes each line ([`normalize_text_for_indexing`]), stamps the
-    /// book's canonical fingerprint ([`compute_book_fingerprint`] — text +
-    /// metadata) on every document, and adds one document per line. Returns the number of documents added (0 for empty
-    /// text — the caller writes its empty-book marker in that case).
+    /// normalizes each line ([`normalize_text_for_indexing`]), records the
+    /// book's stamps ([`compute_book_fingerprint`] — text + metadata,
+    /// [`compute_content_fingerprint`], [`compute_book_metadata_fingerprint`] and
+    /// `source_hash` as given) on its first document, and adds one document per line.
+    /// Returns the number of documents added (0 for empty text — the caller writes its
+    /// empty-book marker in that case).
     ///
     /// This is the whole-book replacement for the app's per-line pipeline
     /// (Dart isolate → per-batch FFI normalize → SendPort copy → batch add):
     /// the raw text crosses the bridge exactly once and only a count comes
-    /// back. Document ids encode catalogue order exactly like the Dart
-    /// `buildCatalogueDocumentId`: `((catalogue_order+1) << 32) + ordinal+1`.
+    /// back. Document ids are `(bookNumber << 32) + ordinal+1`, the book's number
+    /// assigned by the engine on its first write (see [`Self::get_book_stamps`]); the
+    /// book's place in the catalogue is [`Self::set_book_order`]'s.
     ///
     /// `text_storage`: [`TextStorage::LibraryDb`] only when `text` is the
     /// newline-joined rows of an official book read from the library database
-    /// (then `file_path` must be `id:<bookId>`); the lines are then not stored in
+    /// (then `file_path` must be `id:<bookId>`), or of a personal book read from the
+    /// user-books database (`uid:<bookId>`) or an attached database
+    /// (`db:<slug>:<bookId>`); the lines are then not stored in
     /// the index and results read them back from that database. The book is
     /// stored as [`TextStorage::InIndex`] instead (and a warning logged) when the
-    /// configured line source does not hold exactly as many rows for it as `text`
+    /// book's configured line source does not hold exactly as many rows for it as `text`
     /// has lines — a row containing `\n`, a different database — or cannot be read
     /// (unconfigured, suspended, busy).
     ///
@@ -7274,26 +8154,29 @@ impl SearchEngine {
     /// in the index anyway, as for `InIndex` — the rows that held embedded `data:` images,
     /// which a result would otherwise read back raw (megabytes) on every window. Ignored
     /// for `InIndex`; ordinals past the last line are ignored.
+    ///
+    /// `source_hash`: an opaque hash of the book's source (the library database's
+    /// `book.contentHash`), stored as given; `None`/0 for none.
     pub fn add_text_book(
         &mut self,
         title: String,
         topics: String,
         file_path: String,
-        catalogue_order: u32,
-        generation_order: u32,
         text: String,
         extra_facets: Option<Vec<String>>,
         text_storage: TextStorage,
         stored_lines: Option<Vec<u32>>,
+        source_hash: Option<u64>,
     ) -> Result<u32> {
         self.add_text_book_impl(
-            title,
-            topics,
-            file_path,
-            catalogue_order,
-            generation_order,
+            TextBookMeta {
+                title,
+                topics,
+                file_path,
+                extra_facets: extra_facets.unwrap_or_default(),
+                source_hash: source_hash.unwrap_or(0),
+            },
             &text,
-            extra_facets.unwrap_or_default(),
             text_storage,
             stored_lines.unwrap_or_default(),
         )
@@ -7310,12 +8193,11 @@ impl SearchEngine {
         title: String,
         topics: String,
         file_path: String,
-        catalogue_order: u32,
-        generation_order: u32,
         text: Vec<u8>,
         extra_facets: Option<Vec<String>>,
         text_storage: TextStorage,
         stored_lines: Option<Vec<u32>>,
+        source_hash: Option<u64>,
     ) -> Result<u32> {
         let text = match String::from_utf8_lossy(&text) {
             std::borrow::Cow::Borrowed(_) => {
@@ -7325,45 +8207,73 @@ impl SearchEngine {
             std::borrow::Cow::Owned(fixed) => fixed,
         };
         self.add_text_book_impl(
-            title,
-            topics,
-            file_path,
-            catalogue_order,
-            generation_order,
+            TextBookMeta {
+                title,
+                topics,
+                file_path,
+                extra_facets: extra_facets.unwrap_or_default(),
+                source_hash: source_hash.unwrap_or(0),
+            },
             &text,
-            extra_facets.unwrap_or_default(),
             text_storage,
             stored_lines.unwrap_or_default(),
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn add_text_book_impl(
         &mut self,
-        title: String,
-        topics: String,
-        file_path: String,
-        catalogue_order: u32,
-        generation_order: u32,
+        book: TextBookMeta,
         text: &str,
-        extra_facets: Vec<String>,
         text_storage: TextStorage,
         stored_lines: Vec<u32>,
     ) -> Result<u32> {
         let library_book = match text_storage {
-            TextStorage::LibraryDb => Some(require_library_book_id(&file_path)?),
+            TextStorage::LibraryDb => Some(require_library_book_id(&book.file_path)?),
             TextStorage::InIndex => None,
         };
         if text.is_empty() {
             return Ok(0);
         }
+        self.ensure_writer()?;
         let started = Instant::now();
-        let lines: Vec<&str> = text.split('\n').collect();
         let text_storage = match library_book {
-            Some(book_id) => library_storage_or_fallback(book_id, lines.len(), &title),
+            Some(source) => library_storage_or_fallback(source, line_count(text), &book.title),
             None => TextStorage::InIndex,
         };
-        let text_bytes = text.len();
+        let mut prepared = self.prepare_text_book(&book, text, text_storage, &stored_lines)?;
+        let writer = self.writer_mut()?;
+        let enqueue_started = Instant::now();
+        let docs = prepared.enqueue(writer)?;
+        info!(
+            "add_text_book '{}': {docs} docs, {} bytes in {:?} \
+             (prepare {:?}, keys {:?}, enqueue {:?})",
+            book.title,
+            text.len(),
+            started.elapsed(),
+            prepared.prepare_time,
+            prepared.keys_time,
+            enqueue_started.elapsed()
+        );
+        Ok(docs)
+    }
+
+    /// The documents of a text book's lines, built without touching the writer: everything
+    /// [`Self::add_text_book`] does before it enqueues them. `text_storage` is final here.
+    pub(crate) fn prepare_text_book(
+        &self,
+        book: &TextBookMeta,
+        text: &str,
+        text_storage: TextStorage,
+        stored_lines: &[u32],
+    ) -> Result<PreparedTextBook> {
+        let TextBookMeta {
+            title,
+            topics,
+            file_path,
+            extra_facets,
+            source_hash,
+        } = book;
+        let lines: Vec<&str> = text.split('\n').collect();
         let (
             title_f,
             reference_f,
@@ -7373,13 +8283,11 @@ impl SearchEngine {
             is_pdf_f,
             file_path_f,
             topics_f,
-            content_hash_f,
-            text_hash_f,
             text_vocalized_f,
             section_id_f,
-            generation_sort_f,
             line_hash_f,
         ) = self.all_fields()?;
+        let stamp_fields = StampFields::of(&self.schema)?;
         let topics_facet = Facet::from_text(&topics)?;
         // נתיבי הממדים (מחבר/תקופה/יסוד) נפרסים פעם אחת לספר ומוטבעים
         // כערכי facet נוספים על כל שורה.
@@ -7387,22 +8295,20 @@ impl SearchEngine {
             .iter()
             .map(|f| Facet::from_text(f))
             .collect::<std::result::Result<_, _>>()?;
-        let content_hash = book_fingerprint(
-            text,
-            &title,
-            &topics,
-            catalogue_order,
-            generation_order,
-            extra_facets.clone(),
-        );
-        let text_hash = content_fingerprint(text);
-        let id_base = catalogue_id_base(catalogue_order)?;
+        let stamps = Stamps {
+            content: book_fingerprint(text, title, topics, extra_facets.clone()),
+            text: content_fingerprint(text),
+            metadata: metadata_fingerprint(title, topics, extra_facets.clone()),
+            source: *source_hash,
+        };
+        let book_number = self.book_number(file_path)?;
+        let id_base = u64::from(book_number) << 32;
         let chunk_key_f = self.chunk_key_field;
         let library = text_storage == TextStorage::LibraryDb;
         let mut kept_in_index = Vec::new();
         if library && !stored_lines.is_empty() {
             kept_in_index = vec![false; lines.len()];
-            for ordinal in stored_lines {
+            for &ordinal in stored_lines {
                 if let Some(kept) = kept_in_index.get_mut(ordinal as usize) {
                     *kept = true;
                 }
@@ -7413,7 +8319,6 @@ impl SearchEngine {
         let line_check_f = self.schema.get_field(LINE_CHECK_FIELD)?;
         let edge_fields = cross_line::EdgeFields::from_schema(&self.schema)?;
         let edge_analyzer = self.text_index_analyzer()?;
-        let writer = self.writer_mut()?;
 
         // "prepare" — the pure-CPU phase (trail + normalization); "enqueue" —
         // writer.add_document (queue push; grows only when tantivy's indexing
@@ -7463,10 +8368,7 @@ impl SearchEngine {
             .map_init(
                 || edge_analyzer.clone(),
                 |analyzer, (segment, raw_line)| {
-                    let plain = hebrew_query::normalize_text_for_indexing(raw_line);
-                    let vocalized = hebrew_query::contains_attached_marks(raw_line)
-                        .then(|| hebrew_query::normalize_vocalized_text_for_indexing(raw_line))
-                        .filter(|v| !v.is_empty());
+                    let (plain, vocalized) = hebrew_query::normalize_line_for_indexing(raw_line);
                     let line_hash = line_dedup_hash(&plain);
                     let line_check =
                         (!stores_text(segment)).then(|| crate::line_source::line_check(raw_line));
@@ -7501,32 +8403,33 @@ impl SearchEngine {
         };
         let keys_time = keys_started.elapsed();
 
-        let enqueue_started = Instant::now();
-        let mut ordinal: u64 = 0;
+        let mut documents = Vec::with_capacity(lines.len());
         for (segment, (normalized_line, vocalized_line, line_hash, line_check, edges)) in
             normalized.into_iter().enumerate()
         {
             let reference = references[reference_of_line[segment] as usize].as_str();
-            let id = id_base + ordinal + 1;
+            let id = id_base + segment as u64 + 1;
             let mut document = doc!(
                 title_f        => title.as_str(),
                 reference_f    => reference,
                 text_f         => normalized_line.as_str(),
                 id_f           => id,
-                segment_f      => segment as u64,
                 is_pdf_f       => false,
                 file_path_f    => file_path.as_str(),
                 topics_f       => topics_facet.clone(),
-                content_hash_f => content_hash,
-                text_hash_f    => text_hash,
                 // כל השורות של אותו בלוק כותרת חולקות ערך; id_base מבדל
-                // בין ספרים, אז המזהה ייחודי גלובלית.
-                section_id_f   => id_base + u64::from(reference_of_line[segment]),
-                generation_sort_f => generation_sort_key(generation_order, id),
+                // בין ספרים, אז sectionId הנגזר ייחודי גלובלית.
+                section_id_f   => u64::from(reference_of_line[segment]),
                 line_hash_f    => line_hash
             );
+            if let Some(stored) = segment_to_store(id, segment as u64) {
+                document.add_u64(segment_f, stored);
+            }
             let chunk_key = chunk_keys.get(segment).copied().unwrap_or(0);
             set_chunk_key(&mut document, chunk_key_f, chunk_key);
+            if segment == 0 {
+                stamp_book(&mut document, stamp_fields, stamps);
+            }
             for facet in &extra_facet_values {
                 document.add_facet(topics_f, facet.clone());
             }
@@ -7546,16 +8449,52 @@ impl SearchEngine {
                     vocalized_line.as_deref(),
                 );
             }
-            writer.add_document(document)?;
-            ordinal += 1;
+            documents.push(document);
         }
-        let enqueue_time = enqueue_started.elapsed();
-        info!(
-            "add_text_book '{title}': {ordinal} docs, {text_bytes} bytes in {:?} \
-             (prepare {prepare_time:?}, keys {keys_time:?}, enqueue {enqueue_time:?})",
-            started.elapsed()
-        );
-        Ok(ordinal as u32)
+        Ok(PreparedTextBook {
+            documents,
+            book_number,
+            content_hash: stamps.content,
+            text_hash: stamps.text,
+            metadata_hash: stamps.metadata,
+            source_hash: stamps.source,
+            text_storage,
+            prepare_time,
+            keys_time,
+        })
+    }
+
+    /// Indexes books whose text the engine reads itself, from the library database
+    /// ([`configure_line_source`]), the user-books database
+    /// ([`configure_user_books_line_source`]) or an attached database
+    /// ([`configure_attached_line_source`]). Does not commit.
+    ///
+    /// Each book is indexed exactly as `add_text_book_bytes` indexes the text the app reads
+    /// for it: rows in `lineIndex` order joined with `\n`, embedded `data:` images removed
+    /// (those rows then stored in the index, as `stored_lines`), the same documents,
+    /// `contentHash` and `textHash`. Several books are read and prepared at once; they
+    /// are added in input order, each whole or not at all.
+    ///
+    /// Takes the engine by shared reference, so searches are not held up while the batch
+    /// prepares; it needs an open writer ([`Self::open_index_writer`]). `cancel` stops the
+    /// batch before its next book. One result per input book, in order. An `Err` means
+    /// the writer failed: books of this batch may be in it, as after a failed
+    /// `add_text_book_bytes`.
+    pub fn add_library_books(
+        &self,
+        books: Vec<LibraryBookInput>,
+        cancel: &IndexingCancellationToken,
+    ) -> Result<Vec<LibraryBookResult>> {
+        let writer = self.index_writer.as_ref().context(
+            "add_library_books needs an open index writer: call open_index_writer first",
+        )?;
+        crate::library_indexing::add_library_books(self, writer, books, Some(cancel))
+    }
+
+    /// Opens the index writer if it is closed (it reopens lazily after some maintenance
+    /// calls); [`Self::add_library_books`] does not open it itself.
+    pub fn open_index_writer(&mut self) -> Result<()> {
+        self.ensure_writer()
     }
 
     /// Indexes a whole PDF book in ONE FFI call. Does not commit.
@@ -7568,9 +8507,9 @@ impl SearchEngine {
     /// heuristic ([`is_probably_garbage_pdf_text`]) flags it — exactly the
     /// per-line logic of [`normalize_pdf_texts_for_indexing`]. One document is
     /// added per surviving line, with `segment` = the page's `page_index` and
-    /// ids encoding catalogue order like [`Self::add_text_book`]. PDFs record
-    /// no content fingerprint (`contentHash` = 0, their text is not in the
-    /// library DB).
+    /// ids composed like [`Self::add_text_book`]'s. PDFs record their
+    /// `metadataHash` and no content fingerprint (`contentHash` = 0, their text is
+    /// not in the library DB).
     ///
     /// Returns the number of documents added; 0 means the PDF yielded no
     /// usable text (scanned/garbage) — the caller falls back to a sidecar or
@@ -7581,8 +8520,6 @@ impl SearchEngine {
         title: String,
         topics: String,
         file_path: String,
-        catalogue_order: u32,
-        generation_order: u32,
         pages: Vec<PdfPageInput>,
         extra_facets: Option<Vec<String>>,
     ) -> Result<u32> {
@@ -7601,22 +8538,25 @@ impl SearchEngine {
             is_pdf_f,
             file_path_f,
             topics_f,
-            content_hash_f,
-            text_hash_f,
             // PDF אינו משתתף בחיפוש מנוקד: ניקוד שמגיע מ-OCR אינו אמין,
             // והנרמול של PDF ממילא מוחק אותו.
             _text_vocalized_f,
             section_id_f,
-            generation_sort_f,
             line_hash_f,
         ) = self.all_fields()?;
+        let stamp_fields = StampFields::of(&self.schema)?;
+        let extra_facets = extra_facets.unwrap_or_default();
+        let stamps = Stamps {
+            metadata: metadata_fingerprint(&title, &topics, extra_facets.clone()),
+            ..Stamps::default()
+        };
         let topics_facet = Facet::from_text(&topics)?;
         let extra_facet_values: Vec<Facet> = extra_facets
-            .unwrap_or_default()
             .iter()
             .map(|f| Facet::from_text(f))
             .collect::<std::result::Result<_, _>>()?;
-        let id_base = catalogue_id_base(catalogue_order)?;
+        self.ensure_writer()?;
+        let id_base = self.id_base(&file_path)?;
         let chunk_key_f = self.chunk_key_field;
         let stored_fields = self.stored_text_fields()?;
         let edge_fields = cross_line::EdgeFields::from_schema(&self.schema)?;
@@ -7668,17 +8608,19 @@ impl SearchEngine {
                 reference_f    => page.reference.as_str(),
                 text_f         => normalized.as_str(),
                 id_f           => id,
-                segment_f      => u64::from(page.page_index),
                 is_pdf_f       => true,
                 file_path_f    => file_path.as_str(),
                 topics_f       => topics_facet.clone(),
-                content_hash_f => 0u64,
-                text_hash_f    => 0u64,
                 // ב-PDF אין שרשרת כותרות — עמוד = סעיף.
-                section_id_f   => id_base + u64::from(page.page_index),
-                generation_sort_f => generation_sort_key(generation_order, id),
+                section_id_f   => u64::from(page.page_index),
                 line_hash_f    => line_hash
             );
+            if ordinal == 0 {
+                stamp_book(&mut document, stamp_fields, stamps);
+            }
+            if let Some(stored) = segment_to_store(id, u64::from(page.page_index)) {
+                document.add_u64(segment_f, stored);
+            }
             // A PDF's lines are not the library's text, so no vector is built from them.
             set_chunk_key(&mut document, chunk_key_f, 0);
             for facet in &extra_facet_values {
@@ -7703,110 +8645,44 @@ impl SearchEngine {
         Ok(ordinal as u32)
     }
 
-    /// Delete then re-insert a single document by id. Does not commit.
+    /// Delete then re-insert a single line, by the id [`Self::add_document`] composes for
+    /// it. Does not commit.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_document(
         &mut self,
-        _id: u64,
-        _title: &str,
-        _reference: &str,
-        _topics: &str,
-        _text: &str,
-        _segment: u64,
-        _is_pdf: bool,
-        _file_path: &str,
-        _section_id: Option<u64>,
-        _generation_order: Option<u32>,
-        _extra_facets: Option<Vec<String>>,
+        ordinal: u32,
+        title: &str,
+        reference: &str,
+        topics: &str,
+        text: &str,
+        segment: u64,
+        is_pdf: bool,
+        file_path: &str,
+        section_ordinal: Option<u32>,
+        extra_facets: Option<Vec<String>>,
     ) -> Result<()> {
-        self.delete_document_by_id(_id)?;
-        self.add_document(
-            _id,
-            _title,
-            _reference,
-            _topics,
-            _text,
-            _segment,
-            _is_pdf,
-            _file_path,
-            _section_id,
-            _generation_order,
-            _extra_facets,
-        )
+        let document = Self::single_input(
+            ordinal,
+            title,
+            reference,
+            topics,
+            text,
+            segment,
+            is_pdf,
+            file_path,
+            section_ordinal,
+            extra_facets,
+        );
+        self.write_inputs_with(vec![document], true, Ids::Composed, Stamping::LineZero)
     }
 
     /// Upsert many documents in a single FFI call. Does not commit.
     /// Normalizes `text`/`text_vocalized` exactly like
     /// [`Self::add_documents_batch`].
     pub fn upsert_documents_batch(&mut self, docs: Vec<DocumentInput>) -> Result<()> {
-        let (
-            title_f,
-            reference_f,
-            text_f,
-            id_f,
-            segment_f,
-            is_pdf_f,
-            file_path_f,
-            topics_f,
-            content_hash_f,
-            text_hash_f,
-            text_vocalized_f,
-            section_id_f,
-            generation_sort_f,
-            line_hash_f,
-        ) = self.all_fields()?;
-        let chunk_key_f = self.chunk_key_field;
-        let stored_fields = self.stored_text_fields()?;
-        // Validated before anything is written, so a bad document cannot leave half
-        // a batch in the writer.
-        refuse_library_storage(&docs)?;
-        let writer = self.writer_mut()?;
-        for doc in docs {
-            writer.delete_term(Term::from_field_u64(id_f, doc.id));
-            let topics_facet = Facet::from_text(&doc.topics)?;
-            let normalized_text = hebrew_query::normalize_text_for_indexing(&doc.text);
-            let line_hash = line_dedup_hash(&normalized_text);
-            let mut document = doc!(
-                title_f        => doc.title,
-                reference_f    => doc.reference,
-                text_f         => normalized_text.as_str(),
-                id_f           => doc.id,
-                segment_f      => doc.segment,
-                is_pdf_f       => doc.is_pdf,
-                file_path_f    => doc.file_path,
-                topics_f       => topics_facet,
-                content_hash_f => doc.content_hash.unwrap_or(0),
-                text_hash_f    => doc.text_hash.unwrap_or(0),
-                section_id_f   => doc.section_id.unwrap_or(doc.id),
-                generation_sort_f => generation_sort_key(
-                    doc.generation_order.unwrap_or(DEFAULT_GENERATION_ORDER),
-                    doc.id
-                ),
-                line_hash_f    => line_hash
-            );
-            set_chunk_key(&mut document, chunk_key_f, 0);
-            for facet in doc.extra_facets.iter().flatten() {
-                document.add_facet(topics_f, Facet::from_text(facet)?);
-            }
-            let vocalized = doc
-                .text_vocalized
-                .filter(|vocalized| !vocalized.is_empty())
-                .map(|vocalized| hebrew_query::normalize_vocalized_text_for_indexing(&vocalized));
-            if let Some(vocalized) = &vocalized {
-                document.add_text(text_vocalized_f, vocalized);
-            }
-            add_stored_text(
-                &mut document,
-                stored_fields,
-                &normalized_text,
-                vocalized.as_deref(),
-            );
-            writer.add_document(document)?;
-        }
-        Ok(())
+        self.write_inputs(docs, true)
     }
 
-    /// Delete a document by its numeric id. Does not commit.
     /// Whether the index this engine opened is one this build reads.
     ///
     /// `pub(crate)`: the FFI already exposes [`check_index_compatibility`] by path. This is
@@ -7831,9 +8707,8 @@ impl SearchEngine {
 
     /// Delete a document by its numeric id. Does not commit.
     pub fn delete_document_by_id(&mut self, id: u64) -> Result<()> {
-        let id_f = self.schema.get_field("id").unwrap();
         self.writer_mut()?
-            .delete_term(Term::from_field_u64(id_f, id));
+            .delete_query(Box::new(IdSetQuery::new([id])))?;
         Ok(())
     }
 
@@ -7930,6 +8805,8 @@ impl SearchEngine {
         let commit_elapsed = started.elapsed();
         let reload_started = Instant::now();
         self.index_reader.reload()?;
+        self.page_cache.clear();
+        self.highlight_cache.clear();
         info!(
             "commit: {commit_elapsed:?} (reader reload {:?})",
             reload_started.elapsed()
@@ -7941,6 +8818,190 @@ impl SearchEngine {
     pub fn rollback(&mut self) -> Result<()> {
         self.writer_mut()?.rollback()?;
         Ok(())
+    }
+
+    // ── Book numbers and order ─────────────────────────────────────────────────
+
+    /// Replaces the whole order mapping: the catalogue and generation position of each book,
+    /// by its `filePath`. Catalogue and generation searches sort by it from the next call on,
+    /// with no reindexing; a book absent from it sorts after every book in it. Stored in the
+    /// index directory, so every engine that opens the index sorts the same way.
+    ///
+    /// Returns the mapping's revision, which grows on every change; the same mapping again
+    /// changes nothing. A `file_path` given twice is an error, and the mapping is kept.
+    pub fn set_book_order(&self, entries: Vec<BookOrderEntry>) -> Result<u64> {
+        let mut places = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            let place = BookPlace {
+                catalogue_order: entry.catalogue_order,
+                generation_order: entry.generation_order,
+            };
+            if places.insert(entry.file_path.clone(), place).is_some() {
+                anyhow::bail!("set_book_order: {:?} is given twice", entry.file_path);
+            }
+        }
+        let mut state = self
+            .book_order
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Independent of the index writer: a reader may replace catalogue order while
+        // another engine indexes. All instances/processes serialize the whole transaction.
+        // Lock order is local book_order, then this file lock; refreshing takes only the
+        // local lock, and neither operation takes book_numbers or the index writer.
+        let directory = IndexDirectory::open(&self.index_path)?;
+        let _order_lock = directory.acquire_lock(&Lock {
+            filepath: PathBuf::from("otzaria_book_order.lock"),
+            is_blocking: true,
+        })?;
+        let mut mapping = OrderMapping::load(&self.index_path);
+        if mapping.places != places {
+            mapping.revision = mapping
+                .revision
+                .checked_add(1)
+                .context("book order revision exhausted")?;
+            mapping.places = places;
+            mapping.save(&self.index_path)?;
+        }
+        let revision = mapping.revision;
+        if state.revision != revision || *state.places != mapping.places {
+            *state = BookOrderState::of(mapping, order_file_stamp(&self.index_path));
+            drop(state);
+            self.page_cache.clear();
+        }
+        Ok(revision)
+    }
+
+    /// The revision of the order mapping: 0 before any [`Self::set_book_order`].
+    #[frb(sync)]
+    pub fn book_order_revision(&self) -> u64 {
+        self.refresh_book_order();
+        self.book_order
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .revision
+    }
+
+    /// Prepares the order catalogue and generation searches sort by — reading the book
+    /// numbers of the index and building the rank tables — so the first such search does
+    /// not pay for it. For after the window is shown; searches do it themselves otherwise.
+    pub fn warm_book_order(&self) -> Result<()> {
+        self.order_tables().map(|_| ())
+    }
+
+    /// Takes in the mapping file when another engine replaced it.
+    fn refresh_book_order(&self) {
+        let stamp = order_file_stamp(&self.index_path);
+        let current = self
+            .book_order
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stamp;
+        if stamp == current {
+            return;
+        }
+        let mut state = self
+            .book_order
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Read under the local write guard: a delayed refresh must not install an older
+        // mapping after this engine's set_book_order has successfully saved a newer one.
+        let read = BookOrderState::read(&self.index_path);
+        if read.revision == state.revision && read.places == state.places {
+            state.stamp = read.stamp;
+            return;
+        }
+        *state = read;
+        drop(state);
+        self.page_cache.clear();
+    }
+
+    /// The number of `file_path`, handed out on the book's first write. Only while this
+    /// engine holds the writer, which no other engine can then hold.
+    pub(crate) fn book_number(&self, file_path: &str) -> Result<u32> {
+        anyhow::ensure!(
+            self.index_writer.is_some(),
+            "a book number is handed out only while the index writer is held"
+        );
+        let mut numbers = self
+            .book_numbers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let numbers = numbers.get_or_insert_with(|| BookNumbers::new(&self.index_path));
+        if self.numbers_stale.load(Ordering::Acquire) {
+            self.index_reader.reload()?;
+            numbers.catch_up(&self.index_reader.searcher())?;
+            // Keep the takeover pending if either read fails: retry before using an id.
+            self.numbers_stale.store(false, Ordering::Release);
+        }
+        numbers.number_for(file_path)
+    }
+
+    /// The high half of every id of the book `file_path`.
+    fn id_base(&self, file_path: &str) -> Result<u64> {
+        Ok(u64::from(self.book_number(file_path)?) << 32)
+    }
+
+    /// The epoch of the current order mapping.
+    fn order_epoch(&self) -> u64 {
+        self.book_order
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .epoch
+    }
+
+    /// The rank tables catalogue and generation searches sort by, with the epoch of the
+    /// mapping they were built from. The segments not read yet are read, and the tables
+    /// built, without holding the locks writers take.
+    pub(crate) fn order_tables(&self) -> Result<(u64, Arc<OrderTables>)> {
+        self.refresh_book_order();
+        let (epoch, places) = {
+            let state = self
+                .book_order
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            (state.epoch, Arc::clone(&state.places))
+        };
+        let searcher = self.index_reader.searcher();
+        let lock_numbers = || {
+            self.book_numbers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        };
+        let unread = lock_numbers()
+            .get_or_insert_with(|| BookNumbers::new(&self.index_path))
+            .unread_segments(&searcher);
+        if !unread.is_empty() {
+            let found = numbers_in_segments(&searcher, &unread)?;
+            lock_numbers()
+                .get_or_insert_with(|| BookNumbers::new(&self.index_path))
+                .absorb(&searcher, &unread, found);
+        }
+        let (version, paths) = {
+            let numbers = lock_numbers();
+            let numbers = numbers.as_ref().expect("created above");
+            let version = numbers.version();
+            let cached = self
+                .order_tables
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(cached) = cached
+                .as_ref()
+                .filter(|c| c.epoch == epoch && c.numbers_version == version)
+            {
+                return Ok((epoch, Arc::clone(&cached.tables)));
+            }
+            (version, numbers.paths().clone())
+        };
+        let tables = Arc::new(OrderTables::build(&paths, &places));
+        *self
+            .order_tables
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(CachedOrderTables {
+            epoch,
+            numbers_version: version,
+            tables: Arc::clone(&tables),
+        });
+        Ok((epoch, tables))
     }
 
     // ── Search API ─────────────────────────────────────────────────────────────
@@ -8220,7 +9281,7 @@ impl SearchEngine {
     /// Text-only fingerprint per distinct `filePath` — the `textHash` column
     /// ([`compute_content_fingerprint`] over the raw book text). Unlike
     /// [`Self::get_book_fingerprints`] (the canonical fingerprint, which also
-    /// covers metadata such as catalogue order), this value shifts only when
+    /// covers the title, topics and extra facets), this value shifts only when
     /// the book's text itself changed — the right signal for content-drift
     /// checks that must not be invalidated by adding/removing other books.
     ///
@@ -8255,13 +9316,44 @@ impl SearchEngine {
         Ok(searcher.search(&query, &SingleBookFingerprintCollector)?)
     }
 
+    /// Every book of the index with its number, live documents and stamps, read columnar in
+    /// one pass, by `file_path`. What a check after a library update compares against: the
+    /// metadata and source stamps need no book text.
+    pub fn get_book_stamps(&self) -> Result<Vec<BookStamps>> {
+        let searcher = self.index_reader.searcher();
+        let collector = book_order::BookStampsCollector {
+            columns: [
+                "contentHash",
+                "textHash",
+                METADATA_HASH_FIELD,
+                SOURCE_HASH_FIELD,
+            ],
+        };
+        let mut books: Vec<BookStamps> = searcher
+            .search(&AllQuery, &collector)?
+            .into_iter()
+            .map(|(file_path, book)| {
+                let [content_hash, text_hash, metadata_hash, source_hash] = book.stamps;
+                BookStamps {
+                    file_path,
+                    book_number: book.number,
+                    documents: book.documents,
+                    content_hash,
+                    text_hash,
+                    metadata_hash,
+                    source_hash,
+                }
+            })
+            .collect();
+        books.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+        Ok(books)
+    }
+
     /// Fetch a single document by its numeric id. Returns None if not found.
     /// The `text` field contains the raw text (no snippet/highlight) — for a
     /// [`TextStorage::LibraryDb`] document, the library row; see `text_status`.
     pub fn get_document_by_id(&self, id: u64) -> Result<Option<SearchResult>> {
-        let id_f = self.schema.get_field("id")?;
-        let term = Term::from_field_u64(id_f, id);
-        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let query = IdSetQuery::new([id]);
         let searcher = self.index_reader.searcher();
 
         let top_docs = searcher.search(&query, &TopDocs::with_limit(1).order_by_score())?;
@@ -8286,10 +9378,7 @@ impl SearchEngine {
             Term::from_field_text(self.schema.get_field("filePath")?, file_path),
             IndexRecordOption::Basic,
         );
-        let line = TermQuery::new(
-            Term::from_field_u64(self.schema.get_field("id")?, id),
-            IndexRecordOption::Basic,
-        );
+        let line = IdSetQuery::new([id]);
         let query = BooleanQuery::new(vec![
             (Occur::Must, Box::new(book) as Box<dyn Query>),
             (Occur::Must, Box::new(line) as Box<dyn Query>),
@@ -8309,7 +9398,7 @@ impl SearchEngine {
         id: u64,
         with_text: bool,
     ) -> Result<SearchResult> {
-        let doc = searcher.doc::<TantivyDocument>(address)?;
+        let doc = load_document(searcher, address)?;
         let title_f = self.schema.get_field("title")?;
         let reference_f = self.schema.get_field("reference")?;
         let segment_f = self.schema.get_field("segment")?;
@@ -8360,9 +9449,10 @@ impl SearchEngine {
         searcher: &Searcher,
         addresses: &[DocAddress],
     ) -> Result<Vec<(String, TextStatus)>> {
+        let mut loader = DocumentLoader::new(searcher);
         let documents = addresses
             .iter()
-            .map(|&address| Ok((address, searcher.doc::<TantivyDocument>(address)?)))
+            .map(|&address| Ok((address, loader.load(address)?)))
             .collect::<Result<Vec<_>>>()?;
         Ok(
             Self::resolve_hit_texts(&self.schema, searcher, &documents, false)?
@@ -8370,6 +9460,74 @@ impl SearchEngine {
                 .map(|hit| (hit.plain, hit.status))
                 .collect(),
         )
+    }
+
+    /// The embedded text to show, spaces collapsed: a short line's capped context, or a long
+    /// line's matched window past its first (see `long_line_window_text`); `None` otherwise.
+    #[cfg(feature = "semantic-integration")]
+    fn embedded_window_texts(
+        &self,
+        searcher: &Searcher,
+        lines: &[EmbeddedLine<'_>],
+    ) -> Result<Vec<Option<String>>> {
+        use otzaria_semantic_search::semantic::chunker::truncate_to_chars;
+        let chunking = semantic_keys::production_chunking();
+        let short: Vec<usize> = (0..lines.len())
+            .filter(|&at| {
+                let length = lines[at].3.trim().chars().count();
+                (chunking.min_embeddable_chars..chunking.min_meaningful_chars).contains(&length)
+            })
+            .collect();
+        let mut out: Vec<Option<String>> = lines
+            .iter()
+            .map(|&(_, _, _, text, window)| long_line_window_text(text, window))
+            .collect();
+        if short.is_empty() {
+            return Ok(out);
+        }
+        let resolver = crate::semantic_resolver::LiveResolver::new(
+            searcher.clone(),
+            self.chunk_key_field,
+            &self.semantic_resolver,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let asked: Vec<(&str, u64, DocAddress)> = short
+            .iter()
+            .map(|&at| (lines[at].1, lines[at].2, lines[at].0))
+            .collect();
+        let windows = resolver
+            .short_line_windows(&asked)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let mut known: HashMap<DocAddress, (String, TextStatus)> = short
+            .iter()
+            .map(|&at| (lines[at].0, (lines[at].3.to_string(), TextStatus::Ok)))
+            .collect();
+        let mut unread: Vec<DocAddress> = windows
+            .iter()
+            .flatten()
+            .flatten()
+            .filter(|address| !known.contains_key(address))
+            .copied()
+            .collect();
+        unread.sort_unstable();
+        unread.dedup();
+        let texts = self.texts_at(searcher, &unread)?;
+        known.extend(unread.into_iter().zip(texts));
+        for (&at, window) in short.iter().zip(windows) {
+            let Some(window) = window else { continue };
+            let texts: Option<Vec<&str>> = window
+                .iter()
+                .map(|address| match &known[address] {
+                    (text, TextStatus::Ok) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            out[at] = texts.map(|texts| {
+                let embedded = truncate_to_chars(texts.join(" ").trim(), chunking.max_chunk_chars);
+                hebrew_query::collapse_whitespace(&embedded)
+            });
+        }
+        Ok(out)
     }
 
     /// Fuzzy (Levenshtein) search on pre-tokenized plain-text terms.
@@ -8441,6 +9599,7 @@ impl SearchEngine {
                 &hl,
                 chunk_size,
                 None,
+                &self.lexical_cancellations.begin(None),
                 &sink,
             )
         })();
@@ -8650,9 +9809,10 @@ impl SearchEngine {
         let is_pdf_f = self.schema.get_field("isPdf")?;
         let file_path_f = self.schema.get_field("filePath")?;
 
+        let mut loader = DocumentLoader::new(searcher);
         let documents = hits
             .iter()
-            .map(|&(_, address)| Ok((address, searcher.doc::<TantivyDocument>(address)?)))
+            .map(|&(_, address)| Ok((address, loader.load(address)?)))
             .collect::<Result<Vec<_>>>()?;
         // The whole candidate window's library rows in one transaction.
         let texts = Self::resolve_hit_texts(&self.schema, searcher, &documents, false)?;
@@ -8666,8 +9826,7 @@ impl SearchEngine {
         for (((score, _), (address, document)), text) in hits.iter().zip(&documents).zip(texts) {
             let reader = searcher.segment_reader(address.segment_ord);
             let fast = reader.fast_fields();
-            let section_id = fast
-                .u64("sectionId")?
+            let section_id = SectionIdColumn::open(reader)?
                 .first(address.doc_id)
                 .unwrap_or_default();
             let line_hash = fast
@@ -8756,9 +9915,12 @@ impl SearchEngine {
         match_taamim: bool,
         chunk_size: u32,
         grouping: Option<ResultGrouping>,
+        cancel_request_id: Option<u32>,
         sink: StreamSink<Vec<SearchResult>>,
     ) -> Result<()> {
+        let request = self.lexical_cancellations.begin(cancel_request_id);
         let result = (|| {
+            request.check()?;
             let voc = VocalizedFlags::new(match_nikud, match_taamim);
             let (q, _) = self.build_exact_query(&query, &facets, &voc)?;
             self.run_search_stream(
@@ -8771,10 +9933,11 @@ impl SearchEngine {
                 &HighlightConfig::default(),
                 chunk_size,
                 grouping.as_ref(),
+                &request,
                 &sink,
             )
         })();
-        Self::surface_stream_error(&sink, result)
+        Self::surface_stream_error(&sink, request.finish(result))
     }
 
     /// Like [`Self::search_exact_stream`] but the first event also carries
@@ -8793,9 +9956,12 @@ impl SearchEngine {
         match_taamim: bool,
         chunk_size: u32,
         grouping: Option<ResultGrouping>,
+        cancel_request_id: Option<u32>,
         sink: StreamSink<SearchStreamUpdate>,
     ) -> Result<()> {
+        let request = self.lexical_cancellations.begin(cancel_request_id);
         let result = (|| {
+            request.check()?;
             let voc = VocalizedFlags::new(match_nikud, match_taamim);
             // The mark-free exact path never degrades under a collection
             // budget; the vocalized single-word path can (its term set is
@@ -8812,10 +9978,11 @@ impl SearchEngine {
                 chunk_size,
                 truncated,
                 grouping.as_ref(),
+                &request,
                 &sink,
             )
         })();
-        Self::surface_stream_error(&sink, result)
+        Self::surface_stream_error(&sink, request.finish(result))
     }
 
     /// Exact-mode hit count. Drops the truncation flag: the mark-free path
@@ -8828,9 +9995,10 @@ impl SearchEngine {
         facets: Vec<String>,
         match_nikud: bool,
         match_taamim: bool,
+        cancel_request_id: Option<u32>,
     ) -> Result<u32> {
         Ok(self
-            .count_exact_with_status(query, facets, match_nikud, match_taamim)?
+            .count_exact_with_status(query, facets, match_nikud, match_taamim, cancel_request_id)?
             .count)
     }
 
@@ -8842,11 +10010,14 @@ impl SearchEngine {
         facets: Vec<String>,
         match_nikud: bool,
         match_taamim: bool,
+        cancel_request_id: Option<u32>,
     ) -> Result<CountResult> {
+        let request = self.lexical_cancellations.begin(cancel_request_id);
+        request.check()?;
         let voc = VocalizedFlags::new(match_nikud, match_taamim);
         let (q, truncated) = self.build_exact_query(&query, &facets, &voc)?;
         Ok(CountResult {
-            count: self.run_count(q)?,
+            count: request.finish(self.run_count(request.wrap(q)))?,
             truncated,
         })
     }
@@ -8859,9 +10030,16 @@ impl SearchEngine {
         facets: Vec<String>,
         match_nikud: bool,
         match_taamim: bool,
+        cancel_request_id: Option<u32>,
     ) -> Result<HashMap<String, u32>> {
         Ok(self
-            .count_by_book_exact_with_status(query, facets, match_nikud, match_taamim)?
+            .count_by_book_exact_with_status(
+                query,
+                facets,
+                match_nikud,
+                match_taamim,
+                cancel_request_id,
+            )?
             .counts)
     }
 
@@ -8873,11 +10051,14 @@ impl SearchEngine {
         facets: Vec<String>,
         match_nikud: bool,
         match_taamim: bool,
+        cancel_request_id: Option<u32>,
     ) -> Result<BookCountResult> {
+        let request = self.lexical_cancellations.begin(cancel_request_id);
+        request.check()?;
         let voc = VocalizedFlags::new(match_nikud, match_taamim);
         let (q, truncated) = self.build_exact_query(&query, &facets, &voc)?;
         Ok(BookCountResult {
-            counts: self.run_count_by_book(q)?,
+            counts: request.finish(self.run_count_by_book(request.wrap(q)))?,
             truncated,
         })
     }
@@ -8947,6 +10128,7 @@ impl SearchEngine {
         grouping: Option<ResultGrouping>,
         word_match_mode: Option<WordMatchMode>,
         word_match_count: Option<u32>,
+        any_order: Option<bool>,
     ) -> Result<Vec<SearchResult>> {
         let voc = VocalizedFlags::new(match_nikud, match_taamim);
         let match_mode = WordMatch::from_api(word_match_mode, word_match_count);
@@ -8954,18 +10136,21 @@ impl SearchEngine {
         // בחירת השדה וה-analyzer של ההדגשה, בעוד הדרישה פר-תו נגזרת פר-מילה
         // בתוך בניית השאילתה.
         let voc_mode = voc.or(hebrew_query::options_vocalized_flags(&search_options));
-        let (q, regex_terms, gaps, truncated, acronym_alts) = self.build_advanced_query(
-            &query,
-            distance,
-            &custom_spacing,
-            &alternative_words,
-            &search_options,
-            facets,
-            &voc,
-            &scope,
-            &match_mode,
-            true,
-        )?;
+        let (q, regex_terms, proximity, truncated, acronym_alts) = self
+            .build_advanced_query_ranked(
+                &query,
+                distance,
+                &custom_spacing,
+                any_order.unwrap_or(false),
+                &alternative_words,
+                &search_options,
+                facets,
+                &voc,
+                &scope,
+                &match_mode,
+                true,
+                matches!(order, ResultsOrder::Relevance),
+            )?;
         let (q, _) = self.apply_advanced_negative_query(
             q,
             truncated,
@@ -8976,6 +10161,7 @@ impl SearchEngine {
             &negative_search_options,
             &voc,
             &negative_scope,
+            any_order.unwrap_or(false),
         )?;
         self.run_search(
             q,
@@ -8983,7 +10169,7 @@ impl SearchEngine {
                 self.advanced_highlight_plan_for_scope(
                     s,
                     &regex_terms,
-                    &gaps,
+                    &proximity,
                     &voc_mode,
                     &scope,
                     &match_mode,
@@ -9022,22 +10208,26 @@ impl SearchEngine {
         grouping: Option<ResultGrouping>,
         word_match_mode: Option<WordMatchMode>,
         word_match_count: Option<u32>,
+        any_order: Option<bool>,
     ) -> Result<SearchPageResult> {
         let voc = VocalizedFlags::new(match_nikud, match_taamim);
         let match_mode = WordMatch::from_api(word_match_mode, word_match_count);
         let voc_mode = voc.or(hebrew_query::options_vocalized_flags(&search_options));
-        let (q, regex_terms, gaps, truncated, acronym_alts) = self.build_advanced_query(
-            &query,
-            distance,
-            &custom_spacing,
-            &alternative_words,
-            &search_options,
-            facets,
-            &voc,
-            &scope,
-            &match_mode,
-            true,
-        )?;
+        let (q, regex_terms, proximity, truncated, acronym_alts) = self
+            .build_advanced_query_ranked(
+                &query,
+                distance,
+                &custom_spacing,
+                any_order.unwrap_or(false),
+                &alternative_words,
+                &search_options,
+                facets,
+                &voc,
+                &scope,
+                &match_mode,
+                true,
+                matches!(order, ResultsOrder::Relevance),
+            )?;
         let (q, truncated) = self.apply_advanced_negative_query(
             q,
             truncated,
@@ -9048,6 +10238,7 @@ impl SearchEngine {
             &negative_search_options,
             &voc,
             &negative_scope,
+            any_order.unwrap_or(false),
         )?;
         self.run_search_and_count(
             q,
@@ -9055,7 +10246,7 @@ impl SearchEngine {
                 self.advanced_highlight_plan_for_scope(
                     s,
                     &regex_terms,
-                    &gaps,
+                    &proximity,
                     &voc_mode,
                     &scope,
                     &match_mode,
@@ -9100,24 +10291,31 @@ impl SearchEngine {
         grouping: Option<ResultGrouping>,
         word_match_mode: Option<WordMatchMode>,
         word_match_count: Option<u32>,
+        any_order: Option<bool>,
+        cancel_request_id: Option<u32>,
         sink: StreamSink<Vec<SearchResult>>,
     ) -> Result<()> {
+        let request = self.lexical_cancellations.begin(cancel_request_id);
         let result = (|| {
+            request.check()?;
             let voc = VocalizedFlags::new(match_nikud, match_taamim);
             let match_mode = WordMatch::from_api(word_match_mode, word_match_count);
             let voc_mode = voc.or(hebrew_query::options_vocalized_flags(&search_options));
-            let (q, regex_terms, gaps, truncated, acronym_alts) = self.build_advanced_query(
-                &query,
-                distance,
-                &custom_spacing,
-                &alternative_words,
-                &search_options,
-                facets,
-                &voc,
-                &scope,
-                &match_mode,
-                true,
-            )?;
+            let (q, regex_terms, proximity, truncated, acronym_alts) = self
+                .build_advanced_query_ranked(
+                    &query,
+                    distance,
+                    &custom_spacing,
+                    any_order.unwrap_or(false),
+                    &alternative_words,
+                    &search_options,
+                    facets,
+                    &voc,
+                    &scope,
+                    &match_mode,
+                    true,
+                    matches!(order, ResultsOrder::Relevance),
+                )?;
             let (q, _) = self.apply_advanced_negative_query(
                 q,
                 truncated,
@@ -9128,6 +10326,7 @@ impl SearchEngine {
                 &negative_search_options,
                 &voc,
                 &negative_scope,
+                any_order.unwrap_or(false),
             )?;
             self.run_search_stream(
                 q,
@@ -9135,7 +10334,7 @@ impl SearchEngine {
                     self.advanced_highlight_plan_for_scope(
                         s,
                         &regex_terms,
-                        &gaps,
+                        &proximity,
                         &voc_mode,
                         &scope,
                         &match_mode,
@@ -9149,10 +10348,11 @@ impl SearchEngine {
                 &HighlightConfig::default(),
                 chunk_size,
                 grouping.as_ref(),
+                &request,
                 &sink,
             )
         })();
-        Self::surface_stream_error(&sink, result)
+        Self::surface_stream_error(&sink, request.finish(result))
     }
 
     /// Like [`Self::search_advanced_stream`] but the first event also carries
@@ -9184,24 +10384,31 @@ impl SearchEngine {
         grouping: Option<ResultGrouping>,
         word_match_mode: Option<WordMatchMode>,
         word_match_count: Option<u32>,
+        any_order: Option<bool>,
+        cancel_request_id: Option<u32>,
         sink: StreamSink<SearchStreamUpdate>,
     ) -> Result<()> {
+        let request = self.lexical_cancellations.begin(cancel_request_id);
         let result = (|| {
+            request.check()?;
             let voc = VocalizedFlags::new(match_nikud, match_taamim);
             let match_mode = WordMatch::from_api(word_match_mode, word_match_count);
             let voc_mode = voc.or(hebrew_query::options_vocalized_flags(&search_options));
-            let (q, regex_terms, gaps, truncated, acronym_alts) = self.build_advanced_query(
-                &query,
-                distance,
-                &custom_spacing,
-                &alternative_words,
-                &search_options,
-                facets,
-                &voc,
-                &scope,
-                &match_mode,
-                true,
-            )?;
+            let (q, regex_terms, proximity, truncated, acronym_alts) = self
+                .build_advanced_query_ranked(
+                    &query,
+                    distance,
+                    &custom_spacing,
+                    any_order.unwrap_or(false),
+                    &alternative_words,
+                    &search_options,
+                    facets,
+                    &voc,
+                    &scope,
+                    &match_mode,
+                    true,
+                    matches!(order, ResultsOrder::Relevance),
+                )?;
             let (q, truncated) = self.apply_advanced_negative_query(
                 q,
                 truncated,
@@ -9212,6 +10419,7 @@ impl SearchEngine {
                 &negative_search_options,
                 &voc,
                 &negative_scope,
+                any_order.unwrap_or(false),
             )?;
             self.run_search_stream_with_counts(
                 q,
@@ -9219,7 +10427,7 @@ impl SearchEngine {
                     self.advanced_highlight_plan_for_scope(
                         s,
                         &regex_terms,
-                        &gaps,
+                        &proximity,
                         &voc_mode,
                         &scope,
                         &match_mode,
@@ -9234,10 +10442,11 @@ impl SearchEngine {
                 chunk_size,
                 truncated,
                 grouping.as_ref(),
+                &request,
                 &sink,
             )
         })();
-        Self::surface_stream_error(&sink, result)
+        Self::surface_stream_error(&sink, request.finish(result))
     }
 
     /// Advanced-query hit count. Drops the single-word truncation flag — see
@@ -9262,6 +10471,8 @@ impl SearchEngine {
         negative_scope: SearchScope,
         word_match_mode: Option<WordMatchMode>,
         word_match_count: Option<u32>,
+        any_order: Option<bool>,
+        cancel_request_id: Option<u32>,
     ) -> Result<u32> {
         Ok(self
             .count_advanced_with_status(
@@ -9282,6 +10493,8 @@ impl SearchEngine {
                 negative_scope,
                 word_match_mode,
                 word_match_count,
+                any_order,
+                cancel_request_id,
             )?
             .count)
     }
@@ -9307,12 +10520,17 @@ impl SearchEngine {
         negative_scope: SearchScope,
         word_match_mode: Option<WordMatchMode>,
         word_match_count: Option<u32>,
+        any_order: Option<bool>,
+        cancel_request_id: Option<u32>,
     ) -> Result<CountResult> {
+        let request = self.lexical_cancellations.begin(cancel_request_id);
+        request.check()?;
         let voc = VocalizedFlags::new(match_nikud, match_taamim);
         let (q, _, _, truncated, _) = self.build_advanced_query(
             &query,
             distance,
             &custom_spacing,
+            any_order.unwrap_or(false),
             &alternative_words,
             &search_options,
             facets,
@@ -9331,9 +10549,10 @@ impl SearchEngine {
             &negative_search_options,
             &voc,
             &negative_scope,
+            any_order.unwrap_or(false),
         )?;
         Ok(CountResult {
-            count: self.run_count(q)?,
+            count: request.finish(self.run_count(request.wrap(q)))?,
             truncated,
         })
     }
@@ -9360,6 +10579,8 @@ impl SearchEngine {
         negative_scope: SearchScope,
         word_match_mode: Option<WordMatchMode>,
         word_match_count: Option<u32>,
+        any_order: Option<bool>,
+        cancel_request_id: Option<u32>,
     ) -> Result<HashMap<String, u32>> {
         Ok(self
             .count_by_book_advanced_with_status(
@@ -9380,6 +10601,8 @@ impl SearchEngine {
                 negative_scope,
                 word_match_mode,
                 word_match_count,
+                any_order,
+                cancel_request_id,
             )?
             .counts)
     }
@@ -9405,12 +10628,17 @@ impl SearchEngine {
         negative_scope: SearchScope,
         word_match_mode: Option<WordMatchMode>,
         word_match_count: Option<u32>,
+        any_order: Option<bool>,
+        cancel_request_id: Option<u32>,
     ) -> Result<BookCountResult> {
+        let request = self.lexical_cancellations.begin(cancel_request_id);
+        request.check()?;
         let voc = VocalizedFlags::new(match_nikud, match_taamim);
         let (q, _, _, truncated, _) = self.build_advanced_query(
             &query,
             distance,
             &custom_spacing,
+            any_order.unwrap_or(false),
             &alternative_words,
             &search_options,
             facets,
@@ -9429,9 +10657,10 @@ impl SearchEngine {
             &negative_search_options,
             &voc,
             &negative_scope,
+            any_order.unwrap_or(false),
         )?;
         Ok(BookCountResult {
-            counts: self.run_count_by_book(q)?,
+            counts: request.finish(self.run_count_by_book(request.wrap(q)))?,
             truncated,
         })
     }
@@ -9460,6 +10689,7 @@ impl SearchEngine {
         negative_scope: SearchScope,
         word_match_mode: Option<WordMatchMode>,
         word_match_count: Option<u32>,
+        any_order: Option<bool>,
     ) -> Result<Vec<FacetCount>> {
         Ok(self
             .get_facet_counts_advanced_with_status(
@@ -9481,6 +10711,7 @@ impl SearchEngine {
                 negative_scope,
                 word_match_mode,
                 word_match_count,
+                any_order,
             )?
             .counts)
     }
@@ -9507,12 +10738,14 @@ impl SearchEngine {
         negative_scope: SearchScope,
         word_match_mode: Option<WordMatchMode>,
         word_match_count: Option<u32>,
+        any_order: Option<bool>,
     ) -> Result<FacetCountsResult> {
         let voc = VocalizedFlags::new(match_nikud, match_taamim);
         let (q, _, _, truncated, _) = self.build_advanced_query(
             &query,
             distance,
             &custom_spacing,
+            any_order.unwrap_or(false),
             &alternative_words,
             &search_options,
             facets,
@@ -9531,6 +10764,7 @@ impl SearchEngine {
             &negative_search_options,
             &voc,
             &negative_scope,
+            any_order.unwrap_or(false),
         )?;
         Ok(FacetCountsResult {
             counts: self.run_facet_counts(q, facet_prefix)?,
@@ -9646,9 +10880,12 @@ impl SearchEngine {
         match_taamim: bool,
         chunk_size: u32,
         grouping: Option<ResultGrouping>,
+        cancel_request_id: Option<u32>,
         sink: StreamSink<Vec<SearchResult>>,
     ) -> Result<()> {
+        let request = self.lexical_cancellations.begin(cancel_request_id);
         let result = (|| {
+            request.check()?;
             let voc = VocalizedFlags::new(match_nikud, match_taamim);
             if voc.any() {
                 let (q, _) =
@@ -9663,6 +10900,7 @@ impl SearchEngine {
                     &HighlightConfig::default(),
                     chunk_size,
                     grouping.as_ref(),
+                    &request,
                     &sink,
                 );
             }
@@ -9681,10 +10919,11 @@ impl SearchEngine {
                 &HighlightConfig::default(),
                 chunk_size,
                 grouping.as_ref(),
+                &request,
                 &sink,
             )
         })();
-        Self::surface_stream_error(&sink, result)
+        Self::surface_stream_error(&sink, request.finish(result))
     }
 
     /// Like [`Self::search_fuzzy_stream`] but the first event also carries
@@ -9704,9 +10943,12 @@ impl SearchEngine {
         match_taamim: bool,
         chunk_size: u32,
         grouping: Option<ResultGrouping>,
+        cancel_request_id: Option<u32>,
         sink: StreamSink<SearchStreamUpdate>,
     ) -> Result<()> {
+        let request = self.lexical_cancellations.begin(cancel_request_id);
         let result = (|| {
+            request.check()?;
             let voc = VocalizedFlags::new(match_nikud, match_taamim);
             if voc.any() {
                 let (q, truncated) =
@@ -9722,6 +10964,7 @@ impl SearchEngine {
                     chunk_size,
                     truncated,
                     grouping.as_ref(),
+                    &request,
                     &sink,
                 );
             }
@@ -9743,10 +10986,11 @@ impl SearchEngine {
                 // single-word degrade mechanism.
                 false,
                 grouping.as_ref(),
+                &request,
                 &sink,
             )
         })();
-        Self::surface_stream_error(&sink, result)
+        Self::surface_stream_error(&sink, request.finish(result))
     }
 
     /// Builds the fuzzy-mode query for the count family: the vocalized path
@@ -9777,9 +11021,17 @@ impl SearchEngine {
         max_distance: u8,
         match_nikud: bool,
         match_taamim: bool,
+        cancel_request_id: Option<u32>,
     ) -> Result<u32> {
         Ok(self
-            .count_fuzzy_with_status(query, facets, max_distance, match_nikud, match_taamim)?
+            .count_fuzzy_with_status(
+                query,
+                facets,
+                max_distance,
+                match_nikud,
+                match_taamim,
+                cancel_request_id,
+            )?
             .count)
     }
 
@@ -9792,11 +11044,14 @@ impl SearchEngine {
         max_distance: u8,
         match_nikud: bool,
         match_taamim: bool,
+        cancel_request_id: Option<u32>,
     ) -> Result<CountResult> {
+        let request = self.lexical_cancellations.begin(cancel_request_id);
+        request.check()?;
         let voc = VocalizedFlags::new(match_nikud, match_taamim);
         let (q, truncated) = self.build_fuzzy_count_query(&query, &facets, max_distance, &voc)?;
         Ok(CountResult {
-            count: self.run_count(q)?,
+            count: request.finish(self.run_count(request.wrap(q)))?,
             truncated,
         })
     }
@@ -9810,6 +11065,7 @@ impl SearchEngine {
         max_distance: u8,
         match_nikud: bool,
         match_taamim: bool,
+        cancel_request_id: Option<u32>,
     ) -> Result<HashMap<String, u32>> {
         Ok(self
             .count_by_book_fuzzy_with_status(
@@ -9818,6 +11074,7 @@ impl SearchEngine {
                 max_distance,
                 match_nikud,
                 match_taamim,
+                cancel_request_id,
             )?
             .counts)
     }
@@ -9831,11 +11088,14 @@ impl SearchEngine {
         max_distance: u8,
         match_nikud: bool,
         match_taamim: bool,
+        cancel_request_id: Option<u32>,
     ) -> Result<BookCountResult> {
+        let request = self.lexical_cancellations.begin(cancel_request_id);
+        request.check()?;
         let voc = VocalizedFlags::new(match_nikud, match_taamim);
         let (q, truncated) = self.build_fuzzy_count_query(&query, &facets, max_distance, &voc)?;
         Ok(BookCountResult {
-            counts: self.run_count_by_book(q)?,
+            counts: request.finish(self.run_count_by_book(request.wrap(q)))?,
             truncated,
         })
     }
@@ -9897,6 +11157,19 @@ impl SearchEngine {
         self.index_reader.searcher()
     }
 
+    /// Reloads the reader now, as `OnCommitWithDelay` does shortly after another engine's
+    /// commit.
+    #[cfg(test)]
+    pub(crate) fn reload_reader_for_tests(&self) {
+        self.index_reader.reload().unwrap();
+    }
+
+    /// Whether this engine holds the index writer.
+    #[cfg(test)]
+    pub(crate) fn holds_writer_for_tests(&self) -> bool {
+        self.index_writer.is_some()
+    }
+
     /// The exact query, or the advanced one at `distance` when given, with or
     /// without its cross-line part.
     #[cfg(test)]
@@ -9929,6 +11202,7 @@ impl SearchEngine {
                     query,
                     distance,
                     &HashMap::new(),
+                    false,
                     &HashMap::new(),
                     &HashMap::new(),
                     facets.to_vec(),
@@ -9944,11 +11218,12 @@ impl SearchEngine {
     }
 
     /// The `text` field's indexing analyzer (with quote-free twins).
+    /// The analyzer `lineEdge` terms are made with: twins included, as up to schema 5.
     fn text_index_analyzer(&self) -> Result<TextAnalyzer> {
         self.index
             .tokenizers()
-            .get("hebrew")
-            .context("the hebrew analyzer is not registered")
+            .get(DISPLAY_ANALYZER)
+            .context("the hebrew display analyzer is not registered")
     }
 
     fn stored_text_fields(&self) -> Result<(Field, Field)> {
@@ -9968,11 +11243,8 @@ impl SearchEngine {
             self.schema.get_field("isPdf")?,
             self.schema.get_field("filePath")?,
             self.schema.get_field("topics")?,
-            self.schema.get_field("contentHash")?,
-            self.schema.get_field("textHash")?,
             self.schema.get_field("textVocalized")?,
-            self.schema.get_field("sectionId")?,
-            self.schema.get_field("generationSort")?,
+            self.schema.get_field(SECTION_OFFSET_FIELD)?,
             self.schema.get_field("lineHash")?,
         ))
     }
@@ -9981,6 +11253,7 @@ impl SearchEngine {
         if self.index_writer.is_none() {
             debug!("writer: reopening lazily");
             self.index_writer = Some(self.open_writer()?);
+            self.numbers_stale.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -10043,6 +11316,7 @@ impl SearchEngine {
 
     fn restore_writer(&mut self) -> Result<()> {
         self.index_writer = Some(self.open_writer()?);
+        self.numbers_stale.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -10063,19 +11337,20 @@ impl SearchEngine {
             .iter()
             .map(|t| hebrew_query::WordPattern::parse(t))
             .collect();
-        let gaps = vec![slop; patterns.len().saturating_sub(1)];
+        let proximity = Proximity::Ordered(vec![slop; patterns.len().saturating_sub(1)]);
         let text_field = self.schema.get_field("text")?;
         self.build_query_from_patterns(
             patterns,
             &[],
             &[],
             facets,
-            &gaps,
+            &proximity,
             max_expansions,
             text_field,
             &SearchScope::WordDistance,
             &WordMatch::All,
             true,
+            None,
         )
     }
 
@@ -10091,6 +11366,7 @@ impl SearchEngine {
         negative_search_options: &HashMap<String, HashMap<String, bool>>,
         voc: &VocalizedFlags,
         negative_scope: &SearchScope,
+        any_order: bool,
     ) -> Result<(Box<dyn Query>, bool)> {
         if hebrew_query::split_query_words(negative_query).is_empty() {
             return Ok((positive_query, positive_truncated));
@@ -10102,6 +11378,7 @@ impl SearchEngine {
             negative_query,
             negative_distance,
             negative_custom_spacing,
+            any_order,
             negative_alternative_words,
             negative_search_options,
             Vec::new(),
@@ -10144,9 +11421,9 @@ impl SearchEngine {
     /// plain `text` field, or `textVocalized` on the vocalized paths (whose
     /// patterns carry free-mark runs and must never hit the plain field).
     ///
-    /// `gaps` is the per-pair intermediate-word allowance (`gaps[i]` between
-    /// words `i` and `i+1`). The phrase branch goes through
-    /// [`Self::phrase_query_with_degrade`]: on its exact path tantivy gets
+    /// `proximity` holds the per-pair intermediate-word allowance (`gaps[i]`
+    /// between words `i` and `i+1`) or the any-order window. The phrase branch
+    /// goes through [`Self::phrase_query_with_degrade`]: on its exact path tantivy gets
     /// the *sum* as its slop — tantivy spends slop cumulatively across the
     /// phrase, so the max would reject a match using its allowance in two
     /// different gaps — wrapped in [`GapVerifiedPhraseQuery`], which
@@ -10161,12 +11438,13 @@ impl SearchEngine {
         source_words: &[String],
         typo_tokens: &[String],
         facets: Vec<String>,
-        gaps: &[u32],
+        proximity: &Proximity,
         max_expansions: u32,
         text_field: Field,
         scope: &SearchScope,
         match_mode: &WordMatch,
         cross_line: bool,
+        ranking_roots: Option<&[String]>,
     ) -> Result<(Box<dyn Query>, bool)> {
         // Resolved up front: the same facet filter both narrows the section
         // pre-pass (fewer candidate sections to intersect) and gates the
@@ -10184,12 +11462,21 @@ impl SearchEngine {
         // nothing and reports none.
         let (main_query, truncated): (Box<dyn Query>, bool) = match regex_terms.len() {
             0 => (Box::new(EmptyQuery), false),
-            1 => self.single_regex_term_query(
-                regex_terms[0].branches(),
-                typo_tokens,
-                text_field,
-                max_expansions,
-            )?,
+            1 => match ranking_roots {
+                Some(roots) => self.ranked_term_query(
+                    regex_terms[0].branches(),
+                    typo_tokens,
+                    text_field,
+                    max_expansions,
+                    roots,
+                )?,
+                None => self.single_regex_term_query(
+                    regex_terms[0].branches(),
+                    typo_tokens,
+                    text_field,
+                    max_expansions,
+                )?,
+            },
             _ => match (scope, match_mode) {
                 // הטווחים "פסקה"/"כותרת" מוותרים על סדר ומרווח, וכך גם כל
                 // מצב התאמה שאינו "כל המילים" (מילים עשויות לחסור) — כל
@@ -10205,17 +11492,14 @@ impl SearchEngine {
                     facets_query.as_deref(),
                     match_mode,
                 )?,
-                (SearchScope::WordDistance, WordMatch::All) => {
-                    debug_assert_eq!(gaps.len() + 1, regex_terms.len());
-                    self.phrase_query_with_degrade(
-                        &regex_terms,
-                        gaps,
-                        text_field,
-                        max_expansions,
-                        cross_line,
-                        facets_query.as_deref(),
-                    )?
-                }
+                (SearchScope::WordDistance, WordMatch::All) => self.phrase_query_with_degrade(
+                    &regex_terms,
+                    proximity,
+                    text_field,
+                    max_expansions,
+                    cross_line,
+                    facets_query.as_deref(),
+                )?,
             },
         };
 
@@ -10253,32 +11537,53 @@ impl SearchEngine {
     ///   now serves complete results when only the *cumulative* ceiling was
     ///   the problem, and budget-truncated (highest-priority-first) results
     ///   with `truncated: true` when a single position outgrew its own caps.
+    ///
+    /// An any-order proximity always takes the degrade path: tantivy's slop is
+    /// no superset of every word order.
     fn phrase_query_with_degrade(
         &self,
         regex_terms: &[hebrew_query::WordPattern],
-        gaps: &[u32],
+        proximity: &Proximity,
         text_field: Field,
         max_expansions: u32,
         cross_line: bool,
         facets_query: Option<&dyn Query>,
     ) -> Result<(Box<dyn Query>, bool)> {
+        let Proximity::Ordered(gaps) = proximity else {
+            // Cross-line matching assumes an order; any-order stays within a line.
+            return self.term_list_phrase_query(regex_terms, proximity, text_field, false, None);
+        };
+        debug_assert_eq!(gaps.len() + 1, regex_terms.len());
         let joined: Vec<String> = regex_terms
             .iter()
             .map(hebrew_query::WordPattern::joined)
             .collect();
         let slop_budget = gaps.iter().fold(0u32, |acc, &g| acc.saturating_add(g));
-        let mut phrase_query = RegexPhraseQuery::new(text_field, joined);
-        phrase_query.set_slop(slop_budget);
-        phrase_query.set_max_expansions(max_expansions);
-        // The query caches the compiled DFAs; the checks below and its weight share them.
-        let joined_compiles = phrase_query.regexes().is_ok();
-        if joined_compiles
-            && !self.phrase_exceeds_max_expansions(
-                phrase_query.regexes()?,
-                text_field,
-                max_expansions,
-            )?
-        {
+        // One quote-transparent DFA per word; the checks below and the query's weight share them.
+        let automata: Option<Vec<Arc<QuoteTransparent<TermDfa>>>> = joined
+            .iter()
+            .map(|pattern| {
+                term_automaton::compile_pattern(pattern)
+                    .ok()
+                    .map(|dfa| Arc::new(QuoteTransparent::from_arc(dfa)))
+            })
+            .collect();
+        let joined_compiles = automata.is_some();
+        let exceeds = match &automata {
+            Some(automata) => {
+                self.phrase_exceeds_max_expansions(automata, text_field, max_expansions)?
+            }
+            None => false,
+        };
+        if let (Some(automata), false) = (automata, exceeds) {
+            let terms = joined
+                .into_iter()
+                .zip(automata)
+                .enumerate()
+                .map(|(offset, (pattern, automaton))| (offset, pattern, automaton))
+                .collect();
+            let mut phrase_query = RegexPhraseQuery::from_automata(text_field, terms, slop_budget);
+            phrase_query.set_max_expansions(max_expansions);
             let inline: Box<dyn Query> = if slop_budget == 0 {
                 Box::new(phrase_query)
             } else {
@@ -10312,6 +11617,19 @@ impl SearchEngine {
             );
         }
 
+        self.term_list_phrase_query(regex_terms, proximity, text_field, cross_line, facets_query)
+    }
+
+    /// The degrade path of [`Self::phrase_query_with_degrade`]: a
+    /// [`TermListPhraseQuery`] over the materialized term sets.
+    fn term_list_phrase_query(
+        &self,
+        regex_terms: &[hebrew_query::WordPattern],
+        proximity: &Proximity,
+        text_field: Field,
+        cross_line: bool,
+        facets_query: Option<&dyn Query>,
+    ) -> Result<(Box<dyn Query>, bool)> {
         // Materialize every *distinct* branch set once, in parallel, only
         // after the exact engine is known to be unusable. This is the costly
         // work the fallback actually needs; doing it for all phrases both
@@ -10368,11 +11686,11 @@ impl SearchEngine {
         let inline: Box<dyn Query> = Box::new(TermListPhraseQuery::new(
             text_field,
             position_terms,
-            gaps.to_vec(),
+            proximity.clone(),
         ));
-        if !cross_line {
+        let (true, Proximity::Ordered(gaps)) = (cross_line, proximity) else {
             return Ok((inline, truncated));
-        }
+        };
         Ok((
             self.with_cross_line(inline, text_field, &words, gaps, facets_query)?,
             truncated,
@@ -10385,12 +11703,16 @@ impl SearchEngine {
     /// here — disjoint vocabularies in several segments may be larger than
     /// `max_expansions` together while every segment remains valid for
     /// Tantivy's BM25 phrase scorer.
-    fn phrase_exceeds_max_expansions(
+    fn phrase_exceeds_max_expansions<A>(
         &self,
-        regexes: &[Arc<tantivy_fst::Regex>],
+        regexes: &[Arc<A>],
         text_field: Field,
         max_expansions: u32,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        A: Automaton,
+        A::State: Clone,
+    {
         let searcher = self.index_reader.searcher();
         for reader in searcher.segment_readers() {
             let inverted = reader.inverted_index(text_field)?;
@@ -10601,6 +11923,55 @@ impl SearchEngine {
         ))
     }
 
+    /// [`Self::single_regex_term_query`] scored in relevance tiers: the same
+    /// terms (the result set is unchanged), split by
+    /// [`hebrew_query::match_tier`] against the typed `roots` into
+    /// constant-score clauses whose scores sum.
+    fn ranked_term_query(
+        &self,
+        branches: &[String],
+        typo_tokens: &[String],
+        text_field: Field,
+        max_expansions: u32,
+        roots: &[String],
+    ) -> Result<(Box<dyn Query>, bool)> {
+        let entry = self.materialize_term_set(
+            branches,
+            typo_tokens,
+            text_field,
+            max_expansions,
+            SINGLE_WORD_POSTINGS_BUDGET,
+        )?;
+        let mut tiers: [Vec<Term>; 4] = Default::default();
+        for term in entry.terms.iter() {
+            let tier = term
+                .value()
+                .as_str()
+                .map_or(3, |text| hebrew_query::match_tier(text, roots));
+            tiers[usize::from(tier)].push(term.clone());
+        }
+        let clauses: Vec<(Occur, Box<dyn Query>)> = tiers
+            .into_iter()
+            .zip(ADVANCED_TIER_BOOSTS)
+            .filter(|(terms, _)| !terms.is_empty())
+            .map(|(terms, boost)| {
+                (
+                    Occur::Should,
+                    Box::new(ConstScoreQuery::new(
+                        Box::new(TermSetQuery::new(terms)),
+                        boost,
+                    )) as Box<dyn Query>,
+                )
+            })
+            .collect();
+        let query: Box<dyn Query> = if clauses.is_empty() {
+            Box::new(EmptyQuery)
+        } else {
+            Box::new(BooleanQuery::new(clauses))
+        };
+        Ok((query, entry.truncated))
+    }
+
     /// The materialization behind [`Self::single_regex_term_query`] and the
     /// phrase degrade path: streams every branch's (and typo automaton's)
     /// dictionary matches into one term set under the two collection budgets,
@@ -10633,93 +12004,55 @@ impl SearchEngine {
             return Ok(entry.clone());
         }
 
-        let regexes: Vec<tantivy_fst::Regex> = branches
-            .iter()
-            .map(|branch| {
-                tantivy_fst::Regex::new(branch).map_err(|e| {
-                    // Surface the failing branch loudly: the historical
-                    // failure mode here was a compile error silently becoming
-                    // "0 results" in the UI.
-                    error!(
-                        "regex branch compilation failed ({} chars): {e}. Branch prefix: {}",
-                        branch.chars().count(),
-                        branch.chars().take(80).collect::<String>(),
-                    );
-                    anyhow::anyhow!(
-                        "invalid regex branch ({} chars): {e}",
-                        branch.chars().count()
-                    )
-                })
-            })
-            .collect::<Result<_>>()?;
+        let automata = term_automaton::compile_branches(branches).map_err(|e| {
+            // Surface the failure loudly: the historical failure mode here
+            // was a compile error silently becoming "0 results" in the UI.
+            error!(
+                "regex branches failed to compile ({} branches): {e}. First branch prefix: {}",
+                branches.len(),
+                branches
+                    .first()
+                    .map(|b| b.chars().take(80).collect::<String>())
+                    .unwrap_or_default(),
+            );
+            anyhow::anyhow!("invalid regex branches ({} branches): {e}", branches.len())
+        })?;
         let inverted_indexes = searcher
             .segment_readers()
             .iter()
             .map(|reader| reader.inverted_index(text_field))
             .collect::<tantivy::Result<Vec<_>>>()?;
-        let mut matched: HashSet<String> = HashSet::new();
-        // Sum of doc_freq over every stream hit — the real cost of executing
-        // the TermSetQuery (BitSet union of one postings list per matched term
-        // per segment). A term matched by several automatons in the same
-        // segment is counted once per automaton — a slight over-estimate that
-        // only errs toward earlier truncation.
-        let mut postings_cost: u64 = 0;
-        let mut truncated = false;
-        // Automatons run most-important-first: branches (exact forms before
-        // typo variants — the `build_word_regex` contract), then the
-        // Levenshtein typo automatons. Each automaton covers *all* segments
-        // before the next starts, so when a budget runs out mid-collection
-        // the query degrades to the highest-priority automaton prefix rather
-        // than over-serving whichever segment happened to be scanned first.
-        if Self::collect_automatons_terms(
+        // Same builder configuration as the fuzzy path (distance 1,
+        // transposition counts as one edit): the whole edit-distance-1
+        // neighborhood of each typo token, ranked after every branch.
+        let typo_automata = typo_tokens
+            .iter()
+            .map(|token| self.fuzzy_automaton(token, 1))
+            .collect::<Result<Vec<_>>>()?;
+        // Everything is gathered and ranked before a budget applies, so a
+        // budget drops the lowest-ranked forms — not whatever the dictionary
+        // order happened to reach last.
+        let (ranked, capped) = term_automaton::collect_ranked(
             &inverted_indexes,
-            &regexes,
-            max_expansions,
+            &automata,
+            &typo_automata,
+            term_automaton::COLLECT_CAP.max(max_expansions as usize),
+        )?;
+        let (kept, truncated) = term_automaton::within_budgets(
+            ranked,
+            capped,
+            max_expansions as usize,
             postings_budget,
-            &mut matched,
-            &mut postings_cost,
-        )? {
-            truncated = true;
-        }
-        if !truncated && !typo_tokens.is_empty() {
-            // Same builder configuration as the fuzzy path (distance 1,
-            // transposition counts as one edit): the whole edit-distance-1
-            // neighborhood in one scan per token per segment, replacing the
-            // ≤128 sampled literal-variant scans (VARIATION_CEILING_RESEARCH
-            // §3.ג). Guarded by `!truncated` on purpose — typo expansion has
-            // the lowest priority, so when the exact branches alone exhaust a
-            // budget (an extremely common word) the scan is skipped entirely
-            // rather than pushed past the budget; the query then behaves as
-            // if typo tolerance found nothing, and the warn! below records it.
-            'typo: for token in typo_tokens {
-                let automaton = self.fuzzy_automaton(token, 1)?;
-                for inverted in &inverted_indexes {
-                    if Self::collect_automaton_terms(
-                        inverted,
-                        &automaton,
-                        max_expansions,
-                        postings_budget,
-                        &mut matched,
-                        &mut postings_cost,
-                    )? {
-                        truncated = true;
-                        break 'typo;
-                    }
-                }
-            }
-        }
+        );
         if truncated {
             warn!(
-                "term collection truncated at {} terms / ~{postings_cost} postings \
-                 (caps: {max_expansions} terms, {postings_budget} postings); \
-                 serving the highest-priority branches collected so far",
-                matched.len(),
+                "term collection truncated at {} terms (caps: {max_expansions} terms,                  {postings_budget} postings); serving the highest-ranked terms",
+                kept.len(),
             );
         }
         let terms: Arc<Vec<Term>> = Arc::new(
-            matched
-                .into_iter()
-                .map(|t| Term::from_field_text(text_field, &t))
+            kept.iter()
+                .map(|t| Term::from_field_text(text_field, &t.term))
                 .collect(),
         );
         let entry = CachedTermSet { terms, truncated };
@@ -10728,293 +12061,6 @@ impl SearchEngine {
             .unwrap()
             .put(cache_key, entry.clone());
         Ok(entry)
-    }
-
-    /// [`Self::collect_automaton_terms`] over every `(automaton, segment)` pair
-    /// in priority order (automaton-major), with the dictionary scans run in
-    /// parallel waves after a bounded, read-only first-segment probe. Narrow
-    /// first branches run synchronously; broad branches share the pool. Each
-    /// scan is capped by the remaining postings budget and the full term cap.
-    /// Hits are then replayed in order into `matched` — so the collected set
-    /// and the truncation point are exactly those of the sequential loop.
-    fn collect_automatons_terms<A>(
-        inverted_indexes: &[Arc<tantivy::InvertedIndexReader>],
-        automatons: &[A],
-        max_expansions: u32,
-        postings_budget: u64,
-        matched: &mut HashSet<String>,
-        postings_cost: &mut u64,
-    ) -> Result<bool>
-    where
-        A: Automaton + Sync,
-        A::State: Clone,
-    {
-        use rayon::prelude::*;
-
-        let pairs: Vec<(usize, usize)> = (0..automatons.len())
-            .flat_map(|a| (0..inverted_indexes.len()).map(move |s| (a, s)))
-            .collect();
-        // A bounded probe distinguishes cheap scans and early budget stops
-        // from broad scans without changing the global set or postings cost.
-        // A broad first automaton can then scan all its segments together;
-        // keeping its first segment synchronous would lose that parallel gain.
-        let initial_terms = matched.len();
-        let mut cursor = 0;
-        if let Some(&(a, segment)) = pairs.first() {
-            if inverted_indexes.len() > 1 {
-                let (hits, broad) = Self::probe_first_automaton_scan(
-                    &inverted_indexes[segment],
-                    &automatons[a],
-                    max_expansions,
-                    postings_budget,
-                    matched,
-                    *postings_cost,
-                )?;
-                if !broad {
-                    // Few hits can still require traversing most of the FST.
-                    // Reuse them instead of repeating that dictionary scan.
-                    if Self::replay_automaton_hits(
-                        hits,
-                        max_expansions,
-                        postings_budget,
-                        matched,
-                        postings_cost,
-                    ) {
-                        return Ok(true);
-                    }
-                    cursor = 1;
-                }
-            } else {
-                if Self::collect_automaton_terms(
-                    &inverted_indexes[segment],
-                    &automatons[a],
-                    max_expansions,
-                    postings_budget,
-                    matched,
-                    postings_cost,
-                )? {
-                    return Ok(true);
-                }
-                cursor = 1;
-            }
-        }
-        if cursor == pairs.len() {
-            return Ok(false);
-        }
-        // Finish the highest-priority automaton before speculating on other
-        // branches. Common narrow patterns can consume the postings budget
-        // across several segments while matching only one or two terms.
-        // Those tiny scans remain serial; broader scans share the pool.
-        let first_automaton_end = inverted_indexes.len();
-        if cursor == 1 && matched.len().saturating_sub(initial_terms) <= 8 {
-            for &(a, segment) in pairs.iter().take(first_automaton_end).skip(cursor) {
-                if Self::collect_automaton_terms(
-                    &inverted_indexes[segment],
-                    &automatons[a],
-                    max_expansions,
-                    postings_budget,
-                    matched,
-                    postings_cost,
-                )? {
-                    return Ok(true);
-                }
-            }
-            cursor = first_automaton_end;
-        }
-        if cursor == pairs.len() {
-            return Ok(false);
-        }
-        let threads = if pairs.len() - cursor > 1 {
-            rayon::current_num_threads().max(1)
-        } else {
-            1
-        };
-        while cursor < pairs.len() {
-            let remaining_postings = postings_budget.saturating_sub(*postings_cost);
-            let remaining_terms = (max_expansions as usize).saturating_sub(matched.len());
-            // Shrink speculative waves near either global limit. Keep the
-            // original local term cap: earlier hits can duplicate `matched`,
-            // so a cap of `remaining_terms` would lose valid prefix terms.
-            let by_postings = if remaining_postings >= postings_budget / 4 {
-                threads
-            } else {
-                ((threads as u128 * remaining_postings as u128)
-                    .div_ceil(postings_budget.max(1) as u128)) as usize
-            };
-            let by_terms = if remaining_terms >= max_expansions as usize / 4 {
-                threads
-            } else {
-                ((threads as u128 * remaining_terms as u128)
-                    .div_ceil(max_expansions.max(1) as u128)) as usize
-            };
-            let wave = threads.min(by_postings).min(by_terms).max(1);
-            let priority_end = if cursor < first_automaton_end {
-                first_automaton_end
-            } else {
-                pairs.len()
-            };
-            let end = (cursor + wave).min(priority_end);
-            // A single remaining scan needs neither task dispatch nor a
-            // temporary hit vector, including waves reduced by the budgets.
-            if end == cursor + 1 {
-                let (a, segment) = pairs[cursor];
-                if Self::collect_automaton_terms(
-                    &inverted_indexes[segment],
-                    &automatons[a],
-                    max_expansions,
-                    postings_budget,
-                    matched,
-                    postings_cost,
-                )? {
-                    return Ok(true);
-                }
-                cursor = end;
-                continue;
-            }
-            let scans: Vec<Vec<(String, u32)>> = pairs[cursor..end]
-                .par_iter()
-                .map(|&(a, segment)| {
-                    Self::scan_automaton_terms(
-                        &inverted_indexes[segment],
-                        &automatons[a],
-                        max_expansions,
-                        remaining_postings,
-                    )
-                })
-                .collect::<Result<_>>()?;
-            if Self::replay_automaton_hits(
-                scans.into_iter().flatten(),
-                max_expansions,
-                postings_budget,
-                matched,
-                postings_cost,
-            ) {
-                return Ok(true);
-            }
-            cursor = end;
-        }
-        Ok(false)
-    }
-
-    /// Inspect at most nine hits without changing the global set or cost.
-    /// Narrow scans return their complete prefix for replay; broad scans will
-    /// repeat only this bounded prefix when starting the parallel wave.
-    /// First-segment terms are distinct, so membership in the prefilled set
-    /// suffices to predict the sequential term budget.
-    fn probe_first_automaton_scan<A>(
-        inverted: &tantivy::InvertedIndexReader,
-        automaton: &A,
-        max_expansions: u32,
-        postings_budget: u64,
-        matched: &HashSet<String>,
-        mut postings_cost: u64,
-    ) -> Result<(Vec<(String, u32)>, bool)>
-    where
-        A: Automaton,
-        A::State: Clone,
-    {
-        let mut terms = matched.len();
-        let mut hits = Vec::new();
-        let mut stream = inverted.terms().search(automaton).into_stream()?;
-        while stream.advance() {
-            if let Ok(term) = std::str::from_utf8(stream.key()) {
-                let doc_freq = stream.value().doc_freq;
-                postings_cost += u64::from(doc_freq);
-                terms += usize::from(!matched.contains(term));
-                hits.push((term.to_string(), doc_freq));
-                if terms >= max_expansions as usize || postings_cost >= postings_budget {
-                    return Ok((hits, false));
-                }
-                if hits.len() > 8 {
-                    return Ok((hits, true));
-                }
-            }
-        }
-        Ok((hits, false))
-    }
-
-    fn replay_automaton_hits(
-        hits: impl IntoIterator<Item = (String, u32)>,
-        max_expansions: u32,
-        postings_budget: u64,
-        matched: &mut HashSet<String>,
-        postings_cost: &mut u64,
-    ) -> bool {
-        for (term, doc_freq) in hits {
-            *postings_cost += u64::from(doc_freq);
-            matched.insert(term);
-            if matched.len() >= max_expansions as usize || *postings_cost >= postings_budget {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// One segment's dictionary hits for `automaton`, in dictionary order,
-    /// stopping where [`Self::collect_automaton_terms`] alone would stop.
-    fn scan_automaton_terms<A>(
-        inverted: &tantivy::InvertedIndexReader,
-        automaton: &A,
-        max_expansions: u32,
-        postings_budget: u64,
-    ) -> Result<Vec<(String, u32)>>
-    where
-        A: Automaton,
-        A::State: Clone,
-    {
-        let mut hits = Vec::new();
-        let mut distinct = 0usize;
-        let mut cost = 0u64;
-        let mut stream = inverted.terms().search(automaton).into_stream()?;
-        while stream.advance() {
-            if let Ok(term) = std::str::from_utf8(stream.key()) {
-                let doc_freq = stream.value().doc_freq;
-                cost += u64::from(doc_freq);
-                distinct += 1;
-                hits.push((term.to_string(), doc_freq));
-                if distinct >= max_expansions as usize || cost >= postings_budget {
-                    break;
-                }
-            }
-        }
-        Ok(hits)
-    }
-
-    /// Streams every term `automaton` matches in one segment's dictionary
-    /// into `matched`, charging each hit's per-segment `doc_freq` against
-    /// `postings_cost` (the streamer decodes `TermInfo` in-memory on
-    /// `advance()`, so reading the value adds no IO). Returns `true` when a
-    /// collection budget was hit — degrade, never error: the check runs after
-    /// insertion, so even a first term costlier than the whole budget is
-    /// kept and the caller serves what was gathered.
-    fn collect_automaton_terms<A>(
-        inverted: &tantivy::InvertedIndexReader,
-        automaton: &A,
-        max_expansions: u32,
-        postings_budget: u64,
-        matched: &mut HashSet<String>,
-        postings_cost: &mut u64,
-    ) -> Result<bool>
-    where
-        A: Automaton,
-        A::State: Clone,
-    {
-        let mut stream = inverted.terms().search(automaton).into_stream()?;
-        while stream.advance() {
-            if let Ok(term) = std::str::from_utf8(stream.key()) {
-                *postings_cost += u64::from(stream.value().doc_freq);
-                // contains-before-insert avoids re-allocating the term string
-                // when it was already seen in an earlier segment or matched
-                // by an earlier automaton.
-                if !matched.contains(term) {
-                    matched.insert(term.to_string());
-                }
-                if matched.len() >= max_expansions as usize || *postings_cost >= postings_budget {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
     }
 
     /// Tokenizes `text` with the same `"hebrew"` analyzer the `text` field is
@@ -11126,31 +12172,33 @@ impl SearchEngine {
             .transpose()?;
         let text_f = self.schema.get_field("text")?;
         let token_texts = self.index_token_texts(query_str)?;
-        let mut terms: Vec<Term> = token_texts
-            .iter()
-            .map(|t| Term::from_field_text(text_f, t))
-            .collect();
-        let main_query: Box<dyn Query> = match terms.len() {
+        let searcher = self.index_reader.searcher();
+        let main_query: Box<dyn Query> = match token_texts.len() {
             0 => Box::new(EmptyQuery),
-            1 => Box::new(TermQuery::new(
-                terms.pop().unwrap(),
+            1 => quote_expansion::term_query(
+                &searcher,
+                text_f,
+                &token_texts[0],
                 IndexRecordOption::Basic,
-            )),
+            )?,
             _ if cross_line => {
                 let words: Vec<cross_line::CrossLineWord> = token_texts
                     .iter()
-                    .map(|t| cross_line::CrossLineWord::Terms(vec![t.clone()]))
-                    .collect();
+                    .map(|t| {
+                        quote_expansion::spellings(&searcher, text_f, t)
+                            .map(cross_line::CrossLineWord::Terms)
+                    })
+                    .collect::<tantivy::Result<_>>()?;
                 let gaps = vec![0; words.len() - 1];
                 self.with_cross_line(
-                    Box::new(PhraseQuery::new(terms)),
+                    quote_expansion::phrase_query(&searcher, text_f, &token_texts, 0)?,
                     text_f,
                     &words,
                     &gaps,
                     facets_query.as_deref(),
                 )?
             }
-            _ => Box::new(PhraseQuery::new(terms)),
+            _ => quote_expansion::phrase_query(&searcher, text_f, &token_texts, 0)?,
         };
         if let Some(facets_query) = facets_query {
             Ok((
@@ -11223,10 +12271,10 @@ impl SearchEngine {
                     .iter()
                     .map(|p| hebrew_query::WordPattern::parse(p))
                     .collect();
-                let gaps = vec![0u32; word_patterns.len().saturating_sub(1)];
+                let proximity = Proximity::adjacent(word_patterns.len());
                 self.phrase_query_with_degrade(
                     &word_patterns,
-                    &gaps,
+                    &proximity,
                     voc_field,
                     VOC_PHRASE_MAX_EXPANSIONS,
                     false,
@@ -11375,24 +12423,28 @@ impl SearchEngine {
     /// relevance tier: a `ConstScoreQuery` floor (immune to BM25 `idf` collapse
     /// on near-ubiquitous terms) plus a small BM25 `TermQuery` add-on for
     /// intra-exact ordering. Only used on the ranked (`Relevance`) fuzzy path.
-    fn exact_rank_clauses(text_f: Field, token: &str) -> Vec<(Occur, Box<dyn Query>)> {
-        let term = Term::from_field_text(text_f, token);
-        vec![
+    fn exact_rank_clauses(
+        searcher: &Searcher,
+        text_f: Field,
+        token: &str,
+    ) -> Result<Vec<(Occur, Box<dyn Query>)>> {
+        let exact = |option| quote_expansion::term_query(searcher, text_f, token, option);
+        Ok(vec![
             (
                 Occur::Should,
                 Box::new(ConstScoreQuery::new(
-                    Box::new(TermQuery::new(term.clone(), IndexRecordOption::Basic)),
+                    exact(IndexRecordOption::Basic)?,
                     FUZZY_BOOST_EXACT,
                 )) as Box<dyn Query>,
             ),
             (
                 Occur::Should,
                 Box::new(BoostQuery::new(
-                    Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
+                    exact(IndexRecordOption::WithFreqs)?,
                     FUZZY_BOOST_EXACT_REL,
                 )),
             ),
-        ]
+        ])
     }
 
     /// Fuzzy mode from pre-tokenized terms: one `FuzzyTermQuery` per term, ANDed,
@@ -11419,11 +12471,15 @@ impl SearchEngine {
             return Ok(Box::new(EmptyQuery));
         }
         let text_f = self.schema.get_field("text")?;
+        let searcher = self.index_reader.searcher();
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = term_texts
             .iter()
-            .map(|t| {
-                let term = Term::from_field_text(text_f, t);
-                let fuzzy = FuzzyTermQuery::new(term, max_distance, true);
+            .map(|t| -> Result<(Occur, Box<dyn Query>)> {
+                let fuzzy = AutomatonQuery::new(
+                    text_f,
+                    format!("{t}~{max_distance}"),
+                    self.fuzzy_automaton(t, max_distance)?,
+                );
                 // Bare recall is one fuzzy automaton per token. distance 0 is
                 // exact already, and unranked paths (count/catalogue) need no
                 // scoring, so both stay the bare query — except that a
@@ -11438,18 +12494,20 @@ impl SearchEngine {
                             (Occur::Should, Box::new(fuzzy) as Box<dyn Query>),
                             (
                                 Occur::Should,
-                                Box::new(TermQuery::new(
-                                    Term::from_field_text(text_f, &clean),
+                                quote_expansion::term_query(
+                                    &searcher,
+                                    text_f,
+                                    &clean,
                                     IndexRecordOption::Basic,
-                                )),
+                                )?,
                             ),
                         ])),
                         None => Box::new(fuzzy),
                     }
                 } else {
-                    let mut should = Self::exact_rank_clauses(text_f, t);
+                    let mut should = Self::exact_rank_clauses(&searcher, text_f, t)?;
                     if let Some(clean) = Self::quoteless_variant(t) {
-                        should.extend(Self::exact_rank_clauses(text_f, &clean));
+                        should.extend(Self::exact_rank_clauses(&searcher, text_f, &clean)?);
                     }
                     should.push((
                         Occur::Should,
@@ -11457,11 +12515,11 @@ impl SearchEngine {
                     ));
                     Box::new(BooleanQuery::new(should))
                 };
-                (Occur::Must, token_query)
+                Ok((Occur::Must, token_query))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         if rank {
-            clauses.extend(Self::exact_phrase_boost(text_f, term_texts));
+            clauses.extend(Self::exact_phrase_boost(&searcher, text_f, term_texts)?);
         }
         if !facets.is_empty() {
             clauses.push((Occur::Must, self.facet_filter_query(facets)?));
@@ -11471,27 +12529,36 @@ impl SearchEngine {
 
     /// The ranking-only `Should` that lifts hits where the typed words stand
     /// adjacent (within [`LEXICAL_FUZZY_PHRASE_SLOP`]) above scattered ones.
-    fn exact_phrase_boost(text_f: Field, term_texts: &[String]) -> Option<(Occur, Box<dyn Query>)> {
-        let phrase = Self::exact_phrase(text_f, term_texts)?;
-        Some((
+    fn exact_phrase_boost(
+        searcher: &Searcher,
+        text_f: Field,
+        term_texts: &[String],
+    ) -> Result<Option<(Occur, Box<dyn Query>)>> {
+        let Some(phrase) = Self::exact_phrase(searcher, text_f, term_texts)? else {
+            return Ok(None);
+        };
+        Ok(Some((
             Occur::Should,
-            Box::new(ConstScoreQuery::new(Box::new(phrase), FUZZY_BOOST_PHRASE)),
-        ))
+            Box::new(ConstScoreQuery::new(phrase, FUZZY_BOOST_PHRASE)),
+        )))
     }
 
     /// The typed words, exact, within [`LEXICAL_FUZZY_PHRASE_SLOP`]; `None`
     /// for a single word.
-    fn exact_phrase(text_f: Field, words: &[String]) -> Option<PhraseQuery> {
+    fn exact_phrase(
+        searcher: &Searcher,
+        text_f: Field,
+        words: &[String],
+    ) -> Result<Option<Box<dyn Query>>> {
         if words.len() < 2 {
-            return None;
+            return Ok(None);
         }
-        let terms = words
-            .iter()
-            .map(|t| Term::from_field_text(text_f, t))
-            .collect();
-        let mut phrase = PhraseQuery::new(terms);
-        phrase.set_slop(LEXICAL_FUZZY_PHRASE_SLOP);
-        Some(phrase)
+        Ok(Some(quote_expansion::phrase_query(
+            searcher,
+            text_f,
+            words,
+            LEXICAL_FUZZY_PHRASE_SLOP,
+        )?))
     }
 
     /// Whether one quotation contains every searchable word of the query. Independent
@@ -11685,6 +12752,7 @@ impl SearchEngine {
             .as_ref()
             .context("lexical fuzzy query requires a loaded magic dictionary")?;
         let text_f = self.schema.get_field("text")?;
+        let searcher = self.index_reader.searcher();
 
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(term_texts.len() + 3);
         for phrase in phrases.iter().filter(|p| p.len() >= 2) {
@@ -11694,8 +12762,7 @@ impl SearchEngine {
             ));
             if rank {
                 clauses.extend(
-                    Self::exact_phrase(text_f, phrase)
-                        .map(|q| (Occur::Should, Box::new(q) as Box<dyn Query>)),
+                    Self::exact_phrase(&searcher, text_f, phrase)?.map(|q| (Occur::Should, q)),
                 );
             }
         }
@@ -11705,19 +12772,24 @@ impl SearchEngine {
             if phrases.iter().any(|p| p.len() >= 2 && p.contains(token)) {
                 continue;
             }
-            let exact_term = Term::from_field_text(text_f, token);
             // Wrap the fuzzy automaton in the fuzzy-tier boost only when ranking;
             // an unranked recall query (count/catalogue) carries no boost so it
-            // stays the bare `FuzzyTermQuery` it always was.
-            let fuzzy: Option<Box<dyn Query>> = (max_distance > 0).then(|| {
-                let fuzzy_q = FuzzyTermQuery::new(exact_term.clone(), max_distance, true);
-                if rank {
+            // stays the bare fuzzy automaton it always was.
+            let fuzzy: Option<Box<dyn Query>> = if max_distance > 0 {
+                let fuzzy_q = AutomatonQuery::new(
+                    text_f,
+                    format!("{token}~{max_distance}"),
+                    self.fuzzy_automaton(token, max_distance)?,
+                );
+                Some(if rank {
                     Box::new(BoostQuery::new(Box::new(fuzzy_q), FUZZY_BOOST_FUZZY))
                         as Box<dyn Query>
                 } else {
                     Box::new(fuzzy_q)
-                }
-            });
+                })
+            } else {
+                None
+            };
             let clean = Self::quoteless_variant(token);
             let mut forms = dict.recall_forms(token, MAX_LEXICAL_FORMS);
             forms.retain(|f| f != token && Some(f.as_str()) != clean.as_deref());
@@ -11732,34 +12804,38 @@ impl SearchEngine {
             // the exact tier — clean-typography editions match at distance 0
             // and rank as exact, not as edit-distance tail.
             let mut should: Vec<(Occur, Box<dyn Query>)> = if rank {
-                Self::exact_rank_clauses(text_f, token)
+                Self::exact_rank_clauses(&searcher, text_f, token)?
             } else if fuzzy.is_none() {
                 vec![(
                     Occur::Should,
-                    Box::new(TermQuery::new(exact_term, IndexRecordOption::Basic)),
+                    quote_expansion::term_query(
+                        &searcher,
+                        text_f,
+                        token,
+                        IndexRecordOption::Basic,
+                    )?,
                 )]
             } else {
                 Vec::with_capacity(3)
             };
             if let Some(clean) = &clean {
                 if rank {
-                    should.extend(Self::exact_rank_clauses(text_f, clean));
+                    should.extend(Self::exact_rank_clauses(&searcher, text_f, clean)?);
                 } else {
                     should.push((
                         Occur::Should,
-                        Box::new(TermQuery::new(
-                            Term::from_field_text(text_f, clean),
+                        quote_expansion::term_query(
+                            &searcher,
+                            text_f,
+                            clean,
                             IndexRecordOption::Basic,
-                        )),
+                        )?,
                     ));
                 }
             }
             should.extend(fuzzy.map(|fuzzy| (Occur::Should, fuzzy)));
             if !forms.is_empty() {
-                let set_terms: Vec<Term> = forms
-                    .iter()
-                    .map(|f| Term::from_field_text(text_f, f))
-                    .collect();
+                let set_terms = quote_expansion::spelling_terms(&searcher, text_f, &forms)?;
                 let termset: Box<dyn Query> = if rank {
                     Box::new(BoostQuery::new(
                         Box::new(TermSetQuery::new(set_terms)),
@@ -11781,7 +12857,7 @@ impl SearchEngine {
             clauses.push((Occur::Must, token_query));
         }
         if rank {
-            clauses.extend(Self::exact_phrase_boost(text_f, term_texts));
+            clauses.extend(Self::exact_phrase_boost(&searcher, text_f, term_texts)?);
             if LEXICAL_FUZZY_EXPANDED_PHRASE_BOOST && term_texts.len() >= 2 {
                 let expanded = self.lexical_fuzzy_phrase_query(dict, term_texts, max_distance)?;
                 clauses.push((
@@ -11806,21 +12882,17 @@ impl SearchEngine {
         max_distance: u8,
     ) -> Result<Box<dyn Query>> {
         let text_f = self.schema.get_field("text")?;
+        let searcher = self.index_reader.searcher();
         let position_terms = self
             .lexical_fuzzy_phrase_terms(dict, term_texts, max_distance)?
             .into_iter()
-            .map(|terms| {
-                terms
-                    .iter()
-                    .map(|t| Term::from_field_text(text_f, t))
-                    .collect()
-            })
-            .collect();
+            .map(|terms| quote_expansion::spelling_terms(&searcher, text_f, &terms))
+            .collect::<tantivy::Result<_>>()?;
         let gaps = vec![LEXICAL_FUZZY_PHRASE_SLOP; term_texts.len().saturating_sub(1)];
         Ok(Box::new(TermListPhraseQuery::new(
             text_f,
             position_terms,
-            gaps,
+            Proximity::Ordered(gaps),
         )))
     }
 
@@ -11896,11 +12968,15 @@ impl SearchEngine {
     /// Advanced mode: ports the Dart morphological query builder to produce regex
     /// terms + slop + max_expansions, then reuses `build_query`. Also returns the
     /// regex patterns so callers can materialize concrete terms for highlighting.
+    /// `any_order` applies as [`hebrew_query::resolve_proximity`] says; acronym
+    /// expansions stay ordered.
+    #[allow(clippy::too_many_arguments)]
     fn build_advanced_query(
         &self,
         query: &str,
         distance: u32,
         custom_spacing: &HashMap<String, String>,
+        any_order: bool,
         alternative_words: &HashMap<u32, Vec<String>>,
         search_options: &HashMap<String, HashMap<String, bool>>,
         facets: Vec<String>,
@@ -11908,6 +12984,40 @@ impl SearchEngine {
         scope: &SearchScope,
         match_mode: &WordMatch,
         cross_line: bool,
+    ) -> Result<AdvancedQueryBuild> {
+        self.build_advanced_query_ranked(
+            query,
+            distance,
+            custom_spacing,
+            any_order,
+            alternative_words,
+            search_options,
+            facets,
+            voc,
+            scope,
+            match_mode,
+            cross_line,
+            false,
+        )
+    }
+
+    /// [`Self::build_advanced_query`]; `rank` (a relevance-ordered search)
+    /// scores a single word's matches in tiers — see [`ADVANCED_TIER_BOOSTS`].
+    #[allow(clippy::too_many_arguments)]
+    fn build_advanced_query_ranked(
+        &self,
+        query: &str,
+        distance: u32,
+        custom_spacing: &HashMap<String, String>,
+        any_order: bool,
+        alternative_words: &HashMap<u32, Vec<String>>,
+        search_options: &HashMap<String, HashMap<String, bool>>,
+        facets: Vec<String>,
+        voc: &VocalizedFlags,
+        scope: &SearchScope,
+        match_mode: &WordMatch,
+        cross_line: bool,
+        rank: bool,
     ) -> Result<AdvancedQueryBuild> {
         // The vocalized mode is requested either by the global API flags or
         // by a per-word "ניקוד"/"טעמים" option; the per-word requirement
@@ -11958,7 +13068,12 @@ impl SearchEngine {
         // `distance` for every pair) — the phrase filter's gap allowances
         // must use it, not the raw `distance`, or a spacing-permitted match
         // would be rejected and fall back to the broad term highlight.
-        let gaps = prepared.gaps.clone();
+        let proximity = hebrew_query::resolve_proximity(
+            std::mem::take(&mut prepared.gaps),
+            distance,
+            custom_spacing,
+            any_order,
+        );
         let source_words = std::mem::take(&mut prepared.words);
         // The highlight builders want one pattern string per word; the query
         // builder gets the structured patterns so a single word compiles per
@@ -11981,17 +13096,43 @@ impl SearchEngine {
             scope,
             cross_line,
         )?;
+        // Tiers compare mark-free text, so the vocalized field stays unranked.
+        let ranking_roots: Option<Vec<String>> = (rank && !voc_mode.any())
+            .then(|| {
+                let word = source_words.first()?;
+                let ignore_quotes =
+                    hebrew_query::word_flags_at(&source_words, 0, search_options).ignore_quotes;
+                let roots = std::iter::once(word.clone())
+                    .chain(
+                        alternative_words
+                            .get(&0)
+                            .into_iter()
+                            .flatten()
+                            .map(|a| hebrew_query::normalize_for_index(a)),
+                    )
+                    .map(|r| {
+                        if ignore_quotes {
+                            hebrew_query::strip_quote_chars(&r)
+                        } else {
+                            r
+                        }
+                    })
+                    .collect();
+                Some(roots)
+            })
+            .flatten();
         let (main_query, main_truncated) = self.build_query_from_patterns(
             prepared.regex_terms,
             &source_words,
             &prepared.typo_tokens,
             facets,
-            &gaps,
+            &proximity,
             prepared.max_expansions,
             text_field,
             scope,
             match_mode,
             cross_line,
+            ranking_roots.as_deref(),
         )?;
         let (query, truncated, acronym_patterns) = if acronym_alts.is_empty() {
             (main_query, main_truncated, Vec::new())
@@ -12012,7 +13153,7 @@ impl SearchEngine {
                 alt_patterns,
             )
         };
-        Ok((query, regex_terms, gaps, truncated, acronym_patterns))
+        Ok((query, regex_terms, proximity, truncated, acronym_patterns))
     }
 
     /// בונה תת-שאילתות פענוח ראשי-תיבות (דו-כיווני) שיש ל-OR עם השאילתה
@@ -12092,18 +13233,19 @@ impl SearchEngine {
                 .collect();
             // פענוח הוא ביטוי קנוני — מילים צמודות (slop 0, ללא GapVerified),
             // וכל מילותיו חובה גם כשהשאילתה הראשית בהתאמה חלקית.
-            let gaps = vec![0u32; patterns.len().saturating_sub(1)];
+            let proximity = Proximity::adjacent(patterns.len());
             let (alt_query, truncated) = self.build_query_from_patterns(
                 patterns,
                 &[],
                 &[],
                 facets.clone(),
-                &gaps,
+                &proximity,
                 max_expansions,
                 text_field,
                 scope,
                 &WordMatch::All,
                 cross_line,
+                None,
             )?;
             out.push((alt_query, truncated, literal_patterns));
         }
@@ -12178,7 +13320,7 @@ impl SearchEngine {
     {
         let searcher = self.index_reader.searcher();
         if let Some(grouping) = grouping {
-            let page = Self::collect_grouped(&searcher, &*query, grouping, limit, offset, order)?;
+            let page = self.collect_grouped(&searcher, &*query, grouping, limit, offset, order)?;
             return Self::build_grouped_results(
                 &self.schema,
                 &searcher,
@@ -12189,7 +13331,9 @@ impl SearchEngine {
                 &page,
             );
         }
-        let addresses = Self::collect_addresses(&searcher, &*query, limit, offset, order)?;
+        let addresses = self
+            .ranked_page(&searcher, &*query, limit, offset, order, PageCounts::None)?
+            .addresses;
         if addresses.is_empty() {
             return Ok(Vec::new());
         }
@@ -12224,7 +13368,7 @@ impl SearchEngine {
     {
         let searcher = self.index_reader.searcher();
         if let Some(grouping) = grouping {
-            let page = Self::collect_grouped(&searcher, &*query, grouping, limit, offset, order)?;
+            let page = self.collect_grouped(&searcher, &*query, grouping, limit, offset, order)?;
             let results = Self::build_grouped_results(
                 &self.schema,
                 &searcher,
@@ -12243,39 +13387,18 @@ impl SearchEngine {
         }
         if limit == 0 {
             return Ok(SearchPageResult {
-                total_count: searcher.search(&*query, &Count)? as u32,
+                total_count: self.count_on(&searcher, &*query)?,
                 results: Vec::new(),
                 truncated,
                 group_count: None,
             });
         }
-        // Tuple collector: single index pass for both count and top-docs.
-        let (addresses, total_count): (Vec<DocAddress>, u32) = match order {
-            ResultsOrder::Catalogue => {
-                let top_collector = TopDocs::with_limit(limit as usize)
-                    .and_offset(offset as usize)
-                    .order_by_fast_field::<u64>("id", Order::Asc);
-                let (top_docs, count) = searcher.search(&*query, &(top_collector, Count))?;
-                let addrs = top_docs.into_iter().map(|(_, addr)| addr).collect();
-                (addrs, count as u32)
-            }
-            ResultsOrder::Generation => {
-                let top_collector = TopDocs::with_limit(limit as usize)
-                    .and_offset(offset as usize)
-                    .order_by_fast_field::<u64>("generationSort", Order::Asc);
-                let (top_docs, count) = searcher.search(&*query, &(top_collector, Count))?;
-                let addrs = top_docs.into_iter().map(|(_, addr)| addr).collect();
-                (addrs, count as u32)
-            }
-            ResultsOrder::Relevance => {
-                let top_collector = TopDocs::with_limit(limit as usize)
-                    .and_offset(offset as usize)
-                    .order_by_score();
-                let (top_docs, count) = searcher.search(&*query, &(top_collector, Count))?;
-                let addrs = top_docs.into_iter().map(|(_, addr)| addr).collect();
-                (addrs, count as u32)
-            }
-        };
+        // One index pass for both count and top-docs.
+        let RankedPage {
+            addresses,
+            total: total_count,
+            ..
+        } = self.ranked_page(&searcher, &*query, limit, offset, order, PageCounts::Total)?;
         // total_count is the full hit count regardless of this page; only the
         // snippet highlighting (and its dictionary scan) is page-dependent, so
         // skip it when this page is empty (e.g. offset past the last hit).
@@ -12307,13 +13430,41 @@ impl SearchEngine {
     }
 
     fn run_count(&self, query: Box<dyn Query>) -> Result<u32> {
-        let searcher = self.index_reader.searcher();
-        Ok(searcher.search(&*query, &Count)? as u32)
+        self.count_on(&self.index_reader.searcher(), &*query)
     }
 
     fn run_count_by_book(&self, query: Box<dyn Query>) -> Result<HashMap<String, u32>> {
         let searcher = self.index_reader.searcher();
-        Ok(searcher.search(&*query, &BookCountCollector)?)
+        let key = PageKey::new(
+            page_cache::snapshot_of(&searcher),
+            self.order_epoch(),
+            &*query,
+        );
+        if let Some(counts) = key
+            .as_ref()
+            .and_then(|key| self.page_cache.book_counts(key))
+        {
+            return Ok((*counts).clone());
+        }
+        let counts = searcher.search(&*query, &BookCountCollector)?;
+        if let Some(key) = key {
+            self.page_cache
+                .store_book_counts(key, Arc::new(counts.clone()));
+        }
+        Ok(counts)
+    }
+
+    /// The hit count of `query`, from the page cache when a search counted it.
+    fn count_on(&self, searcher: &Searcher, query: &dyn Query) -> Result<u32> {
+        let key = PageKey::new(page_cache::snapshot_of(searcher), self.order_epoch(), query);
+        if let Some(total) = key.as_ref().and_then(|key| self.page_cache.total(key)) {
+            return Ok(total);
+        }
+        let total = searcher.search(query, &Count)? as u32;
+        if let Some(key) = key {
+            self.page_cache.store_total(key, total);
+        }
+        Ok(total)
     }
 
     fn run_facet_counts(
@@ -12336,6 +13487,15 @@ impl SearchEngine {
         Ok(results)
     }
 
+    /// Stops every lexical call tagged with `request_id` (the streams, counts and
+    /// per-book counts that take `cancel_request_id`), running or still to come.
+    /// A cancelled count fails with [`LexicalSearchCancelled::MESSAGE`]; a
+    /// cancelled stream closes without another event. Returns at once.
+    #[frb(sync)]
+    pub fn cancel_lexical_search(&self, request_id: u32) {
+        self.lexical_cancellations.cancel(request_id);
+    }
+
     /// Routes a stream-search failure into the stream itself, where the Dart
     /// side receives it as an `onError` event.
     ///
@@ -12351,6 +13511,10 @@ impl SearchEngine {
         result: Result<()>,
     ) -> Result<()> {
         if let Err(err) = result {
+            if LexicalSearchCancelled::is(&err) {
+                debug!("stream search cancelled");
+                return Ok(());
+            }
             error!("stream search failed: {err:#}");
             let _ = sink.add_error(err);
         }
@@ -12369,15 +13533,17 @@ impl SearchEngine {
         hl: &HighlightConfig,
         chunk_size: u32,
         grouping: Option<&ResultGrouping>,
+        request: &LexicalRequest<'_>,
         sink: &StreamSink<Vec<SearchResult>>,
     ) -> Result<()>
     where
         F: FnOnce(&Searcher) -> Result<HighlightPlan>,
     {
         let searcher = self.index_reader.searcher();
+        let query = request.wrap(query);
         let chunk_size = (chunk_size.max(1)) as usize;
         if let Some(grouping) = grouping {
-            let page = Self::collect_grouped(&searcher, &*query, grouping, limit, offset, order)?;
+            let page = self.collect_grouped(&searcher, &*query, grouping, limit, offset, order)?;
             let results = Self::build_grouped_results(
                 &self.schema,
                 &searcher,
@@ -12388,13 +13554,16 @@ impl SearchEngine {
                 &page,
             )?;
             for chunk in results.chunks(chunk_size) {
+                request.check()?;
                 if sink.add(chunk.to_vec()).is_err() {
                     break;
                 }
             }
             return Ok(());
         }
-        let addresses = Self::collect_addresses(&searcher, &*query, limit, offset, order)?;
+        let addresses = self
+            .ranked_page(&searcher, &*query, limit, offset, order, PageCounts::None)?
+            .addresses;
         if addresses.is_empty() {
             return Ok(());
         }
@@ -12415,6 +13584,7 @@ impl SearchEngine {
                 phrase,
             )?;
             // If the Dart side cancelled the stream, stop early.
+            request.check()?;
             if sink.add(results).is_err() {
                 break;
             }
@@ -12440,19 +13610,23 @@ impl SearchEngine {
         chunk_size: u32,
         truncated: bool,
         grouping: Option<&ResultGrouping>,
+        request: &LexicalRequest<'_>,
         sink: &StreamSink<SearchStreamUpdate>,
     ) -> Result<()>
     where
         F: FnOnce(&Searcher) -> Result<HighlightPlan>,
     {
         let searcher = self.index_reader.searcher();
+        let query = request.wrap(query);
         let chunk_size = (chunk_size.max(1)) as usize;
 
         if let Some(grouping) = grouping {
             // מעבר אינדקס אחד: קיבוץ + ספירות פר-ספר יחד, כמו המסלול השטוח.
-            let collectors = (GroupCollector::new(grouping, order), BookCountCollector);
+            let sort = self.group_sort(order)?;
+            let collectors = (GroupCollector::new(grouping, sort), BookCountCollector);
             let ((), book_counts) = searcher.search(&*query, &collectors)?;
             let page = Self::finalize_grouped(collectors.0.take_hits(), limit, offset);
+            request.check()?;
             if sink
                 .add(SearchStreamUpdate {
                     total_count: Some(page.raw_total),
@@ -12475,6 +13649,7 @@ impl SearchEngine {
                 &page,
             )?;
             for chunk in results.chunks(chunk_size) {
+                request.check()?;
                 if sink
                     .add(SearchStreamUpdate {
                         total_count: None,
@@ -12491,43 +13666,26 @@ impl SearchEngine {
             return Ok(());
         }
 
-        let (addresses, total_count, book_counts): (Vec<DocAddress>, u32, HashMap<String, u32>) =
-            match order {
-                ResultsOrder::Catalogue => {
-                    let top_collector = TopDocs::with_limit(limit as usize)
-                        .and_offset(offset as usize)
-                        .order_by_fast_field::<u64>("id", Order::Asc);
-                    let (top_docs, count, by_book) =
-                        searcher.search(&*query, &(top_collector, Count, BookCountCollector))?;
-                    let addrs = top_docs.into_iter().map(|(_, addr)| addr).collect();
-                    (addrs, count as u32, by_book)
-                }
-                ResultsOrder::Generation => {
-                    let top_collector = TopDocs::with_limit(limit as usize)
-                        .and_offset(offset as usize)
-                        .order_by_fast_field::<u64>("generationSort", Order::Asc);
-                    let (top_docs, count, by_book) =
-                        searcher.search(&*query, &(top_collector, Count, BookCountCollector))?;
-                    let addrs = top_docs.into_iter().map(|(_, addr)| addr).collect();
-                    (addrs, count as u32, by_book)
-                }
-                ResultsOrder::Relevance => {
-                    let top_collector = TopDocs::with_limit(limit as usize)
-                        .and_offset(offset as usize)
-                        .order_by_score();
-                    let (top_docs, count, by_book) =
-                        searcher.search(&*query, &(top_collector, Count, BookCountCollector))?;
-                    let addrs = top_docs.into_iter().map(|(_, addr)| addr).collect();
-                    (addrs, count as u32, by_book)
-                }
-            };
+        let RankedPage {
+            addresses,
+            total: total_count,
+            book_counts,
+        } = self.ranked_page(
+            &searcher,
+            &*query,
+            limit,
+            offset,
+            order,
+            PageCounts::TotalAndBooks,
+        )?;
 
         // Counts first — the page addresses may be empty (offset past the
         // end) while the totals are still meaningful.
+        request.check()?;
         if sink
             .add(SearchStreamUpdate {
                 total_count: Some(total_count),
-                book_counts: Some(book_counts),
+                book_counts,
                 results: Vec::new(),
                 truncated,
                 group_count: None,
@@ -12557,6 +13715,7 @@ impl SearchEngine {
                 phrase,
             )?;
             // If the Dart side cancelled the stream, stop early.
+            request.check()?;
             if sink
                 .add(SearchStreamUpdate {
                     total_count: None,
@@ -12585,48 +13744,89 @@ impl SearchEngine {
         make_highlight(searcher).unwrap_or_else(|_| HighlightPlan::none())
     }
 
-    fn collect_addresses(
+    /// The hits `offset..offset + limit` of `query` in `order`, with the counts
+    /// `counts` asks for, in one index pass. Ranks a few pages ahead into the
+    /// page cache, and serves from it when an earlier call ranked this far.
+    fn ranked_page(
+        &self,
         searcher: &Searcher,
         query: &dyn Query,
         limit: u32,
         offset: u32,
         order: &ResultsOrder,
-    ) -> Result<Vec<DocAddress>> {
-        let addresses = match order {
-            ResultsOrder::Catalogue => {
-                // and_offset is set on TopDocs before calling order_by_fast_field,
-                // which consumes self and preserves the offset configuration.
-                let collector = TopDocs::with_limit(limit as usize)
-                    .and_offset(offset as usize)
-                    .order_by_fast_field::<u64>("id", Order::Asc);
-                searcher
-                    .search(query, &collector)?
-                    .into_iter()
-                    .map(|(_, addr)| addr)
-                    .collect()
-            }
-            ResultsOrder::Generation => {
-                let collector = TopDocs::with_limit(limit as usize)
-                    .and_offset(offset as usize)
-                    .order_by_fast_field::<u64>("generationSort", Order::Asc);
-                searcher
-                    .search(query, &collector)?
-                    .into_iter()
-                    .map(|(_, addr)| addr)
-                    .collect()
-            }
-            ResultsOrder::Relevance => {
-                let collector = TopDocs::with_limit(limit as usize)
-                    .and_offset(offset as usize)
-                    .order_by_score();
-                searcher
-                    .search(query, &collector)?
-                    .into_iter()
-                    .map(|(_, addr)| addr)
-                    .collect()
-            }
+        counts: PageCounts,
+    ) -> Result<RankedPage> {
+        let slot = match order {
+            ResultsOrder::Catalogue => 0,
+            ResultsOrder::Generation => 1,
+            ResultsOrder::Relevance => 2,
         };
-        Ok(addresses)
+        let (epoch, sort) = self.order_sort(order)?;
+        let key = PageKey::new(page_cache::snapshot_of(searcher), epoch, query);
+        if let Some(page) = key
+            .as_ref()
+            .and_then(|key| self.page_cache.page(key, slot, offset, limit))
+        {
+            if (counts == PageCounts::None || page.total.is_some())
+                && (counts != PageCounts::TotalAndBooks || page.book_counts.is_some())
+            {
+                return Ok(RankedPage {
+                    addresses: page.addresses,
+                    total: page.total.unwrap_or(0),
+                    book_counts: page.book_counts.map(|counts| (*counts).clone()),
+                });
+            }
+        }
+        let window = key.and(page_cache::ranked_window(offset, limit));
+        let (from, take) = match window {
+            Some(window) => (0, window),
+            None => (offset as usize, limit as usize),
+        };
+        let top = TopDocs::with_limit(take).and_offset(from);
+        let (mut addresses, total, book_counts) = match sort {
+            Some(sort) => {
+                collect_ranked(searcher, query, top.order_by((sort, Order::Asc)), counts)?
+            }
+            None => collect_ranked(searcher, query, top.order_by_score(), counts)?,
+        };
+        if let (Some(key), Some(window)) = (key, window) {
+            if let Some(total) = total {
+                self.page_cache.store_total(key, total);
+            }
+            if let Some(counts) = &book_counts {
+                self.page_cache
+                    .store_book_counts(key, Arc::new(counts.clone()));
+            }
+            let start = (offset as usize).min(addresses.len());
+            let end = (offset as usize + limit as usize).min(addresses.len());
+            let page = addresses[start..end].to_vec();
+            self.page_cache.store_ranked(key, slot, addresses, window);
+            addresses = page;
+        }
+        Ok(RankedPage {
+            addresses,
+            total: total.unwrap_or(0),
+            book_counts,
+        })
+    }
+
+    fn group_sort(&self, order: &ResultsOrder) -> Result<GroupSort> {
+        Ok(match self.order_sort(order)?.1 {
+            Some(sort) => GroupSort::Book(sort.tables, sort.kind),
+            None => GroupSort::ScoreDesc(self.order_tables()?.1),
+        })
+    }
+
+    /// The epoch of the order mapping `order` ranks by, and the sort it ranks with (`None`:
+    /// by score).
+    fn order_sort(&self, order: &ResultsOrder) -> Result<(u64, Option<BookOrderSort>)> {
+        let kind = match order {
+            ResultsOrder::Catalogue => OrderKind::Catalogue,
+            ResultsOrder::Generation => OrderKind::Generation,
+            ResultsOrder::Relevance => return Ok((self.order_epoch(), None)),
+        };
+        let (epoch, tables) = self.order_tables()?;
+        Ok((epoch, Some(BookOrderSort { tables, kind })))
     }
 
     /// מריץ את שאילתת החיפוש עם [`GroupCollector`] וגוזר את עמוד הקבוצות
@@ -12635,6 +13835,7 @@ impl SearchEngine {
     /// O(קבוצות), קצוץ ב-[`GROUP_COLLECTOR_MAX_GROUPS`] — בניגוד לספירות,
     /// שמחזיקות מונה-לספר בלבד.
     fn collect_grouped(
+        &self,
         searcher: &Searcher,
         query: &dyn Query,
         grouping: &ResultGrouping,
@@ -12642,7 +13843,7 @@ impl SearchEngine {
         offset: u32,
         order: &ResultsOrder,
     ) -> Result<GroupedPage> {
-        let collector = GroupCollector::new(grouping, order);
+        let collector = GroupCollector::new(grouping, self.group_sort(order)?);
         searcher.search(query, &collector)?;
         Ok(Self::finalize_grouped(collector.take_hits(), limit, offset))
     }
@@ -12657,7 +13858,7 @@ impl SearchEngine {
             .skip(offset as usize)
             .take(limit as usize)
             .map(|g| GroupedRep {
-                id: g.best.1,
+                id: g.best.3,
                 address: g.best.2,
                 count: g.count,
                 siblings: g.siblings.iter().map(|s| s.2).collect(),
@@ -12705,6 +13906,7 @@ impl SearchEngine {
         )?;
         let rep_by_id: HashMap<u64, &GroupedRep> = page.reps.iter().map(|r| (r.id, r)).collect();
         let fields = SiblingFields::resolve(schema)?;
+        let mut loader = DocumentLoader::new(searcher);
         for result in &mut results {
             let Some(rep) = rep_by_id.get(&result.id) else {
                 continue;
@@ -12713,7 +13915,9 @@ impl SearchEngine {
             result.merged = rep
                 .siblings
                 .iter()
-                .filter_map(|addr| Self::fetch_merged_sibling(&fields, searcher, *addr).transpose())
+                .filter_map(|addr| {
+                    Self::fetch_merged_sibling(&fields, &mut loader, *addr).transpose()
+                })
                 .collect::<Result<Vec<_>>>()?;
         }
         Ok(results)
@@ -12723,10 +13927,10 @@ impl SearchEngine {
     /// מסמך שאינו ניתן לקריאה נשמט בשקט מהרשימה (המונה כבר ספר אותו).
     fn fetch_merged_sibling(
         fields: &SiblingFields,
-        searcher: &Searcher,
+        loader: &mut DocumentLoader<'_>,
         address: DocAddress,
     ) -> Result<Option<MergedSibling>> {
-        let doc = match searcher.doc::<TantivyDocument>(address) {
+        let doc = match loader.load(address) {
             Ok(d) => d,
             Err(e) => {
                 log::error!(
@@ -12789,74 +13993,101 @@ impl SearchEngine {
         custom_spacing: HashMap<String, String>,
         alternative_words: HashMap<u32, Vec<String>>,
         search_options: HashMap<String, HashMap<String, bool>>,
+        any_order: Option<bool>,
     ) -> Result<Option<HighlightPattern>> {
-        let advanced = hebrew_query::prepare_advanced_query(
-            &query,
-            distance,
-            &custom_spacing,
-            &alternative_words,
-            &search_options,
-        );
         let searcher = self.index_reader.searcher();
+        let key = format!(
+            "advanced {query:?} {distance} {:?} {:?} {:?} {any_order:?}",
+            custom_spacing.iter().collect::<BTreeMap<_, _>>(),
+            alternative_words.iter().collect::<BTreeMap<_, _>>(),
+            search_options
+                .iter()
+                .map(|(word, options)| (word, options.iter().collect::<BTreeMap<_, _>>()))
+                .collect::<BTreeMap<_, _>>(),
+        );
+        let pattern =
+            self.highlight_cache
+                .pattern(searcher.generation().generation_id(), key, || {
+                    self.compute_index_highlight_pattern(
+                        &searcher,
+                        &query,
+                        distance,
+                        &custom_spacing,
+                        &alternative_words,
+                        &search_options,
+                        any_order,
+                    )
+                })?;
+        Ok(pattern.map(|pattern| pattern.to_api()))
+    }
 
-        // Per word: compile the word's branches and collect the index terms
-        // they match. `automaton_highlight_terms` splits its budget across the
-        // word's branches, so a wide word (partial + typo) still spreads its
-        // term allowance over all variants instead of exhausting it on the
-        // first branch; the display char budget bounds the final pattern size.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_index_highlight_pattern(
+        &self,
+        _searcher: &Searcher,
+        query: &str,
+        distance: u32,
+        custom_spacing: &HashMap<String, String>,
+        alternative_words: &HashMap<u32, Vec<String>>,
+        search_options: &HashMap<String, HashMap<String, bool>>,
+        any_order: Option<bool>,
+    ) -> Result<Option<DisplayPattern>> {
+        let advanced = hebrew_query::prepare_advanced_query(
+            query,
+            distance,
+            custom_spacing,
+            alternative_words,
+            search_options,
+        );
+
+        // Per word: the very term set the search serves — same automata, same
+        // ranking, same budgets (the phrase degrade path's for a multi-word
+        // query, which keep a superset of the scoped paths' ranked prefix) —
+        // so every form a result was found by is painted. A word whose
+        // branches fail to compile paints the query shape instead.
+        let text_field = self.schema.get_field("text")?;
+        let single = advanced.regex_terms.len() == 1;
+        let (max_terms, postings_budget) = if single {
+            (advanced.max_expansions, SINGLE_WORD_POSTINGS_BUDGET)
+        } else {
+            (
+                PHRASE_POSITION_MAX_EXPANSIONS.max(advanced.max_expansions),
+                PHRASE_POSITION_POSTINGS_BUDGET,
+            )
+        };
         let mut per_word_terms: Vec<Vec<String>> = Vec::with_capacity(advanced.regex_terms.len());
         for word_pattern in &advanced.regex_terms {
-            let automatons: Vec<tantivy_fst::Regex> = word_pattern
-                .branches()
-                .iter()
-                .filter_map(|branch| match tantivy_fst::Regex::new(branch) {
-                    Ok(re) => Some(re),
-                    Err(e) => {
-                        // A branch the search itself would reject: skip it for
-                        // highlighting (the search surfaces the error), keep
-                        // painting what the remaining branches match.
-                        log::error!(
-                            "highlight branch failed to compile ({} chars): {e}",
-                            branch.chars().count()
-                        );
-                        None
-                    }
-                })
-                .collect();
-            let mut matched: HashSet<String> = if automatons.is_empty() {
-                HashSet::new()
-            } else {
-                self.automaton_highlight_terms(&searcher, &automatons)?
-            };
-            // Single-word typo path: the search expands typo coverage through
-            // Levenshtein-1 automatons, not regex branches — run the same
-            // scan here so a document found via any edit-distance-1 variant
-            // highlights that variant (search↔highlight parity).
-            if !advanced.typo_tokens.is_empty() {
-                let typo_automatons = advanced
-                    .typo_tokens
+            let typo_tokens: &[String] = if single { &advanced.typo_tokens } else { &[] };
+            let terms = match self.materialize_term_set(
+                word_pattern.branches(),
+                typo_tokens,
+                text_field,
+                max_terms,
+                postings_budget,
+            ) {
+                Ok(entry) => entry
+                    .terms
                     .iter()
-                    .map(|t| self.fuzzy_automaton(t, 1))
-                    .collect::<Result<Vec<_>>>()?;
-                matched.extend(self.automaton_highlight_terms(&searcher, &typo_automatons)?);
-            }
-            per_word_terms.push(matched.into_iter().collect());
+                    .filter_map(|t| t.value().as_str().map(str::to_string))
+                    .collect(),
+                Err(e) => {
+                    log::error!("highlight terms unavailable: {e}");
+                    Vec::new()
+                }
+            };
+            per_word_terms.push(terms);
         }
 
         Ok(display_highlight::build_display_highlight_from_terms(
-            &query,
+            query,
             distance,
-            &custom_spacing,
-            &alternative_words,
-            &search_options,
+            custom_spacing,
+            alternative_words,
+            search_options,
             &per_word_terms,
+            any_order.unwrap_or(false),
         )
-        .map(|hl| HighlightPattern {
-            combined_pattern: hl.combined_pattern,
-            word_patterns: hl.word_patterns,
-            word_boundary_eligible: hl.word_boundary_eligible,
-            matcher: Some(HighlightMatcher { plan: hl.matcher }),
-        }))
+        .map(DisplayPattern::from))
     }
 
     /// Fuzzy-mode counterpart of [`Self::generate_index_highlight_pattern`]:
@@ -12873,23 +14104,37 @@ impl SearchEngine {
             max_distance <= 2,
             "fuzzy highlight distance is limited to 2, got {max_distance}"
         );
-        let tokens = self.index_token_texts(&query)?;
+        let searcher = self.index_reader.searcher();
+        let pattern = self.highlight_cache.pattern(
+            searcher.generation().generation_id(),
+            format!("fuzzy {query:?} {max_distance}"),
+            || self.compute_index_fuzzy_highlight_pattern(&searcher, &query, max_distance),
+        )?;
+        Ok(pattern.map(|pattern| pattern.to_api()))
+    }
+
+    fn compute_index_fuzzy_highlight_pattern(
+        &self,
+        searcher: &Searcher,
+        query: &str,
+        max_distance: u8,
+    ) -> Result<Option<DisplayPattern>> {
+        let tokens = self.index_token_texts(query)?;
         // `build_display_highlight_from_terms` walks `split_query_words`;
         // the analyzer tokens are aligned with it by design, but if they ever
         // diverge, feeding misaligned terms would paint the wrong word — fall
         // back to the query-shape pattern instead.
-        let words = hebrew_query::split_query_words(&hebrew_query::normalize_for_index(&query));
+        let words = hebrew_query::split_query_words(&hebrew_query::normalize_for_index(query));
         let per_word_terms: Vec<Vec<String>> = if tokens.len() != words.len() {
             Vec::new()
         } else {
-            let searcher = self.index_reader.searcher();
             let mut collected = Vec::with_capacity(tokens.len());
             for token in &tokens {
                 let mut matched = if max_distance == 0 {
                     HashSet::new()
                 } else {
                     self.automaton_highlight_terms(
-                        &searcher,
+                        searcher,
                         &[self.fuzzy_automaton(token, max_distance)?],
                     )?
                 };
@@ -12906,28 +14151,23 @@ impl SearchEngine {
         };
 
         Ok(display_highlight::build_display_highlight_from_terms(
-            &query,
+            query,
             0,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &per_word_terms,
+            false,
         )
-        .map(|hl| HighlightPattern {
-            combined_pattern: hl.combined_pattern,
-            word_patterns: hl.word_patterns,
-            word_boundary_eligible: hl.word_boundary_eligible,
-            matcher: Some(HighlightMatcher { plan: hl.matcher }),
-        }))
+        .map(DisplayPattern::from))
     }
 
-    /// One index-term set per query word (in phrase order), each materialized by
-    /// streaming the term dictionary through that word's regex automaton — the
-    /// same FST scan the search uses, so the sets contain exactly the
-    /// morphological variants (prefixes, suffixes, alternatives) that genuinely
-    /// matched. The per-word budget split mirrors
-    /// [`Self::automaton_highlight_terms`], so their union equals the merged
-    /// highlight term set the flat query paints with.
+    /// One index-term set per query word (in phrase order), materialized like
+    /// the search's own term sets ([`Self::materialize_term_set`]: same
+    /// automata, same ranking), so the sets contain exactly the morphological
+    /// variants (prefixes, suffixes, alternatives) that genuinely matched.
+    /// [`MAX_HIGHLIGHT_TERMS`] is split evenly between the words; a word's
+    /// highest-ranked forms fill its share first.
     fn phrase_per_word_terms(
         &self,
         searcher: &Searcher,
@@ -12935,15 +14175,31 @@ impl SearchEngine {
         field: Field,
     ) -> Result<Vec<HashSet<String>>> {
         let cap = (MAX_HIGHLIGHT_TERMS / regex_terms.len().max(1)).max(1);
+        let generation = searcher.generation().generation_id();
         regex_terms
             .iter()
             .map(|pattern| {
-                let re = tantivy_fst::Regex::new(pattern)
-                    .map_err(|e| anyhow::anyhow!("invalid highlight regex {pattern:?}: {e}"))?;
-                Ok(self
-                    .automaton_terms_in_field(searcher, field, &re, cap)?
-                    .into_iter()
-                    .collect())
+                let terms =
+                    self.highlight_cache
+                        .term_set(generation, field, pattern, cap, || {
+                            let entry = self
+                                .materialize_term_set(
+                                    hebrew_query::WordPattern::parse(pattern).branches(),
+                                    &[],
+                                    field,
+                                    cap as u32,
+                                    u64::MAX,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!("invalid highlight regex {pattern:?}: {e}")
+                                })?;
+                            Ok(entry
+                                .terms
+                                .iter()
+                                .filter_map(|t| t.value().as_str().map(str::to_string))
+                                .collect())
+                        })?;
+                Ok(terms.iter().cloned().collect())
             })
             .collect()
     }
@@ -12957,11 +14213,9 @@ impl SearchEngine {
         per_word_terms: &[HashSet<String>],
         text_f: Field,
     ) -> Result<Option<Box<dyn Query>>> {
-        let terms: Vec<Term> = per_word_terms
-            .iter()
-            .flat_map(|set| set.iter())
-            .map(|t| Term::from_field_text(text_f, t))
-            .collect();
+        let words: Vec<&String> = per_word_terms.iter().flatten().collect();
+        let searcher = self.index_reader.searcher();
+        let terms = quote_expansion::spelling_terms(&searcher, text_f, &words)?;
         Ok((!terms.is_empty()).then(|| Box::new(TermSetQuery::new(terms)) as Box<dyn Query>))
     }
 
@@ -12992,7 +14246,7 @@ impl SearchEngine {
         &self,
         searcher: &Searcher,
         regex_terms: &[String],
-        gaps: &[u32],
+        proximity: &Proximity,
         voc: &VocalizedFlags,
         scope: &SearchScope,
         match_mode: &WordMatch,
@@ -13003,7 +14257,7 @@ impl SearchEngine {
         let partial = !matches!(match_mode, WordMatch::All);
         match scope {
             SearchScope::WordDistance if !partial => {
-                self.advanced_highlight_plan(searcher, regex_terms, gaps, voc, acronym_alts)
+                self.advanced_highlight_plan(searcher, regex_terms, proximity, voc, acronym_alts)
             }
             _ => {
                 if regex_terms.len() < 2 && acronym_alts.is_empty() {
@@ -13027,7 +14281,7 @@ impl SearchEngine {
         &self,
         searcher: &Searcher,
         regex_terms: &[String],
-        gaps: &[u32],
+        proximity: &Proximity,
         voc: &VocalizedFlags,
         acronym_alts: &[Vec<String>],
     ) -> Result<HighlightPlan> {
@@ -13036,9 +14290,9 @@ impl SearchEngine {
         }
         let field = self.search_text_field(voc)?;
         let analyzer = if voc.any() {
-            "hebrew_vocalized"
+            VOCALIZED_DISPLAY_ANALYZER
         } else {
-            "hebrew"
+            DISPLAY_ANALYZER
         };
         let per_word_terms = self.phrase_per_word_terms(searcher, regex_terms, field)?;
         let mut all_word_sets = per_word_terms.clone();
@@ -13047,7 +14301,7 @@ impl SearchEngine {
             let alt_terms = self.phrase_per_word_terms(searcher, alt, field)?;
             all_word_sets.extend(alt_terms.iter().cloned());
             alternatives.push(PhraseHighlight {
-                gaps: vec![0; alt_terms.len().saturating_sub(1)],
+                proximity: Proximity::adjacent(alt_terms.len()),
                 per_word_terms: alt_terms,
                 analyzer,
                 cross_line: !voc.any(),
@@ -13060,9 +14314,10 @@ impl SearchEngine {
         // detect and render a match that continues on the next line.
         let phrase = Some(PhraseHighlight {
             per_word_terms,
-            gaps: gaps.to_vec(),
+            proximity: proximity.clone(),
             analyzer,
-            cross_line: !voc.any(),
+            // As in the query: an any-order match never continues across lines.
+            cross_line: !voc.any() && !proximity.is_any_order(),
             alternatives,
             allow_term_fallback: true,
         });
@@ -13097,13 +14352,12 @@ impl SearchEngine {
             let field = self.schema.get_field("textVocalized")?;
             let per_word_terms = self.phrase_per_word_terms(searcher, &patterns, field)?;
             let query = self.terms_query_from_word_sets(&per_word_terms, field)?;
-            let gaps = vec![0; per_word_terms.len().saturating_sub(1)];
             return Ok(HighlightPlan {
                 query,
                 phrase: Some(PhraseHighlight {
+                    proximity: Proximity::adjacent(per_word_terms.len()),
                     per_word_terms,
-                    gaps,
-                    analyzer: "hebrew_vocalized",
+                    analyzer: VOCALIZED_DISPLAY_ANALYZER,
                     cross_line: false,
                     alternatives: Vec::new(),
                     allow_term_fallback: true,
@@ -13116,13 +14370,12 @@ impl SearchEngine {
         }
         let per_word_terms: Vec<HashSet<String>> =
             tokens.into_iter().map(|t| HashSet::from([t])).collect();
-        let gaps = vec![0; per_word_terms.len().saturating_sub(1)];
         Ok(HighlightPlan {
             query: None,
             phrase: Some(PhraseHighlight {
+                proximity: Proximity::adjacent(per_word_terms.len()),
                 per_word_terms,
-                gaps,
-                analyzer: "hebrew",
+                analyzer: DISPLAY_ANALYZER,
                 cross_line: true,
                 alternatives: Vec::new(),
                 allow_term_fallback: true,
@@ -13154,9 +14407,9 @@ impl SearchEngine {
             };
         }
         let (query_analyzer, analyzer) = if voc.any() {
-            ("hebrew_vocalized_query", "hebrew_vocalized")
+            ("hebrew_vocalized_query", VOCALIZED_DISPLAY_ANALYZER)
         } else {
-            ("hebrew_query", "hebrew")
+            ("hebrew_query", DISPLAY_ANALYZER)
         };
         let field = self.search_text_field(voc)?;
         let mut outside = self.index_token_texts_with(query_analyzer, query)?;
@@ -13188,7 +14441,7 @@ impl SearchEngine {
             }
             all_word_sets.extend(per_word_terms.iter().cloned());
             variants.push(PhraseHighlight {
-                gaps: vec![0; per_word_terms.len().saturating_sub(1)],
+                proximity: Proximity::adjacent(per_word_terms.len()),
                 per_word_terms,
                 analyzer,
                 cross_line: false,
@@ -13238,7 +14491,7 @@ impl SearchEngine {
             all_word_sets.push(terms.clone());
             variants.push(PhraseHighlight {
                 per_word_terms: vec![terms],
-                gaps: Vec::new(),
+                proximity: Proximity::Ordered(Vec::new()),
                 analyzer,
                 cross_line: false,
                 alternatives: Vec::new(),
@@ -13278,8 +14531,8 @@ impl SearchEngine {
             let gaps = vec![LEXICAL_FUZZY_PHRASE_SLOP; per_word_terms.len().saturating_sub(1)];
             Some(PhraseHighlight {
                 per_word_terms,
-                gaps,
-                analyzer: "hebrew",
+                proximity: Proximity::Ordered(gaps),
+                analyzer: DISPLAY_ANALYZER,
                 cross_line: false,
                 alternatives: Vec::new(),
                 allow_term_fallback: true,
@@ -13408,10 +14661,8 @@ impl SearchEngine {
             }
         }
 
-        let terms: Vec<Term> = matched
-            .into_iter()
-            .map(|t| Term::from_field_text(text_f, &t))
-            .collect();
+        let matched: Vec<String> = matched.into_iter().collect();
+        let terms = quote_expansion::spelling_terms(searcher, text_f, &matched)?;
         Ok(Box::new(TermSetQuery::new(terms)))
     }
 
@@ -13495,7 +14746,10 @@ impl SearchEngine {
         let mut seen = HashSet::new();
         'segments: for reader in searcher.segment_readers() {
             let inverted = reader.inverted_index(text_f)?;
-            let mut stream = inverted.terms().search(automaton).into_stream()?;
+            let mut stream = inverted
+                .terms()
+                .search(QuoteTransparent::new(automaton))
+                .into_stream()?;
             while stream.advance() {
                 if let Ok(term) = std::str::from_utf8(stream.key()) {
                     // contains-before-insert: a term already seen in an
@@ -13523,21 +14777,55 @@ impl SearchEngine {
         text_field: Field,
         hl: &HighlightConfig,
     ) -> Result<SnippetGenerator> {
-        let mut snippet_generator = SnippetGenerator::create(searcher, query, text_field)?;
-        snippet_generator.set_max_num_chars(hl.max_chars as usize);
-        Ok(snippet_generator)
+        // `SnippetGenerator::create` with the display analyzer instead of the field's:
+        // a term reached through its quote-free spelling paints the quoted word.
+        let mut terms = std::collections::BTreeSet::new();
+        query.query_terms(&mut |term, _| {
+            if term.field() == text_field {
+                terms.insert(term.clone());
+            }
+        });
+        let mut terms_text = std::collections::BTreeMap::new();
+        for term in terms {
+            let Some(text) = term.value().as_str().map(str::to_string) else {
+                continue;
+            };
+            let doc_freq = searcher.doc_freq(&term)?;
+            if doc_freq > 0 {
+                terms_text.insert(text, 1.0 / (1.0 + doc_freq as Score));
+            }
+        }
+        let vocalized = text_field == searcher.schema().get_field("textVocalized")?;
+        let analyzer = if vocalized {
+            VOCALIZED_DISPLAY_ANALYZER
+        } else {
+            DISPLAY_ANALYZER
+        };
+        let tokenizer = searcher
+            .index()
+            .tokenizers()
+            .get(analyzer)
+            .with_context(|| format!("{analyzer} is not registered"))?;
+        Ok(SnippetGenerator::new(
+            terms_text,
+            tokenizer,
+            text_field,
+            hl.max_chars as usize,
+        ))
     }
 
-    /// Re-derives a snippet's highlight markup so only complete, in-order
-    /// phrase occurrences stay painted (see [`PhraseHighlight`]).
+    /// Re-derives a snippet's highlight markup so only complete phrase
+    /// occurrences under the phrase's [`Proximity`] stay painted (see
+    /// [`PhraseHighlight`]).
     ///
     /// Tokenizes the fragment with the same `text`-field analyzer the index and
     /// `SnippetGenerator` use, tags each token with the query words it can fill,
-    /// then keeps the byte ranges of tokens forming an occurrence
-    /// `w0 … w1 … w_{k-1}` where each adjacent pair `w-1, w` is at most
-    /// `gaps[w-1]` intermediate tokens apart. Selects the leftmost complete,
+    /// then keeps the byte ranges of tokens forming an occurrence. Ordered: an
+    /// occurrence `w0 … w1 … w_{k-1}` where each adjacent pair `w-1, w` is at
+    /// most `gaps[w-1]` intermediate tokens apart — the leftmost complete,
     /// non-overlapping matches, retaining a candidate only when its entire
-    /// phrase suffix can be completed.
+    /// phrase suffix can be completed. Any order: every word at its own token
+    /// within one window — the earliest-ending, non-overlapping windows.
     ///
     /// Returns `None` when the fragment holds no complete occurrence, so the
     /// caller falls back to the plain term highlight instead of painting
@@ -13622,6 +14910,46 @@ impl SearchEngine {
             }
         }
 
+        let gaps = match &phrase.proximity {
+            Proximity::Ordered(gaps) => gaps,
+            &Proximity::AnyOrder { max_span } => {
+                // By position, then token: a shared position paints its first token.
+                let mut cells = Vec::new();
+                for (w, word_candidates) in by_word.iter().enumerate() {
+                    cells.extend(
+                        word_candidates
+                            .iter()
+                            .map(|&ci| (candidates[ci].order, ci, w)),
+                    );
+                }
+                cells.sort_unstable();
+                let mut windows = WordWindows::default();
+                windows.reset(word_count);
+                let mut slots = Vec::new();
+                for (order, ci, w) in cells {
+                    let Ok(at) = u32::try_from(order) else {
+                        break;
+                    };
+                    if windows.push(at, w).is_some() {
+                        slots.push(ci);
+                    }
+                }
+                let mut ranges = Vec::new();
+                let mut assignment = Vec::new();
+                let mut from = 0;
+                while let Some(last) = windows.next_window(from, max_span, &mut assignment) {
+                    let occurrence = ranges.len();
+                    ranges.extend(assignment.iter().enumerate().map(|(w, &entry)| {
+                        let candidate = &candidates[slots[windows.slot(entry, w)]];
+                        (candidate.from, candidate.to)
+                    }));
+                    // Callers take an occurrence's first and last range as its edges.
+                    ranges[occurrence..].sort_unstable();
+                    from = last + 1;
+                }
+                return (!ranges.is_empty()).then_some(ranges);
+            }
+        };
         // Layer w stores only candidates able to complete words w..end and
         // the earliest viable continuation in layer w+1. A monotone cursor
         // finds that continuation in linear time per layer. Unlike greedily
@@ -13632,7 +14960,7 @@ impl SearchEngine {
         let mut layers: Vec<Vec<(usize, usize)>> = vec![Vec::new(); word_count];
         layers[word_count - 1] = by_word[word_count - 1].iter().map(|&ci| (ci, 0)).collect();
         for w in (0..word_count - 1).rev() {
-            let max_step = (phrase.gaps.get(w).copied().unwrap_or(0) as usize).saturating_add(1);
+            let max_step = (gaps.get(w).copied().unwrap_or(0) as usize).saturating_add(1);
             let next = &layers[w + 1];
             let mut cursor = 0;
             let mut viable = Vec::new();
@@ -13772,8 +15100,9 @@ impl SearchEngine {
         let file_path_field = schema.get_field("filePath")?;
 
         let mut documents = Vec::with_capacity(addresses.len());
+        let mut loader = DocumentLoader::new(searcher);
         for doc_address in addresses {
-            match searcher.doc::<TantivyDocument>(doc_address) {
+            match loader.load(doc_address) {
                 Ok(d) => documents.push((doc_address, d)),
                 Err(e) => {
                     // A hit the collectors counted but the doc store cannot
@@ -13882,8 +15211,10 @@ impl SearchEngine {
         phrase: &PhraseHighlight,
     ) -> Result<Vec<Option<String>>> {
         let id_field = schema.get_field("id")?;
+        let file_path_field = schema.get_field("filePath")?;
         let mut out = vec![None; documents.len()];
         let mut next_documents = Vec::new();
+        let mut loader = DocumentLoader::new(searcher);
         let mut slots = Vec::new();
         for (slot, ((address, document), text)) in documents.iter().zip(texts).enumerate() {
             if text.status != TextStatus::Ok
@@ -13905,16 +15236,44 @@ impl SearchEngine {
             if !ends_open {
                 continue;
             }
-            let next_query = TermQuery::new(
-                Term::from_field_u64(id_field, id + 1),
-                IndexRecordOption::Basic,
-            );
-            let Some((_, next)) = searcher
-                .search(&next_query, &TopDocs::with_limit(1).order_by_score())?
-                .into_iter()
-                .next()
-            else {
-                continue;
+            // By the book too: two books' lines can share an id (see `address_in_book`).
+            let file_path = document
+                .get_first(file_path_field)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let reader = searcher.segment_reader(address.segment_ord);
+            let paths = reader.fast_fields().str("filePath")?;
+            let book_of = |doc| paths.as_ref().and_then(|p| p.term_ords(doc).next());
+            let beside = crate::id_lookup::neighbour(
+                reader,
+                &reader.fast_fields().u64("id")?,
+                address.doc_id,
+                id + 1,
+            )
+            .filter(|&doc| book_of(doc) == book_of(address.doc_id))
+            .map(|doc| DocAddress::new(address.segment_ord, doc));
+            let next = match beside {
+                Some(next) => next,
+                None => {
+                    let next_query = BooleanQuery::new(vec![
+                        (
+                            Occur::Must,
+                            Box::new(TermQuery::new(
+                                Term::from_field_text(file_path_field, file_path),
+                                IndexRecordOption::Basic,
+                            )) as Box<dyn Query>,
+                        ),
+                        (Occur::Must, Box::new(IdSetQuery::new([id + 1]))),
+                    ]);
+                    let Some((_, next)) = searcher
+                        .search(&next_query, &TopDocs::with_limit(1).order_by_score())?
+                        .into_iter()
+                        .next()
+                    else {
+                        continue;
+                    };
+                    next
+                }
             };
             let starts_open = searcher
                 .segment_reader(next.segment_ord)
@@ -13923,7 +15282,7 @@ impl SearchEngine {
                 .first(next.doc_id)
                 .is_some_and(|v| v > 0);
             if starts_open {
-                next_documents.push((next, searcher.doc::<TantivyDocument>(next)?));
+                next_documents.push((next, loader.load(next)?));
                 slots.push(slot);
             }
         }
@@ -14005,6 +15364,7 @@ impl SearchEngine {
 
         struct Pending {
             slot: usize,
+            source: crate::line_source::Source,
             key: crate::line_source::LineKey,
             line_check: Option<u32>,
             line_hash: u64,
@@ -14029,8 +15389,8 @@ impl SearchEngine {
                 .get_first(file_path_f)
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let Some(book_id) = library_book_id(file_path) else {
-                log::warn!("document without stored text has no library book id: {file_path:?}");
+            let Some((source, book_id)) = line_source_book(file_path) else {
+                log::warn!("document without stored text has no line-source book: {file_path:?}");
                 continue;
             };
             let ordinal = document
@@ -14046,6 +15406,7 @@ impl SearchEngine {
             };
             pending.push(Pending {
                 slot,
+                source,
                 key: crate::line_source::LineKey { book_id, ordinal },
                 line_check: check_column
                     .first(address.doc_id)
@@ -14057,29 +15418,39 @@ impl SearchEngine {
             return Ok(out);
         }
 
-        let keys: Vec<_> = pending.iter().map(|p| p.key).collect();
-        let checks: Vec<_> = pending.iter().map(|p| p.line_check).collect();
-        let rows = match crate::line_source::with_store(|store| store.fetch_window(&keys, &checks))
-        {
-            Ok(rows) => rows,
-            Err(reason) => {
-                debug!(
-                    "library text unavailable for {} hit(s): {reason:?}",
-                    keys.len()
-                );
-                return Ok(out);
+        // One transaction per source, one after the other: never two mutexes at once.
+        for source in crate::line_source::Source::all() {
+            let pending: Vec<&Pending> = pending.iter().filter(|p| p.source == source).collect();
+            if pending.is_empty() {
+                continue;
             }
-        };
-        // Normalizing a window's rows is most of its cost; a lone row is not worth the hop.
-        use rayon::prelude::*;
-        let hits: Vec<HitText> = pending
-            .par_iter()
-            .zip(rows.into_par_iter())
-            .with_min_len(LIBRARY_ROWS_PER_TASK)
-            .map(|(p, row)| HitText::from_library_row(row, p.line_check, p.line_hash, vocalized))
-            .collect();
-        for (p, hit) in pending.iter().zip(hits) {
-            out[p.slot] = hit;
+            let keys: Vec<_> = pending.iter().map(|p| p.key).collect();
+            let checks: Vec<_> = pending.iter().map(|p| p.line_check).collect();
+            let rows = match crate::line_source::with_store(source, |store| {
+                store.fetch_window(&keys, &checks)
+            }) {
+                Ok(rows) => rows,
+                Err(reason) => {
+                    debug!(
+                        "{source:?} text unavailable for {} hit(s): {reason:?}",
+                        keys.len()
+                    );
+                    continue;
+                }
+            };
+            // Normalizing a window's rows is most of its cost; a lone row is not worth the hop.
+            use rayon::prelude::*;
+            let hits: Vec<HitText> = pending
+                .par_iter()
+                .zip(rows.into_par_iter())
+                .with_min_len(LIBRARY_ROWS_PER_TASK)
+                .map(|(p, row)| {
+                    HitText::from_library_row(row, p.line_check, p.line_hash, vocalized)
+                })
+                .collect();
+            for (p, hit) in pending.iter().zip(hits) {
+                out[p.slot] = hit;
+            }
         }
         Ok(out)
     }
@@ -14198,6 +15569,594 @@ impl HighlightConfig {
     }
 }
 
+/// Which counts a ranked page is collected with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageCounts {
+    None,
+    Total,
+    TotalAndBooks,
+}
+
+struct RankedPage {
+    addresses: Vec<DocAddress>,
+    /// 0 unless counted.
+    total: u32,
+    book_counts: Option<HashMap<String, u32>>,
+}
+
+/// `top` with the counts `counts` asks for, in one pass.
+#[allow(clippy::type_complexity)]
+fn collect_ranked<C, K>(
+    searcher: &Searcher,
+    query: &dyn Query,
+    top: C,
+    counts: PageCounts,
+) -> Result<(Vec<DocAddress>, Option<u32>, Option<HashMap<String, u32>>)>
+where
+    C: Collector<Fruit = Vec<(K, DocAddress)>>,
+{
+    let addresses = |hits: Vec<(K, DocAddress)>| hits.into_iter().map(|(_, a)| a).collect();
+    Ok(match counts {
+        PageCounts::None => (addresses(searcher.search(query, &top)?), None, None),
+        PageCounts::Total => {
+            let (hits, total) = searcher.search(query, &(top, Count))?;
+            (addresses(hits), Some(total as u32), None)
+        }
+        PageCounts::TotalAndBooks => {
+            let (hits, total, books) = searcher.search(query, &(top, Count, BookCountCollector))?;
+            (addresses(hits), Some(total as u32), Some(books))
+        }
+    })
+}
+
+// ── User regex (`/…/`) ─────────────────────────────────────────────────────────
+//
+// The engine side of a regular expression the user types wrapped in slashes; the work is in
+// `crate::user_regex`. The application calls [`parse_user_regex`] on every query that is
+// wrapped in `/…/`: `Invalid` means "search the text as ordinary words", any other kind is
+// searched with the `*_user_regex*` family below, each call taking a
+// [`UserRegexCancellationToken`]. A cross-space pattern may read whole books, so its counts
+// arrive with the stream's last event, and the count/facet calls after a finished stream are
+// answered from its cached result.
+
+/// How a `/…/` pattern is searched (see [`parse_user_regex`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserRegexKind {
+    /// Not usable as a regex (not wrapped, syntax, too complex): search it as plain text.
+    Invalid,
+    /// No whitespace: matched against whole index terms (`/מש.ה/`, `/[א-ת]+ים/`).
+    SingleWord,
+    /// Words separated by a space or `\s+`: an adjacent phrase of term patterns, which may
+    /// continue onto the next line (`/(משה|אהרן) רבנו/`).
+    WordSequence,
+    /// Anything else that spans a space: matched against each line's text (`/שמע .* ישראל/`).
+    CrossSpace,
+}
+
+/// What [`parse_user_regex`] made of a query.
+pub struct UserRegexPlan {
+    pub kind: UserRegexKind,
+    /// The pattern as searched: without `/…/` and edge anchors, folded like the index text
+    /// (no nikud, ASCII quotes, maqaf as a space). Empty when `Invalid`.
+    pub pattern: String,
+    /// The pattern of each word, for `SingleWord` (one) and `WordSequence`; empty otherwise.
+    pub words: Vec<String>,
+    /// Why the query is `Invalid`.
+    pub reason: Option<String>,
+}
+
+/// Classifies a query typed as `/pattern/`. Cheap and synchronous: parsing plus a
+/// size-limited compile, never more than a few milliseconds whatever the pattern.
+///
+/// Rules: the outer `/…/` and `^`, `$`, `\b` at the pattern's edges are dropped (a term
+/// pattern matches whole terms, a cross-space one starts and ends on a word boundary when
+/// its edge is a letter). `.` and negated classes never cross a space by themselves; only
+/// explicit whitespace (a space, `\s`, `\W`, a class of spaces) makes a pattern
+/// cross-space — as do an inner anchor, and a sequence word that names no letter (`.*`).
+/// Matching ignores case and nikud; geresh/gershayim match their ASCII forms.
+#[frb(sync)]
+pub fn parse_user_regex(raw: String) -> UserRegexPlan {
+    match crate::user_regex::parse(&raw) {
+        Ok(regex) => UserRegexPlan {
+            kind: regex.kind.api(),
+            words: regex.parts.iter().map(|p| p.pattern.clone()).collect(),
+            pattern: regex.pattern,
+            reason: None,
+        },
+        Err(reason) => UserRegexPlan {
+            kind: UserRegexKind::Invalid,
+            pattern: String::new(),
+            words: Vec::new(),
+            reason: Some(reason),
+        },
+    }
+}
+
+/// Finds a `/…/` pattern in displayed book text (markup and nikud included); see
+/// [`prepare_user_regex_matcher`].
+#[frb(opaque)]
+pub struct UserRegexMatcher {
+    inner: crate::user_regex::DisplayMatcher,
+}
+
+impl UserRegexMatcher {
+    /// Every match in `data` (one line of the book, HTML as shown), in UTF-16 units, with
+    /// one word range per word of a `WordSequence`.
+    #[frb(sync)]
+    pub fn find_matches(&self, data: String) -> Vec<HighlightMatch> {
+        convert_highlight_matches(self.inner.find(&data))
+    }
+}
+
+/// The book-view matcher of a `/…/` query, compiled once; `None` when it is `Invalid`.
+#[frb(sync)]
+pub fn prepare_user_regex_matcher(raw: String) -> Option<UserRegexMatcher> {
+    let regex = crate::user_regex::parse(&raw).ok()?;
+    crate::user_regex::DisplayMatcher::new(&regex).map(|inner| UserRegexMatcher { inner })
+}
+
+/// Stops a `*_user_regex*` call. Opaque and borrowed, like [`SemanticCancellationToken`]:
+/// Dart keeps the object and [`Self::cancel`] reaches the running search, which looks at it
+/// while collecting terms, between verified batches and between the books it reads. One
+/// token per search; a cancelled one stays cancelled.
+#[frb(opaque)]
+pub struct UserRegexCancellationToken {
+    flag: std::sync::atomic::AtomicBool,
+}
+
+impl UserRegexCancellationToken {
+    #[frb(sync)]
+    pub fn new() -> Self {
+        Self {
+            flag: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Returns at once; the search stops at its next look.
+    #[frb(sync)]
+    pub fn cancel(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[frb(sync, getter)]
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for UserRegexCancellationToken {
+    #[frb(ignore)]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The match ranges of one result of a cross-space search.
+pub struct UserRegexLineMatches {
+    /// UTF-16 ranges in the result's whole line as [`SearchEngine::get_document_by_id`]
+    /// returns its `text` (the snippet is already painted). Empty for term kinds: their
+    /// snippets are painted, and [`UserRegexMatcher`] finds them in the book.
+    pub ranges: Vec<HighlightRange>,
+}
+
+/// One event of [`SearchEngine::search_user_regex_stream`].
+///
+/// The last event has `done` set and carries the final `total_count`/`book_counts` and
+/// `truncated` (and `cancelled` when the token stopped it). Term kinds also send their counts
+/// first, before the results, as the other streams do; a cross-space search reports
+/// `progress_done`/`progress_total` (candidate lines, or books read) and `found_so_far`
+/// while it runs, and the page's results as soon as they are found.
+pub struct UserRegexStreamUpdate {
+    pub kind: UserRegexKind,
+    pub results: Vec<SearchResult>,
+    /// One entry per result, in order.
+    pub match_ranges: Vec<UserRegexLineMatches>,
+    pub total_count: Option<u32>,
+    pub book_counts: Option<HashMap<String, u32>>,
+    pub found_so_far: u32,
+    pub progress_done: u32,
+    pub progress_total: u32,
+    /// Partial: a term budget ran out, more than `MAX_LINE_HITS` lines matched, or some lines
+    /// could not be read (the library database suspended or busy).
+    pub truncated: bool,
+    pub done: bool,
+    pub cancelled: bool,
+}
+
+/// A term pattern's query, whether a budget truncated it, and each word's terms.
+type UserRegexTermQuery = (Box<dyn Query>, bool, Vec<Arc<Vec<String>>>);
+
+/// Terms one word of a `SingleWord` pattern may expand to before it is truncated.
+const USER_REGEX_WORD_MAX_TERMS: u32 = 10_000;
+
+impl SearchEngine {
+    /// Results of a `/…/` query in the order asked for (a cross-space pattern is always in
+    /// catalogue order), `limit` from `offset`, in chunks of `chunk_size`, as
+    /// [`UserRegexStreamUpdate`] events. Grouping is not offered. An invalid pattern is an
+    /// error event; check [`parse_user_regex`] first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_user_regex_stream(
+        &self,
+        raw: String,
+        facets: Vec<String>,
+        limit: u32,
+        offset: u32,
+        order: ResultsOrder,
+        chunk_size: u32,
+        cancellation: &UserRegexCancellationToken,
+        sink: StreamSink<UserRegexStreamUpdate>,
+    ) -> Result<()> {
+        let mut emit = |update: UserRegexStreamUpdate| sink.add(update).is_ok();
+        let result = self.user_regex_stream_into(
+            &raw,
+            &facets,
+            limit,
+            offset,
+            &order,
+            chunk_size,
+            &cancellation.flag,
+            &mut emit,
+        );
+        Self::surface_stream_error(&sink, result)
+    }
+
+    /// [`Self::search_user_regex_stream`] into `emit`, which returns `false` once nobody
+    /// listens.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn user_regex_stream_into(
+        &self,
+        raw: &str,
+        facets: &[String],
+        limit: u32,
+        offset: u32,
+        order: &ResultsOrder,
+        chunk_size: u32,
+        cancel: &std::sync::atomic::AtomicBool,
+        emit: &mut dyn FnMut(UserRegexStreamUpdate) -> bool,
+    ) -> Result<()> {
+        let regex = Self::user_regex(raw)?;
+        let searcher = self.index_reader.searcher();
+        if regex.kind == crate::user_regex::RegexKind::Line {
+            let ctx = self.user_regex_line_search(&searcher, facets, cancel)?;
+            let hl = HighlightConfig::default();
+            let page = crate::user_regex::Page {
+                offset,
+                limit,
+                chunk_size,
+                highlight_prefix: hl.highlight_prefix,
+                highlight_postfix: hl.highlight_postfix,
+                max_chars: hl.max_chars,
+            };
+            crate::user_regex::run_line_search(&ctx, &regex, Some(&page), emit)?;
+            return Ok(());
+        }
+        self.user_regex_term_stream(
+            &searcher, &regex, facets, limit, offset, order, chunk_size, cancel, emit,
+        )
+    }
+
+    /// Lines a `/…/` query matches. A cancelled call is an error.
+    pub fn count_user_regex(
+        &self,
+        raw: String,
+        facets: Vec<String>,
+        cancellation: &UserRegexCancellationToken,
+    ) -> Result<CountResult> {
+        let regex = Self::user_regex(&raw)?;
+        let searcher = self.index_reader.searcher();
+        if regex.kind == crate::user_regex::RegexKind::Line {
+            let outcome = self.user_regex_line_outcome(&searcher, &regex, &facets, cancellation)?;
+            return Ok(CountResult {
+                count: outcome.count(),
+                truncated: outcome.truncated,
+            });
+        }
+        let (query, truncated, _) =
+            self.user_regex_term_query(&searcher, &regex, &facets, &cancellation.flag)?;
+        Ok(CountResult {
+            count: searcher.search(&*query, &Count)? as u32,
+            truncated,
+        })
+    }
+
+    /// Lines a `/…/` query matches per `filePath`. A cancelled call is an error.
+    pub fn count_by_book_user_regex(
+        &self,
+        raw: String,
+        facets: Vec<String>,
+        cancellation: &UserRegexCancellationToken,
+    ) -> Result<BookCountResult> {
+        let regex = Self::user_regex(&raw)?;
+        let searcher = self.index_reader.searcher();
+        if regex.kind == crate::user_regex::RegexKind::Line {
+            let outcome = self.user_regex_line_outcome(&searcher, &regex, &facets, cancellation)?;
+            return Ok(BookCountResult {
+                counts: outcome.book_counts.clone(),
+                truncated: outcome.truncated,
+            });
+        }
+        let (query, truncated, _) =
+            self.user_regex_term_query(&searcher, &regex, &facets, &cancellation.flag)?;
+        Ok(BookCountResult {
+            counts: searcher.search(&*query, &BookCountCollector)?,
+            truncated,
+        })
+    }
+
+    /// Per-child facet counts under `facet_prefix` of a `/…/` query (see
+    /// [`Self::get_facet_counts`] on the dimension roots). `facets` filters, as everywhere:
+    /// one book's path is a search in that book. A cancelled call is an error.
+    pub fn get_facet_counts_user_regex(
+        &self,
+        raw: String,
+        facets: Vec<String>,
+        facet_prefix: String,
+        cancellation: &UserRegexCancellationToken,
+    ) -> Result<FacetCountsResult> {
+        let regex = Self::user_regex(&raw)?;
+        let searcher = self.index_reader.searcher();
+        let (query, truncated): (Box<dyn Query>, bool) = if regex.kind
+            == crate::user_regex::RegexKind::Line
+        {
+            let outcome = self.user_regex_line_outcome(&searcher, &regex, &facets, cancellation)?;
+            (
+                Box::new(crate::user_regex::HitSetQuery::new(&searcher, &outcome)),
+                outcome.truncated,
+            )
+        } else {
+            let (query, truncated, _) =
+                self.user_regex_term_query(&searcher, &regex, &facets, &cancellation.flag)?;
+            (query, truncated)
+        };
+        let mut collector = FacetCollector::for_field("topics");
+        collector.add_facet(&facet_prefix);
+        let counts = searcher.search(&*query, &collector)?;
+        Ok(FacetCountsResult {
+            counts: counts
+                .get(facet_prefix.as_str())
+                .map(|(f, count)| FacetCount {
+                    path: f.to_string(),
+                    count,
+                })
+                .collect(),
+            truncated,
+        })
+    }
+
+    fn user_regex(raw: &str) -> Result<crate::user_regex::UserRegex> {
+        crate::user_regex::parse(raw)
+            .map_err(|reason| anyhow::anyhow!("invalid user regex: {reason}"))
+    }
+
+    fn user_regex_line_search<'a>(
+        &'a self,
+        searcher: &'a Searcher,
+        facets: &[String],
+        cancel: &'a std::sync::atomic::AtomicBool,
+    ) -> Result<crate::user_regex::LineSearch<'a>> {
+        let (order_epoch, order) = self.order_tables()?;
+        Ok(crate::user_regex::LineSearch {
+            searcher,
+            schema: &self.schema,
+            scope: (!facets.is_empty())
+                .then(|| self.facet_filter_query(facets))
+                .transpose()?,
+            facets: facets.to_vec(),
+            cancel,
+            max_hits: crate::user_regex::MAX_LINE_HITS,
+            order,
+            order_epoch,
+        })
+    }
+
+    fn user_regex_line_outcome(
+        &self,
+        searcher: &Searcher,
+        regex: &crate::user_regex::UserRegex,
+        facets: &[String],
+        cancellation: &UserRegexCancellationToken,
+    ) -> Result<Arc<crate::user_regex::LineOutcome>> {
+        let ctx = self.user_regex_line_search(searcher, facets, &cancellation.flag)?;
+        crate::user_regex::run_line_search(&ctx, regex, None, &mut |_| true)?
+            .ok_or_else(|| anyhow::anyhow!(crate::user_regex::CANCELLED))
+    }
+
+    /// The query of a term pattern: one word as its term set, a sequence as an adjacent
+    /// phrase of term sets that may continue onto the next line. Also returns whether a
+    /// budget truncated a term set, and the sets (for highlighting).
+    fn user_regex_term_query(
+        &self,
+        searcher: &Searcher,
+        regex: &crate::user_regex::UserRegex,
+        facets: &[String],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<UserRegexTermQuery> {
+        let text_field = self.schema.get_field("text")?;
+        let single = regex.parts.len() == 1;
+        let (max_terms, budget) = if single {
+            (USER_REGEX_WORD_MAX_TERMS, SINGLE_WORD_POSTINGS_BUDGET)
+        } else {
+            (
+                PHRASE_POSITION_MAX_EXPANSIONS,
+                PHRASE_POSITION_POSTINGS_BUDGET,
+            )
+        };
+        let mut truncated = false;
+        let mut sets = Vec::with_capacity(regex.parts.len());
+        for part in &regex.parts {
+            let found = crate::user_regex::collect_part_terms(
+                searcher, text_field, part, max_terms, budget, cancel,
+            )?;
+            truncated |= found.truncated;
+            sets.push(found.terms);
+        }
+        let facets_query = (!facets.is_empty())
+            .then(|| self.facet_filter_query(facets))
+            .transpose()?;
+        let terms_of = |set: &Vec<String>| -> Vec<Term> {
+            set.iter()
+                .map(|t| Term::from_field_text(text_field, t))
+                .collect()
+        };
+        let main: Box<dyn Query> = if sets.iter().any(|s| s.is_empty()) {
+            Box::new(EmptyQuery)
+        } else if single {
+            Box::new(TermSetQuery::new(terms_of(&sets[0])))
+        } else {
+            let n = sets.len();
+            let inline: Box<dyn Query> = Box::new(TermListPhraseQuery::new(
+                text_field,
+                sets.iter().map(|s| terms_of(s)).collect(),
+                Proximity::adjacent(n),
+            ));
+            let words: Vec<cross_line::CrossLineWord> = sets
+                .iter()
+                .map(|s| cross_line::CrossLineWord::Terms(s.as_ref().clone()))
+                .collect();
+            self.with_cross_line(
+                inline,
+                text_field,
+                &words,
+                &vec![0; n - 1],
+                facets_query.as_deref(),
+            )?
+        };
+        let query: Box<dyn Query> = match facets_query {
+            Some(facets_query) => Box::new(BooleanQuery::new(vec![
+                (Occur::Must, main),
+                (Occur::Must, facets_query),
+            ])),
+            None => main,
+        };
+        Ok((query, truncated, sets))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn user_regex_term_stream(
+        &self,
+        searcher: &Searcher,
+        regex: &crate::user_regex::UserRegex,
+        facets: &[String],
+        limit: u32,
+        offset: u32,
+        order: &ResultsOrder,
+        chunk_size: u32,
+        cancel: &std::sync::atomic::AtomicBool,
+        emit: &mut dyn FnMut(UserRegexStreamUpdate) -> bool,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let kind = regex.kind.api();
+        let event = |results: Vec<SearchResult>,
+                     counts: Option<(u32, &HashMap<String, u32>)>,
+                     truncated: bool,
+                     done: bool,
+                     cancelled: bool| UserRegexStreamUpdate {
+            kind,
+            match_ranges: results
+                .iter()
+                .map(|_| UserRegexLineMatches { ranges: Vec::new() })
+                .collect(),
+            results,
+            total_count: counts.map(|(total, _)| total),
+            book_counts: counts.map(|(_, by_book)| by_book.clone()),
+            found_so_far: counts.map_or(0, |(total, _)| total),
+            progress_done: 0,
+            progress_total: 0,
+            truncated,
+            done,
+            cancelled,
+        };
+        let built = self.user_regex_term_query(searcher, regex, facets, cancel);
+        if cancel.load(Ordering::Relaxed) {
+            emit(event(Vec::new(), None, false, true, true));
+            return Ok(());
+        }
+        let (query, truncated, sets) = built?;
+        let text_field = self.schema.get_field("text")?;
+        let top = TopDocs::with_limit(limit.max(1) as usize).and_offset(offset as usize);
+        let collected = match self.order_sort(order)?.1 {
+            Some(sort) => {
+                let top = top.order_by((sort, Order::Asc));
+                let (docs, count, by_book) =
+                    searcher.search(&*query, &(top, Count, BookCountCollector))?;
+                (
+                    docs.into_iter().map(|(_, a)| a).collect::<Vec<_>>(),
+                    count,
+                    by_book,
+                )
+            }
+            None => {
+                let top = top.order_by_score();
+                let (docs, count, by_book) =
+                    searcher.search(&*query, &(top, Count, BookCountCollector))?;
+                (docs.into_iter().map(|(_, a)| a).collect(), count, by_book)
+            }
+        };
+        let (addresses, total, by_book) = collected;
+        let addresses = if limit == 0 { Vec::new() } else { addresses };
+        let total = total as u32;
+        if !emit(event(
+            Vec::new(),
+            Some((total, &by_book)),
+            truncated,
+            false,
+            false,
+        )) {
+            return Ok(());
+        }
+        if !addresses.is_empty() {
+            let per_word: Vec<HashSet<String>> =
+                sets.iter().map(|s| s.iter().cloned().collect()).collect();
+            let plan = HighlightPlan {
+                query: self.terms_query_from_word_sets(&per_word, text_field)?,
+                phrase: (per_word.len() > 1).then(|| PhraseHighlight {
+                    proximity: Proximity::adjacent(per_word.len()),
+                    per_word_terms: per_word,
+                    analyzer: "hebrew",
+                    cross_line: true,
+                    alternatives: Vec::new(),
+                    allow_term_fallback: true,
+                }),
+            };
+            let hl = HighlightConfig::default();
+            let hl_query: &dyn Query = plan.query.as_deref().unwrap_or(query.as_ref());
+            let generator = Self::make_snippet_generator(searcher, hl_query, text_field, &hl)?;
+            for chunk in addresses.chunks(chunk_size.max(1) as usize) {
+                if cancel.load(Ordering::Relaxed) {
+                    emit(event(
+                        Vec::new(),
+                        Some((total, &by_book)),
+                        truncated,
+                        true,
+                        true,
+                    ));
+                    return Ok(());
+                }
+                let results = Self::build_results_with_generator(
+                    &self.schema,
+                    searcher,
+                    &generator,
+                    text_field,
+                    chunk.to_vec(),
+                    &hl,
+                    plan.phrase.as_ref(),
+                )?;
+                if !emit(event(results, None, false, false, false)) {
+                    return Ok(());
+                }
+            }
+        }
+        emit(event(
+            Vec::new(),
+            Some((total, &by_book)),
+            truncated,
+            true,
+            false,
+        ));
+        Ok(())
+    }
+}
+
 // ── BookCountCollector ─────────────────────────────────────────────────────────
 
 /// Counts matching documents grouped by `filePath` fast field.
@@ -14206,7 +16165,8 @@ struct BookCountCollector;
 
 struct BookCountSegmentCollector {
     str_col: Option<tantivy::columnar::StrColumn>,
-    counts: HashMap<u64, u32>,
+    /// Indexed by term ordinal: a segment holds only thousands of paths.
+    counts: Vec<u32>,
 }
 
 impl Collector for BookCountCollector {
@@ -14219,9 +16179,10 @@ impl Collector for BookCountCollector {
         reader: &SegmentReader,
     ) -> tantivy::Result<BookCountSegmentCollector> {
         let str_col = reader.fast_fields().str("filePath")?;
+        let num_terms = str_col.as_ref().map_or(0, |col| col.num_terms());
         Ok(BookCountSegmentCollector {
             str_col,
-            counts: HashMap::new(),
+            counts: vec![0; num_terms],
         })
     }
 
@@ -14248,8 +16209,8 @@ impl SegmentCollector for BookCountSegmentCollector {
 
     fn collect(&mut self, doc_id: DocId, _score: Score) {
         if let Some(col) = &self.str_col {
-            if let Some(term_ord) = col.term_ords(doc_id).next() {
-                *self.counts.entry(term_ord).or_insert(0) += 1;
+            if let Some(term_ord) = col.ords().first(doc_id) {
+                self.counts[term_ord as usize] += 1;
             }
         }
     }
@@ -14258,33 +16219,43 @@ impl SegmentCollector for BookCountSegmentCollector {
         let Some(col) = self.str_col else {
             return Ok(HashMap::new());
         };
-        let mut result = HashMap::with_capacity(self.counts.len());
-        let mut buf = String::new();
-        for (term_ord, count) in self.counts {
-            buf.clear();
-            if col.ord_to_str(term_ord, &mut buf)? {
-                result.insert(buf.clone(), count);
-            }
-        }
+        let hits: Vec<(u64, u32)> = (0u64..)
+            .zip(self.counts)
+            .filter(|&(_, count)| count > 0)
+            .collect();
+        let mut result = HashMap::with_capacity(hits.len());
+        let mut counts = hits.iter().map(|&(_, count)| count);
+        // One sequential pass over the dictionary: `ord_to_str` per ordinal
+        // re-seeks the sstable and dominated the whole count.
+        col.dictionary().sorted_ords_to_term_cb(
+            hits.iter().map(|&(term_ord, _)| term_ord),
+            |bytes| {
+                let path = std::str::from_utf8(bytes).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Not valid utf-8")
+                })?;
+                result.insert(path.to_owned(), counts.next().unwrap_or(0));
+                Ok(())
+            },
+        )?;
         Ok(result)
     }
 }
 
 // ── GroupCollector ─────────────────────────────────────────────────────────────
 
-/// מפתח המיון של מסמך בקיבוץ, כ-u64 עולה: `id` (קטלוג), `generationSort`
-/// (דורות), או היפוך ביטי הציון (רלוונטיות — ציון BM25 אי-שלילי, כך
-/// שהיפוך הביטים הופך "ציון גבוה" ל"ערך נמוך" והמיון נשאר עולה).
-#[derive(Clone, Copy)]
+/// מפתח המיון של מסמך בקיבוץ, כ-u64 עולה: מפתח סדר הספרים (קטלוג/דורות), או
+/// היפוך ביטי הציון (רלוונטיות — ציון BM25 אי-שלילי, כך שהיפוך הביטים הופך
+/// "ציון גבוה" ל"ערך נמוך" והמיון נשאר עולה).
+#[derive(Clone)]
 enum GroupSort {
-    IdAsc,
-    GenerationAsc,
-    ScoreDesc,
+    Book(Arc<OrderTables>, OrderKind),
+    /// Equal scores, which are common, go by the catalogue.
+    ScoreDesc(Arc<OrderTables>),
 }
 
-/// `(sort_val, id, address)` — ה-id ייחודי גלובלית ומשמש שובר-שוויון
-/// דטרמיניסטי (בציוני רלוונטיות שוויון שכיח).
-type GroupEntry = (u64, u64, DocAddress);
+/// `(sort_val, tie, address, id)`: `tie` is unique per document and breaks ties
+/// deterministically; `id` names the representative.
+type GroupEntry = (u64, u64, DocAddress, u64);
 
 /// צבירת קבוצה אחת: מונה, הנציג הטוב ביותר, ועד [`MERGED_SIBLINGS_CAP`]
 /// חברות נוספות ממוינות לפי אותו סדר.
@@ -14457,14 +16428,10 @@ struct GroupCollector {
 }
 
 impl GroupCollector {
-    fn new(grouping: &ResultGrouping, order: &ResultsOrder) -> Self {
+    fn new(grouping: &ResultGrouping, sort: GroupSort) -> Self {
         Self {
             mode: *grouping,
-            sort: match order {
-                ResultsOrder::Catalogue => GroupSort::IdAsc,
-                ResultsOrder::Generation => GroupSort::GenerationAsc,
-                ResultsOrder::Relevance => GroupSort::ScoreDesc,
-            },
+            sort,
             shared: Arc::new(Mutex::new(SharedGroupedAcc {
                 raw_total: 0,
                 groups: BoundedGroups::new(),
@@ -14483,15 +16450,29 @@ impl GroupCollector {
     }
 }
 
+enum GroupKeyColumn {
+    Section(SectionIdColumn),
+    LineHash(tantivy::columnar::Column<u64>),
+}
+
+impl GroupKeyColumn {
+    fn first(&self, doc: DocId) -> Option<u64> {
+        match self {
+            Self::Section(column) => column.first(doc),
+            Self::LineHash(column) => column.first(doc),
+        }
+    }
+}
+
 struct GroupSegmentCollector {
     seg_ord: SegmentOrdinal,
     mode: ResultGrouping,
     sort: GroupSort,
     id_col: tantivy::columnar::Column<u64>,
-    /// עמודת המיון (`id`/`generationSort`); `None` במיון לפי ציון.
-    sort_col: Option<tantivy::columnar::Column<u64>>,
+    /// עמודת מפתח הסדר; `None` במיון לפי ציון.
+    sort_col: Option<BookOrderColumn>,
     /// עמודת מפתח הקבוצה: `sectionId` או `lineHash` לפי המצב.
-    key_col: tantivy::columnar::Column<u64>,
+    key_col: GroupKeyColumn,
     shared: Arc<Mutex<SharedGroupedAcc>>,
     buffer: Vec<((u8, u64), GroupEntry)>,
 }
@@ -14520,19 +16501,20 @@ impl Collector for GroupCollector {
     ) -> tantivy::Result<GroupSegmentCollector> {
         let fast = reader.fast_fields();
         let id_col = fast.u64("id")?;
-        let sort_col = match self.sort {
-            GroupSort::IdAsc => None, // עמודת ה-id כבר בידינו
-            GroupSort::GenerationAsc => Some(fast.u64("generationSort")?),
-            GroupSort::ScoreDesc => None,
+        let sort_col = match &self.sort {
+            GroupSort::Book(tables, kind) => {
+                Some(BookOrderColumn::open(reader, Arc::clone(tables), *kind)?)
+            }
+            GroupSort::ScoreDesc(_) => None,
         };
         let key_col = match self.mode {
-            ResultGrouping::SameSection => fast.u64("sectionId")?,
-            ResultGrouping::IdenticalText => fast.u64("lineHash")?,
+            ResultGrouping::SameSection => GroupKeyColumn::Section(SectionIdColumn::open(reader)?),
+            ResultGrouping::IdenticalText => GroupKeyColumn::LineHash(fast.u64("lineHash")?),
         };
         Ok(GroupSegmentCollector {
             seg_ord,
             mode: self.mode,
-            sort: self.sort,
+            sort: self.sort.clone(),
             id_col,
             sort_col,
             key_col,
@@ -14542,7 +16524,7 @@ impl Collector for GroupCollector {
     }
 
     fn requires_scoring(&self) -> bool {
-        matches!(self.sort, GroupSort::ScoreDesc)
+        matches!(self.sort, GroupSort::ScoreDesc(_))
     }
 
     fn merge_fruits(&self, _per_segment: Vec<()>) -> tantivy::Result<()> {
@@ -14555,14 +16537,18 @@ impl SegmentCollector for GroupSegmentCollector {
 
     fn collect(&mut self, doc_id: DocId, score: Score) {
         let id = self.id_col.first(doc_id).unwrap_or_default();
-        let sort_val = match self.sort {
-            GroupSort::IdAsc => id,
-            GroupSort::GenerationAsc => self
-                .sort_col
-                .as_ref()
-                .and_then(|c| c.first(doc_id))
-                .unwrap_or(u64::MAX),
-            GroupSort::ScoreDesc => u64::from(!score.to_bits()),
+        let (sort_val, tie) = match &self.sort {
+            GroupSort::Book(..) => (
+                self.sort_col
+                    .as_ref()
+                    .and_then(|c| c.first(doc_id))
+                    .unwrap_or(u64::MAX),
+                id,
+            ),
+            GroupSort::ScoreDesc(tables) => (
+                u64::from(!score.to_bits()),
+                tables.key(OrderKind::Catalogue, id),
+            ),
         };
         let key = match self.mode {
             ResultGrouping::SameSection => (0u8, self.key_col.first(doc_id).unwrap_or(id)),
@@ -14575,7 +16561,7 @@ impl SegmentCollector for GroupSegmentCollector {
                 }
             }
         };
-        let entry: GroupEntry = (sort_val, id, DocAddress::new(self.seg_ord, doc_id));
+        let entry: GroupEntry = (sort_val, tie, DocAddress::new(self.seg_ord, doc_id), id);
         self.buffer.push((key, entry));
         if self.buffer.len() >= GROUP_FLUSH_BUFFER {
             self.flush();
@@ -14591,8 +16577,9 @@ impl SegmentCollector for GroupSegmentCollector {
 
 /// Collects a u64 fast-field value (`hash_column`) per `filePath` fast field.
 /// Per-segment work uses term ordinals; strings are decoded only in harvest().
-/// Documents of the same book that disagree on the hash collapse to 0
-/// ("unverifiable"), and 0 wins over any value when merging segments.
+/// Only the document [`stamp_book`] wrote holds a book's value: a book
+/// whose documents hold none is 0, and two that disagree collapse to 0
+/// ("unverifiable"), which wins over any value when merging segments.
 struct BookFingerprintCollector {
     hash_column: &'static str,
 }
@@ -14600,7 +16587,18 @@ struct BookFingerprintCollector {
 struct BookFingerprintSegmentCollector {
     str_col: Option<tantivy::columnar::StrColumn>,
     hash_col: Option<tantivy::columnar::Column<u64>>,
-    fingerprints: HashMap<u64, u64>,
+    fingerprints: HashMap<u64, Option<u64>>,
+}
+
+/// One more of a book's fingerprint values, `None` for a document without one:
+/// `Some(0)` once two values disagree.
+pub(crate) fn combine_fingerprint(seen: Option<u64>, value: Option<u64>) -> Option<u64> {
+    match (seen, value) {
+        (seen, None) => seen,
+        (None, value) => value,
+        (Some(a), Some(b)) if a == b => Some(a),
+        _ => Some(0),
+    }
 }
 
 impl Collector for BookFingerprintCollector {
@@ -14628,31 +16626,28 @@ impl Collector for BookFingerprintCollector {
 
     fn merge_fruits(
         &self,
-        per_segment: Vec<tantivy::Result<HashMap<String, u64>>>,
+        per_segment: Vec<tantivy::Result<HashMap<String, Option<u64>>>>,
     ) -> tantivy::Result<HashMap<String, u64>> {
-        let mut merged: HashMap<String, u64> = HashMap::new();
+        let mut merged: HashMap<String, Option<u64>> = HashMap::new();
         for seg_result in per_segment {
             for (path, hash) in seg_result? {
-                merged
-                    .entry(path)
-                    .and_modify(|existing| {
-                        if *existing != hash {
-                            *existing = 0;
-                        }
-                    })
-                    .or_insert(hash);
+                let seen = merged.entry(path).or_default();
+                *seen = combine_fingerprint(*seen, hash);
             }
         }
-        Ok(merged)
+        Ok(merged
+            .into_iter()
+            .map(|(path, hash)| (path, hash.unwrap_or(0)))
+            .collect())
     }
 }
 
 // ── SingleBookFingerprintCollector ────────────────────────────────────────────
 
-/// The `textHash` of the documents a single-book query matched. Documents that
-/// disagree collapse to 0 ("unverifiable"), and 0 wins over any value — same
-/// semantics as [`BookFingerprintCollector`], without touching `filePath`:
-/// the query already restricts the documents to one book.
+/// The `textHash` of the documents a single-book query matched, read from those
+/// that hold one. Values that disagree collapse to 0 ("unverifiable"), and 0 wins
+/// over any value — same semantics as [`BookFingerprintCollector`], without
+/// touching `filePath`: the query already restricts the documents to one book.
 struct SingleBookFingerprintCollector;
 
 struct SingleBookFingerprintSegmentCollector {
@@ -14681,15 +16676,10 @@ impl Collector for SingleBookFingerprintCollector {
     }
 
     fn merge_fruits(&self, per_segment: Vec<Option<u64>>) -> tantivy::Result<u64> {
-        let mut merged: Option<u64> = None;
-        for hash in per_segment.into_iter().flatten() {
-            match merged {
-                None => merged = Some(hash),
-                Some(existing) if existing != hash => return Ok(0),
-                Some(_) => {}
-            }
-        }
-        Ok(merged.unwrap_or(0))
+        Ok(per_segment
+            .into_iter()
+            .fold(None, combine_fingerprint)
+            .unwrap_or(0))
     }
 }
 
@@ -14697,16 +16687,8 @@ impl SegmentCollector for SingleBookFingerprintSegmentCollector {
     type Fruit = Option<u64>;
 
     fn collect(&mut self, doc_id: DocId, _score: Score) {
-        let hash = self
-            .hash_col
-            .as_ref()
-            .and_then(|col| col.first(doc_id))
-            .unwrap_or(0);
-        match self.fingerprint {
-            None => self.fingerprint = Some(hash),
-            Some(existing) if existing != hash => self.fingerprint = Some(0),
-            Some(_) => {}
-        }
+        let hash = self.hash_col.as_ref().and_then(|col| col.first(doc_id));
+        self.fingerprint = combine_fingerprint(self.fingerprint, hash);
     }
 
     fn harvest(self) -> Option<u64> {
@@ -14715,7 +16697,7 @@ impl SegmentCollector for SingleBookFingerprintSegmentCollector {
 }
 
 impl SegmentCollector for BookFingerprintSegmentCollector {
-    type Fruit = tantivy::Result<HashMap<String, u64>>;
+    type Fruit = tantivy::Result<HashMap<String, Option<u64>>>;
 
     fn collect(&mut self, doc_id: DocId, _score: Score) {
         let Some(str_col) = &self.str_col else {
@@ -14724,22 +16706,12 @@ impl SegmentCollector for BookFingerprintSegmentCollector {
         let Some(term_ord) = str_col.term_ords(doc_id).next() else {
             return;
         };
-        let hash = self
-            .hash_col
-            .as_ref()
-            .and_then(|col| col.first(doc_id))
-            .unwrap_or(0);
-        self.fingerprints
-            .entry(term_ord)
-            .and_modify(|existing| {
-                if *existing != hash {
-                    *existing = 0;
-                }
-            })
-            .or_insert(hash);
+        let hash = self.hash_col.as_ref().and_then(|col| col.first(doc_id));
+        let seen = self.fingerprints.entry(term_ord).or_default();
+        *seen = combine_fingerprint(*seen, hash);
     }
 
-    fn harvest(self) -> tantivy::Result<HashMap<String, u64>> {
+    fn harvest(self) -> tantivy::Result<HashMap<String, Option<u64>>> {
         let Some(col) = self.str_col else {
             return Ok(HashMap::new());
         };
@@ -14913,8 +16885,19 @@ fn select_level_to_compact(sized_metas: &[(u64, SegmentMeta)]) -> Option<Vec<Seg
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[path = "../search_quality_tests.rs"]
+mod quality_tests;
+
+#[cfg(test)]
+#[path = "../quality_bench.rs"]
+mod quality_bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The generation a test book is placed at when it names none.
+    const DEFAULT_GENERATION_ORDER: u32 = 5;
 
     #[test]
     fn crop_keeps_the_whole_first_occurrence_and_whole_words() {
@@ -14977,8 +16960,8 @@ mod tests {
                 HashSet::from(["משה".into()]),
                 HashSet::from(["ואהרן".into()]),
             ],
-            gaps: vec![1000],
-            analyzer: "hebrew",
+            proximity: Proximity::Ordered(vec![1000]),
+            analyzer: DISPLAY_ANALYZER,
             cross_line: false,
             alternatives: Vec::new(),
             allow_term_fallback: true,
@@ -15002,8 +16985,8 @@ mod tests {
                 HashSet::from(["רמב\"ם".into()]),
                 HashSet::from(["רמבם".into()]),
             ],
-            gaps: vec![0],
-            analyzer: "hebrew",
+            proximity: Proximity::Ordered(vec![0]),
+            analyzer: DISPLAY_ANALYZER,
             cross_line: false,
             alternatives: Vec::new(),
             allow_term_fallback: true,
@@ -15074,8 +17057,8 @@ mod tests {
                 for gaps in [vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1], vec![2, 2]] {
                     let phrase = PhraseHighlight {
                         per_word_terms: sets.clone(),
-                        gaps: gaps.clone(),
-                        analyzer: "hebrew",
+                        proximity: Proximity::Ordered(gaps.clone()),
+                        analyzer: DISPLAY_ANALYZER,
                         cross_line: false,
                         alternatives: Vec::new(),
                         allow_term_fallback: true,
@@ -15106,8 +17089,8 @@ mod tests {
                 HashSet::from(["רמב\"ם".into(), "רמבם".into()]),
                 HashSet::from(["רמב\"ם".into(), "רמבם".into()]),
             ],
-            gaps: vec![0],
-            analyzer: "hebrew",
+            proximity: Proximity::Ordered(vec![0]),
+            analyzer: DISPLAY_ANALYZER,
             cross_line: false,
             alternatives: Vec::new(),
             allow_term_fallback: true,
@@ -15178,8 +17161,8 @@ mod tests {
                 HashSet::from(["משה".into()]),
                 HashSet::from(["ואהרן".into()]),
             ],
-            gaps: vec![0],
-            analyzer: "hebrew",
+            proximity: Proximity::Ordered(vec![0]),
+            analyzer: DISPLAY_ANALYZER,
             cross_line: false,
             alternatives: Vec::new(),
             allow_term_fallback: true,
@@ -15250,6 +17233,27 @@ mod tests {
             let (semantic_html, painted) = painter.paint("משה לבדו ואהרן", false);
             assert!(!painted);
             assert_eq!(semantic_html, "משה לבדו ואהרן");
+
+            // A shown window the lexical match is not in gives way to the whole line; a
+            // window it is in, or a hit no lexical search confirmed, keeps the window.
+            let window = "…שלום שלום שלום…";
+            let (shown, painted) = painter.paint_shown(&text, Some(window), true);
+            assert!(painted);
+            assert!(shown.contains("ואהרן"), "{shown}");
+            assert_eq!(
+                painter.paint_shown(&text, Some(window), false),
+                painter.paint(window, false)
+            );
+            let marked = "…שלום משה ואהרן שלום…";
+            assert_eq!(
+                painter.paint_shown(&text, Some(marked), true),
+                painter.paint(marked, true)
+            );
+            assert!(painter.paint(marked, true).1);
+            assert_eq!(
+                painter.paint_shown(&text, None, true),
+                painter.paint(&text, true)
+            );
         }
     }
 
@@ -15265,8 +17269,8 @@ mod tests {
                 HashSet::from(["משה".into()]),
                 HashSet::from(["ואהרן".into()]),
             ],
-            gaps: vec![1000],
-            analyzer: "hebrew",
+            proximity: Proximity::Ordered(vec![1000]),
+            analyzer: DISPLAY_ANALYZER,
             cross_line: false,
             alternatives: Vec::new(),
             allow_term_fallback: true,
@@ -15370,6 +17374,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -15412,6 +17417,8 @@ mod tests {
             negative_scope,
             None,
             None,
+            None,
+            None,
         )
     }
 
@@ -15444,6 +17451,8 @@ mod tests {
             match_taamim,
             scope,
             negative_scope,
+            None,
+            None,
             None,
             None,
         )
@@ -15676,7 +17685,7 @@ mod tests {
 
     fn add(engine: &mut SearchEngine, id: u64, text: &str, file_path: &str) {
         engine
-            .add_document(
+            .add_document_at(
                 id, "title", "ref", "/root", text, 0, false, file_path, None, None, None,
             )
             .unwrap();
@@ -15715,45 +17724,164 @@ mod tests {
         cross_line::LINE_EDGE_FIELD,
     ];
 
-    /// Version 5 is the released version 4 schema with `text` and `textVocalized` out of the
-    /// store, and the `chunkKey` column and [`VERSION_5_FIELDS`] beside it. No other
-    /// version is one this engine reads.
+    /// The schema of a real version 5 index, as the `meta.json` of a full library index
+    /// (6,910,973 lines) built by the engine before version 6 holds it.
+    const RELEASED_VERSION_5_SCHEMA: &str = r#"[
+        {"name": "text", "type": "text", "options": {"indexing": {"record": "position", "fieldnorms": true, "tokenizer": "hebrew"}, "stored": false, "fast": false}},
+        {"name": "textVocalized", "type": "text", "options": {"indexing": {"record": "position", "fieldnorms": true, "tokenizer": "hebrew_vocalized"}, "stored": false, "fast": false}},
+        {"name": "reference", "type": "text", "options": {"stored": true, "fast": false}},
+        {"name": "title", "type": "text", "options": {"indexing": {"record": "basic", "fieldnorms": false, "tokenizer": "raw"}, "stored": true, "fast": false}},
+        {"name": "id", "type": "u64", "options": {"indexed": true, "fieldnorms": true, "fast": true, "stored": true}},
+        {"name": "segment", "type": "u64", "options": {"indexed": false, "fieldnorms": false, "fast": false, "stored": true}},
+        {"name": "isPdf", "type": "bool", "options": {"indexed": false, "fieldnorms": false, "fast": false, "stored": true}},
+        {"name": "filePath", "type": "text", "options": {"indexing": {"record": "basic", "fieldnorms": true, "tokenizer": "raw"}, "stored": true, "fast": true}},
+        {"name": "contentHash", "type": "u64", "options": {"indexed": false, "fieldnorms": false, "fast": true, "stored": false}},
+        {"name": "textHash", "type": "u64", "options": {"indexed": false, "fieldnorms": false, "fast": true, "stored": false}},
+        {"name": "sectionId", "type": "u64", "options": {"indexed": false, "fieldnorms": false, "fast": true, "stored": false}},
+        {"name": "generationSort", "type": "u64", "options": {"indexed": false, "fieldnorms": false, "fast": true, "stored": false}},
+        {"name": "lineHash", "type": "u64", "options": {"indexed": false, "fieldnorms": false, "fast": true, "stored": false}},
+        {"name": "lineCheck", "type": "u64", "options": {"indexed": false, "fieldnorms": false, "fast": true, "stored": false}},
+        {"name": "topics", "type": "facet", "options": {"stored": false}},
+        {"name": "chunkKey", "type": "u64", "options": {"indexed": false, "fieldnorms": false, "fast": true, "stored": false}},
+        {"name": "textStored", "type": "text", "options": {"stored": true, "fast": false}},
+        {"name": "textVocalizedStored", "type": "text", "options": {"stored": true, "fast": false}},
+        {"name": "lineFirst", "type": "u64", "options": {"indexed": false, "fieldnorms": false, "fast": true, "stored": false}},
+        {"name": "lineLast", "type": "u64", "options": {"indexed": false, "fieldnorms": false, "fast": true, "stored": false}},
+        {"name": "lineEdge", "type": "text", "options": {"indexing": {"record": "basic", "fieldnorms": false, "tokenizer": "raw"}, "stored": false, "fast": false}}
+    ]"#;
+
+    /// The version 5 fields versions 6 and 7 change, and how; every other version 5 field is
+    /// unchanged. No other version is one this engine reads.
     #[test]
-    fn version_5_is_version_4_with_the_text_out_of_its_store() {
-        let released: Schema = serde_json::from_str(RELEASED_VERSION_4_SCHEMA).unwrap();
+    fn version_7_is_version_5_with_its_disk_savings_and_stamps() {
+        let released: Schema = serde_json::from_str(RELEASED_VERSION_5_SCHEMA).unwrap();
         let current = current_schema();
         assert_eq!(
             schema_of_version(INDEX_SCHEMA_VERSION),
             Some(current.clone())
         );
-        for (_, entry) in released.fields() {
-            let now = current.get_field_entry(current.get_field(entry.name()).unwrap());
-            if ["text", "textVocalized"].contains(&entry.name()) {
-                assert!(entry.is_stored() && !now.is_stored(), "{}", entry.name());
-                assert_eq!(now.is_indexed(), entry.is_indexed(), "{}", entry.name());
-            } else {
-                assert_eq!(now, entry);
+        let entry = |name: &str| current.get_field_entry(current.get_field(name).unwrap());
+        let mut removed = Vec::new();
+        for (_, old) in released.fields() {
+            match old.name() {
+                "id" => {
+                    let now = entry("id");
+                    assert!(now.is_fast() && now.is_stored() && !now.is_indexed());
+                }
+                // Out of the doc store, read from their columns.
+                "title" | "isPdf" | "filePath" => {
+                    let now = entry(old.name());
+                    assert!(old.is_stored() && !now.is_stored(), "{}", old.name());
+                    assert!(now.is_fast(), "{}", old.name());
+                    assert_eq!(now.is_indexed(), old.is_indexed(), "{}", old.name());
+                    assert!(!now.has_fieldnorms(), "{}", old.name());
+                }
+                name if current.get_field(name).is_err() => removed.push(name),
+                name => assert_eq!(entry(name), old, "{name}"),
             }
         }
-        let mut added: Vec<&str> = current
+        // `sectionId` is derived at query time from `id` and the small column that replaces
+        // it; the generation is the order mapping's (`book_order`), not the index's.
+        assert_eq!(removed, ["sectionId", "generationSort"]);
+        let added: Vec<&str> = current
             .fields()
             .map(|(_, entry)| entry.name())
             .filter(|name| released.get_field(name).is_err())
             .collect();
-        added.sort_unstable();
-        let mut expected = VERSION_5_FIELDS.to_vec();
-        expected.push(CHUNK_KEY_FIELD);
-        expected.sort_unstable();
-        assert_eq!(added, expected);
+        assert_eq!(
+            added,
+            [METADATA_HASH_FIELD, SOURCE_HASH_FIELD, SECTION_OFFSET_FIELD]
+        );
+        for name in added {
+            let added = entry(name);
+            assert!(added.is_fast() && !added.is_indexed() && !added.is_stored());
+        }
 
-        let chunk_key = current.get_field_entry(current.get_field(CHUNK_KEY_FIELD).unwrap());
-        assert!(chunk_key.is_fast());
-        assert!(!chunk_key.is_indexed());
-        assert!(!chunk_key.is_stored());
-        assert_eq!(chunk_key.field_type().value_type(), Type::U64);
-
-        for version in [4, MIN_READABLE_SCHEMA_VERSION - 1, INDEX_SCHEMA_VERSION + 1] {
+        for version in [5, MIN_READABLE_SCHEMA_VERSION - 1, INDEX_SCHEMA_VERSION + 1] {
             assert_eq!(schema_of_version(version), None, "{version}");
+        }
+    }
+
+    /// A new index compresses its doc store with zstd over 16K blocks; one created with
+    /// other settings is opened with its own.
+    #[test]
+    fn a_new_index_compresses_its_store_with_zstd() {
+        let (mut engine, dir) = make_engine();
+        let settings = engine.index.settings();
+        assert_eq!(
+            settings.docstore_compression,
+            tantivy::store::Compressor::Zstd(tantivy::store::ZstdCompressor {
+                compression_level: Some(DOCSTORE_ZSTD_LEVEL)
+            })
+        );
+        assert_eq!(settings.docstore_blocksize, DOCSTORE_BLOCK_SIZE);
+        add(&mut engine, 7, "שורה ראשונה", "/a.txt");
+        engine.commit().unwrap();
+        drop(engine);
+        let engine = SearchEngine::new(dir.path().to_str().unwrap());
+        let found = engine.get_document_by_id(7).unwrap().unwrap();
+        assert_eq!(found.text, "שורה ראשונה");
+
+        let lz4 = TempDir::new().unwrap();
+        Index::builder()
+            .schema(current_schema())
+            .settings(tantivy::IndexSettings {
+                docstore_compression: tantivy::store::Compressor::Lz4,
+                ..tantivy::IndexSettings::default()
+            })
+            .create_in_dir(lz4.path())
+            .unwrap();
+        let mut engine = SearchEngine::new(lz4.path().to_str().unwrap());
+        assert_eq!(
+            engine.index.settings().docstore_compression,
+            tantivy::store::Compressor::Lz4
+        );
+        add(&mut engine, 8, "שורה שנייה", "/b.txt");
+        engine.commit().unwrap();
+        engine.index_reader.reload().unwrap();
+        assert_eq!(
+            engine.get_document_by_id(8).unwrap().unwrap().text,
+            "שורה שנייה"
+        );
+    }
+
+    /// A version 5 index is rebuilt, with its metadata or without.
+    #[test]
+    fn a_released_version_5_index_is_rebuilt() {
+        let fields: JsonValue = serde_json::from_str(RELEASED_VERSION_5_SCHEMA).unwrap();
+        for version in [Some(5), None] {
+            let dir = index_of_schema(fields.clone(), version);
+            let compatibility = check_index_compatibility(dir_path_string(&dir));
+            assert!(!compatibility.compatible, "{version:?}");
+            assert_eq!(compatibility.status, "rebuild_required", "{version:?}");
+            assert_eq!(compatibility.found_schema_version, version);
+            assert_eq!(compatibility.required_schema_version, INDEX_SCHEMA_VERSION);
+        }
+    }
+
+    /// A version 6 index — ids composed from the catalogue position, a `generation` column,
+    /// no metadata or source stamps — is rebuilt, with its metadata or without, and so is
+    /// one whose metadata claims this version over that schema.
+    #[test]
+    fn a_version_6_index_is_rebuilt() {
+        let mut fields = serde_json::to_value(current_schema()).unwrap();
+        let list = fields.as_array_mut().unwrap();
+        list.retain(|field| {
+            ![METADATA_HASH_FIELD, SOURCE_HASH_FIELD].contains(&field["name"].as_str().unwrap())
+        });
+        let offset = list
+            .iter()
+            .position(|field| field["name"] == SECTION_OFFSET_FIELD)
+            .unwrap();
+        let mut generation = list[offset].clone();
+        generation["name"] = JsonValue::from("generation");
+        list.insert(offset + 1, generation);
+        for version in [Some(6), None, Some(INDEX_SCHEMA_VERSION)] {
+            let dir = index_of_schema(fields.clone(), version);
+            let compatibility = check_index_compatibility(dir_path_string(&dir));
+            assert!(!compatibility.compatible, "{version:?}");
+            assert_eq!(compatibility.status, "rebuild_required", "{version:?}");
+            assert_eq!(compatibility.required_schema_version, INDEX_SCHEMA_VERSION);
         }
     }
 
@@ -15854,6 +17982,34 @@ mod tests {
         values.into_iter().map(|(_, value)| value).collect()
     }
 
+    /// An index the engine before long-line windows wrote, its column keyed under the
+    /// published chunking, is read by its column; one recording the windows chunking is not.
+    #[test]
+    fn an_index_written_before_the_windows_keeps_its_column() {
+        for (identity, used) in [
+            (2_685_558_872_390_372_738u64, true),
+            (
+                crate::semantic_keys::production_chunking().identity(),
+                false,
+            ),
+        ] {
+            let (engine, dir) = make_engine();
+            drop(engine);
+            let mut metadata = index_metadata(
+                INDEX_SCHEMA_VERSION,
+                Some(ChunkKeyRecipe {
+                    line_text_version: 1,
+                    key_version: 1,
+                    chunking_identity: identity,
+                }),
+            );
+            metadata.engine_version = "3.1.0".to_string();
+            write_index_metadata(dir.path(), &metadata).unwrap();
+            let engine = SearchEngine::new(dir.path().to_str().unwrap());
+            assert_eq!(engine.chunk_key_field.is_some(), used, "{identity}");
+        }
+    }
+
     /// A new index is version 5: it has the column, its metadata records the recipe the
     /// column is written under, and the engine writes to it.
     #[test]
@@ -15874,7 +18030,7 @@ mod tests {
         );
 
         engine
-            .add_text_book(
+            .add_text_book_placed(
                 "בראשית".to_string(),
                 "/root".to_string(),
                 "/books/genesis.txt".to_string(),
@@ -15900,8 +18056,8 @@ mod tests {
     fn every_other_add_path_writes_zero() {
         let (mut engine, _dir) = make_engine();
         let line = "שורה ארוכה דיה כדי לעמוד בפני עצמה";
-        let input = |id: u64| DocumentInput {
-            id,
+        let input = |ordinal: u32| DocumentInput {
+            ordinal,
             title: "t".to_string(),
             reference: "r".to_string(),
             topics: "/root".to_string(),
@@ -15911,18 +18067,18 @@ mod tests {
             file_path: "/books/loose.txt".to_string(),
             content_hash: None,
             text_hash: None,
-            section_id: None,
-            generation_order: None,
+            source_hash: None,
+            section_ordinal: None,
             text_vocalized: None,
             extra_facets: None,
             text_storage: None,
         };
         add(&mut engine, 1, line, "/books/loose.txt");
-        engine.add_documents_batch(vec![input(2)]).unwrap();
-        engine.upsert_documents_batch(vec![input(3)]).unwrap();
+        engine.add_documents_batch(vec![input(1)]).unwrap();
+        engine.upsert_documents_batch(vec![input(2)]).unwrap();
         engine
             .upsert_document(
-                4,
+                3,
                 "t",
                 "r",
                 "/root",
@@ -15930,7 +18086,6 @@ mod tests {
                 0,
                 false,
                 "/books/loose.txt",
-                None,
                 None,
                 None,
             )
@@ -15954,7 +18109,7 @@ mod tests {
         for (field, value) in other_recipes {
             let (mut engine, dir) = make_engine();
             engine
-                .add_text_book(
+                .add_text_book_placed(
                     "בראשית".to_string(),
                     "/root".to_string(),
                     "/books/genesis.txt".to_string(),
@@ -15984,7 +18139,7 @@ mod tests {
             let mut engine = SearchEngine::new(dir.path().to_str().unwrap());
             assert_eq!(engine.chunk_key_field, None, "{field}={value}");
             engine
-                .add_text_book(
+                .add_text_book_placed(
                     "שמות".to_string(),
                     "/root".to_string(),
                     "/books/exodus.txt".to_string(),
@@ -16255,54 +18410,30 @@ mod tests {
     #[test]
     fn generation_order_can_prioritize_sources_before_commentaries() {
         let (mut engine, _dir) = make_engine();
-        engine
-            .add_document(
-                10,
-                "פירוש מוקדם בקטלוג",
-                "ref",
-                "/root",
-                "שלום",
-                0,
-                false,
-                "/books/commentary.txt",
-                None,
-                Some(65),
-                None,
-            )
-            .unwrap();
-        engine
-            .add_document(
-                30,
-                "מקור שני",
-                "ref",
-                "/root",
-                "שלום",
-                0,
-                false,
-                "/books/source-b.txt",
-                None,
-                Some(2),
-                None,
-            )
-            .unwrap();
-        engine
-            .add_document(
-                20,
-                "מקור ראשון",
-                "ref",
-                "/root",
-                "שלום",
-                0,
-                false,
-                "/books/source-a.txt",
-                None,
-                Some(2),
-                None,
-            )
-            .unwrap();
+        for (title, path) in [
+            ("פירוש מוקדם בקטלוג", "/books/commentary.txt"),
+            ("מקור שני", "/books/source-b.txt"),
+            ("מקור ראשון", "/books/source-a.txt"),
+        ] {
+            engine
+                .add_document(0, title, "ref", "/root", "שלום", 0, false, path, None, None)
+                .unwrap();
+        }
         engine.commit().unwrap();
+        let place = |path: &str, catalogue_order, generation_order| BookOrderEntry {
+            file_path: path.to_string(),
+            catalogue_order,
+            generation_order,
+        };
+        engine
+            .set_book_order(vec![
+                place("/books/commentary.txt", 10, 65),
+                place("/books/source-b.txt", 30, 2),
+                place("/books/source-a.txt", 20, 2),
+            ])
+            .unwrap();
 
-        let by_generation: Vec<u64> = engine
+        let by_generation: Vec<String> = engine
             .search_exact(
                 "שלום".to_string(),
                 vec!["/root".to_string()],
@@ -16315,10 +18446,18 @@ mod tests {
             )
             .unwrap()
             .into_iter()
-            .map(|result| result.id)
+            .map(|result| result.file_path)
             .collect();
 
-        assert_eq!(by_generation, vec![20, 30, 10]);
+        // Within a generation, the catalogue decides.
+        assert_eq!(
+            by_generation,
+            [
+                "/books/source-a.txt",
+                "/books/source-b.txt",
+                "/books/commentary.txt"
+            ]
+        );
     }
 
     #[test]
@@ -16331,12 +18470,11 @@ mod tests {
                 "בראשית".to_string(),
                 "/root".to_string(),
                 "/books/bereshit.txt".to_string(),
-                5,
-                DEFAULT_GENERATION_ORDER,
                 text.to_string(),
                 None,
                 TextStorage::InIndex,
                 None,
+                Some(77),
             )
             .unwrap();
         assert_eq!(added, 5);
@@ -16359,8 +18497,8 @@ mod tests {
         // הכותרת החדשה של פרק ב החליפה את פרק א ב-trail (אותו prefix "<h2>").
         assert_eq!(hit.reference, "ספר בראשית, פרק ב");
         assert_eq!(hit.segment, 4);
-        // id = ((catalogue_order+1) << 32) + ordinal+1, כמו ב-Dart.
-        assert_eq!(hit.id, ((5u64 + 1) << 32) + 5);
+        // id = (bookNumber << 32) + ordinal+1; the first book of an index is number 1.
+        assert_eq!(hit.id, (1u64 << 32) + 5);
         assert_eq!(hit.title, "בראשית");
         assert!(!hit.is_pdf);
 
@@ -16388,28 +18526,22 @@ mod tests {
                 text.to_string(),
                 "בראשית".to_string(),
                 "/root".to_string(),
-                5,
-                DEFAULT_GENERATION_ORDER,
                 None,
             ))
         );
-        // שינוי metadata בלבד (סדר דורות) משנה את החתימה — הספר יזוהה
+        // שינוי metadata בלבד (כותרת) משנה את החתימה — הספר יזוהה
         // כדורש אינדוקס-מחדש.
         assert_ne!(
             compute_book_fingerprint(
                 text.to_string(),
                 "בראשית".to_string(),
                 "/root".to_string(),
-                5,
-                DEFAULT_GENERATION_ORDER,
                 None,
             ),
             compute_book_fingerprint(
                 text.to_string(),
-                "בראשית".to_string(),
+                "ספר בראשית".to_string(),
                 "/root".to_string(),
-                5,
-                7,
                 None,
             ),
         );
@@ -16419,8 +18551,6 @@ mod tests {
                 text.to_string(),
                 "בראשית".to_string(),
                 "/root".to_string(),
-                5,
-                DEFAULT_GENERATION_ORDER,
                 Some(vec![
                     "/author/רש\"י".to_string(),
                     "/era/ראשונים".to_string()
@@ -16430,8 +18560,6 @@ mod tests {
                 text.to_string(),
                 "בראשית".to_string(),
                 "/root".to_string(),
-                5,
-                DEFAULT_GENERATION_ORDER,
                 Some(vec![
                     "/era/ראשונים".to_string(),
                     "/author/רש\"י".to_string()
@@ -16440,11 +18568,29 @@ mod tests {
         );
 
         // חתימת הטקסט-בלבד נחתמה גם היא, זהה לחישוב הציבורי — ובניגוד
-        // לקנונית, אינה תלויה בסדר הקטלוגי או בשאר ה-metadata.
+        // לקנונית, אינה תלויה ב-metadata.
         let text_fingerprints = engine.get_book_text_fingerprints().unwrap();
         assert_eq!(
             text_fingerprints.get("/books/bereshit.txt"),
             Some(&compute_content_fingerprint(text.to_string()))
+        );
+
+        // All the book's stamps in one call: the metadata alone, and the source as given.
+        assert_eq!(
+            engine.get_book_stamps().unwrap(),
+            vec![BookStamps {
+                file_path: "/books/bereshit.txt".to_string(),
+                book_number: 1,
+                documents: 5,
+                content_hash: fingerprints["/books/bereshit.txt"],
+                text_hash: compute_content_fingerprint(text.to_string()),
+                metadata_hash: compute_book_metadata_fingerprint(
+                    "בראשית".to_string(),
+                    "/root".to_string(),
+                    None,
+                ),
+                source_hash: 77,
+            }]
         );
     }
 
@@ -16455,7 +18601,7 @@ mod tests {
         // אחת מהן החטיא.
         let (mut engine, _dir) = make_engine();
         engine
-            .add_text_book(
+            .add_text_book_placed(
                 "חוזק יד".to_string(),
                 "/root".to_string(),
                 "/books/chozek.txt".to_string(),
@@ -16501,7 +18647,7 @@ mod tests {
         let (mut engine, _dir) = make_engine();
         for (id, text) in [(1, line), (2, "כי [אם] עונותיכם היו מבדילים")] {
             engine
-                .add_document(
+                .add_document_at(
                     id,
                     "title",
                     "ref",
@@ -16602,6 +18748,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
+                None,
             )
             .unwrap();
             assert_eq!(pattern.combined_pattern, "(?!)");
@@ -16630,6 +18777,7 @@ mod tests {
                     HashMap::new(),
                     HashMap::new(),
                     HashMap::new(),
+                    None,
                 )
                 .unwrap();
                 assert_eq!(
@@ -16717,394 +18865,13 @@ mod tests {
     }
 
     #[test]
-    fn parallel_term_collection_equals_the_sequential_loop() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let (mut engine, _dir) = make_engine();
-        engine.set_bulk_indexing(true).unwrap();
-        let words = [
-            "ספר",
-            "ספרים",
-            "הספר",
-            "מספר",
-            "סופר",
-            "ספרא",
-            "בספרו",
-            "תורה",
-        ];
-        for (segment, chunk) in words.chunks(2).enumerate() {
-            for (i, word) in chunk.iter().enumerate() {
-                let id = (segment * 10 + i) as u64;
-                engine
-                    .add_document(
-                        id,
-                        "title",
-                        "ref",
-                        "/root",
-                        &format!("{word} {word} ספר אחר"),
-                        id,
-                        false,
-                        &format!("/books/{id}.txt"),
-                        None,
-                        None,
-                        None,
-                    )
-                    .unwrap();
-            }
-            engine.commit().unwrap();
-        }
-        assert!(engine.get_segment_count().unwrap() > 1);
-
-        let searcher = engine.index_reader.searcher();
-        let text = engine.schema.get_field("text").unwrap();
-        let inverted: Vec<_> = searcher
-            .segment_readers()
-            .iter()
-            .map(|r| r.inverted_index(text).unwrap())
-            .collect();
-        let regexes: Vec<tantivy_fst::Regex> = [".{0,3}ספר.{0,3}", "סופר", ".{0,2}ס.{0,3}"]
-            .iter()
-            .map(|p| tantivy_fst::Regex::new(p).unwrap())
-            .collect();
-
-        struct CountedRegex {
-            regex: tantivy_fst::Regex,
-            starts: Arc<AtomicUsize>,
-        }
-        impl Automaton for CountedRegex {
-            type State = <tantivy_fst::Regex as Automaton>::State;
-            fn start(&self) -> Self::State {
-                self.starts.fetch_add(1, Ordering::Relaxed);
-                self.regex.start()
-            }
-            fn is_match(&self, state: &Self::State) -> bool {
-                self.regex.is_match(state)
-            }
-            fn can_match(&self, state: &Self::State) -> bool {
-                self.regex.can_match(state)
-            }
-            fn accept(&self, state: &Self::State, byte: u8) -> Self::State {
-                self.regex.accept(state, byte)
-            }
-        }
-        let counted: Vec<_> = (0..8)
-            .map(|_| CountedRegex {
-                regex: tantivy_fst::Regex::new(".*").unwrap(),
-                starts: Arc::new(AtomicUsize::new(0)),
-            })
-            .collect();
-        assert!(SearchEngine::collect_automatons_terms(
-            &inverted,
-            &counted,
-            1,
-            u64::MAX,
-            &mut HashSet::new(),
-            &mut 0,
-        )
-        .unwrap());
-        assert!(counted[0].starts.load(Ordering::Relaxed) > 0);
-        assert!(counted[1..]
-            .iter()
-            .all(|automaton| automaton.starts.load(Ordering::Relaxed) == 0));
-
-        // The common first branch can also consume the budget across all
-        // segments, rather than on its first hit. Later branches stay idle.
-        let first_budget: u64 = inverted
-            .iter()
-            .map(|reader| {
-                let mut stream = reader.terms().search(&counted[0]).into_stream().unwrap();
-                let mut cost = 0;
-                while stream.advance() {
-                    cost += u64::from(stream.value().doc_freq);
-                }
-                cost
-            })
-            .sum();
-        for automaton in &counted {
-            automaton.starts.store(0, Ordering::Relaxed);
-        }
-        assert!(SearchEngine::collect_automatons_terms(
-            &inverted,
-            &counted,
-            1000,
-            first_budget,
-            &mut HashSet::new(),
-            &mut 0,
-        )
-        .unwrap());
-        assert!(counted[0].starts.load(Ordering::Relaxed) > 0);
-        assert!(counted[1..]
-            .iter()
-            .all(|automaton| automaton.starts.load(Ordering::Relaxed) == 0));
-
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
-        // Narrow leading-wildcard and empty scans can traverse the whole
-        // dictionary. Their probe hits must be reused, so each visited
-        // segment starts exactly as many scans as the sequential collector.
-        for pattern in [".*ספר", "סופר", ".*missing"] {
-            let narrow = [CountedRegex {
-                regex: tantivy_fst::Regex::new(pattern).unwrap(),
-                starts: Arc::new(AtomicUsize::new(0)),
-            }];
-            for initial in [HashSet::new(), HashSet::from(["ספר".to_owned()])] {
-                for max_expansions in [0, 1, 1000] {
-                    for budget in [0, 1, u64::MAX] {
-                        narrow[0].starts.store(0, Ordering::Relaxed);
-                        let mut actual = initial.clone();
-                        let mut actual_cost = 0;
-                        let actual_truncated = pool
-                            .install(|| {
-                                SearchEngine::collect_automatons_terms(
-                                    &inverted,
-                                    &narrow,
-                                    max_expansions,
-                                    budget,
-                                    &mut actual,
-                                    &mut actual_cost,
-                                )
-                            })
-                            .unwrap();
-                        let actual_scans = narrow[0].starts.swap(0, Ordering::Relaxed);
-                        let mut seq = initial.clone();
-                        let mut seq_cost = 0;
-                        let mut seq_truncated = false;
-                        for reader in &inverted {
-                            if SearchEngine::collect_automaton_terms(
-                                reader,
-                                &narrow[0],
-                                max_expansions,
-                                budget,
-                                &mut seq,
-                                &mut seq_cost,
-                            )
-                            .unwrap()
-                            {
-                                seq_truncated = true;
-                                break;
-                            }
-                        }
-                        assert_eq!(actual, seq, "pattern={pattern}");
-                        assert_eq!(actual_cost, seq_cost, "pattern={pattern}");
-                        assert_eq!(actual_truncated, seq_truncated, "pattern={pattern}");
-                        assert_eq!(
-                            actual_scans,
-                            narrow[0].starts.load(Ordering::Relaxed),
-                            "narrow probe repeated a scan: pattern={pattern}",
-                        );
-                    }
-                }
-            }
-        }
-        // Existing terms, per-segment duplicates, exhausted initial budgets,
-        // and shrinking waves all retain the original sequential prefix.
-        for initial in [vec![], vec!["ספר"], vec!["ספר", "סופר", "not-in-index"]] {
-            for max_expansions in [0, 1, 2, 3, 7, 1000] {
-                for budget in [0, 1, 3, 5, 9, u64::MAX] {
-                    for initial_cost in [0, 2, budget] {
-                        // Avoid an irrelevant arithmetic overflow in both
-                        // collectors when starting already at u64::MAX.
-                        if initial_cost == u64::MAX {
-                            continue;
-                        }
-                        let initial: HashSet<String> =
-                            initial.iter().map(|term| (*term).to_owned()).collect();
-                        let mut seq = initial.clone();
-                        let mut seq_cost = initial_cost;
-                        let mut seq_truncated = false;
-                        'outer: for regex in &regexes {
-                            for inv in &inverted {
-                                if SearchEngine::collect_automaton_terms(
-                                    inv,
-                                    regex,
-                                    max_expansions,
-                                    budget,
-                                    &mut seq,
-                                    &mut seq_cost,
-                                )
-                                .unwrap()
-                                {
-                                    seq_truncated = true;
-                                    break 'outer;
-                                }
-                            }
-                        }
-                        let mut par = initial;
-                        let mut par_cost = initial_cost;
-                        let par_truncated = pool
-                            .install(|| {
-                                SearchEngine::collect_automatons_terms(
-                                    &inverted,
-                                    &regexes,
-                                    max_expansions,
-                                    budget,
-                                    &mut par,
-                                    &mut par_cost,
-                                )
-                            })
-                            .unwrap();
-                        let case = format!("max_expansions={max_expansions} budget={budget} initial_cost={initial_cost}");
-                        assert_eq!(par, seq, "{case}");
-                        assert_eq!(par_cost, seq_cost, "{case}");
-                        assert_eq!(par_truncated, seq_truncated, "{case}");
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn broad_term_collection_on_few_segments_retains_sequential_prefix() {
-        let (mut engine, _dir) = make_engine();
-        engine.set_bulk_indexing(true).unwrap();
-        let letters: Vec<char> = "אבגדהוזחטיכלמנסעפצקרשת".chars().collect();
-        let term = |index: usize| {
-            format!(
-                "מלה{}{}",
-                letters[index / letters.len()],
-                letters[index % letters.len()]
-            )
-        };
-        for segment in 0..3 {
-            let words: Vec<_> = (segment * 16..segment * 16 + 32).map(term).collect();
-            add(
-                &mut engine,
-                segment as u64,
-                &words.join(" "),
-                &format!("/books/{segment}.txt"),
-            );
-            engine.commit().unwrap();
-        }
-        let searcher = engine.index_reader.searcher();
-        let text = engine.schema.get_field("text").unwrap();
-        let inverted: Vec<_> = searcher
-            .segment_readers()
-            .iter()
-            .map(|reader| reader.inverted_index(text).unwrap())
-            .collect();
-        assert_eq!(inverted.len(), 3);
-        let regexes = [tantivy_fst::Regex::new("מלה.*").unwrap()];
-
-        // Wide dictionaries exercise the probe and parallel waves, while
-        // budgets reached inside the probe select synchronous collection.
-        // Overlapping dictionaries and prefilled sets retain the same prefix,
-        // including budgets reached immediately after the ninth probe hit.
-        for threads in [1, 4] {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap();
-            for segment_count in [2, 3] {
-                let readers = &inverted[..segment_count];
-                for initial in [HashSet::new(), (0..20).map(term).collect()] {
-                    for max_expansions in [0, 1, 8, 9, 10, 24, 40, 1000] {
-                        for budget in [0, 1, 8, 9, 10, 11, 24, 40, 64, 1000] {
-                            let mut seq = initial.clone();
-                            let mut seq_cost = 2;
-                            let mut seq_truncated = false;
-                            for reader in readers {
-                                if SearchEngine::collect_automaton_terms(
-                                    reader,
-                                    &regexes[0],
-                                    max_expansions,
-                                    budget,
-                                    &mut seq,
-                                    &mut seq_cost,
-                                )
-                                .unwrap()
-                                {
-                                    seq_truncated = true;
-                                    break;
-                                }
-                            }
-                            let mut actual = initial.clone();
-                            let mut actual_cost = 2;
-                            let actual_truncated = pool
-                                .install(|| {
-                                    SearchEngine::collect_automatons_terms(
-                                        readers,
-                                        &regexes,
-                                        max_expansions,
-                                        budget,
-                                        &mut actual,
-                                        &mut actual_cost,
-                                    )
-                                })
-                                .unwrap();
-                            let case = format!("threads={threads} segments={segment_count} cap={max_expansions} budget={budget}");
-                            assert_eq!(actual, seq, "{case}");
-                            assert_eq!(actual_cost, seq_cost, "{case}");
-                            assert_eq!(actual_truncated, seq_truncated, "{case}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn term_budget_respects_segment_order_before_dictionary_order() {
-        let (mut engine, _dir) = make_engine();
-        engine.set_bulk_indexing(true).unwrap();
-        add(
-            &mut engine,
-            1,
-            "מלהד מלהה מלהו מלהז מלהח מלהט",
-            "/books/later.txt",
-        );
-        engine.commit().unwrap();
-        add(&mut engine, 2, "מלהא", "/books/early.txt");
-        engine.commit().unwrap();
-        let searcher = engine.index_reader.searcher();
-        let text = engine.schema.get_field("text").unwrap();
-        let early = Term::from_field_text(text, "מלהא");
-        let mut inverted: Vec<_> = searcher
-            .segment_readers()
-            .iter()
-            .map(|reader| reader.inverted_index(text).unwrap())
-            .collect();
-        assert_eq!(inverted.len(), 2);
-        // Reproduce the layout that made the overflow phrase test flaky:
-        // a segment containing later terms exhausts the cap before the
-        // segment that contains the globally earliest term is visited.
-        inverted.sort_by_key(|reader| reader.get_term_info(&early).unwrap().is_some());
-        let regexes = vec![tantivy_fst::Regex::new("מלה.*").unwrap()];
-        let mut seq = HashSet::new();
-        let mut seq_cost = 0;
-        assert!(SearchEngine::collect_automaton_terms(
-            &inverted[0],
-            &regexes[0],
-            5,
-            u64::MAX,
-            &mut seq,
-            &mut seq_cost,
-        )
-        .unwrap());
-        assert!(!seq.contains("מלהא"));
-        let mut parallel = HashSet::new();
-        let mut parallel_cost = 0;
-        assert!(SearchEngine::collect_automatons_terms(
-            &inverted,
-            &regexes,
-            5,
-            u64::MAX,
-            &mut parallel,
-            &mut parallel_cost,
-        )
-        .unwrap());
-        assert_eq!(parallel, seq);
-        assert_eq!(parallel_cost, seq_cost);
-    }
-
-    #[test]
     fn add_document_and_batch_normalize_like_add_text_book() {
         // ה-API הישירים חשופים ב-FFI — ההנחה "הקלט כבר מנורמל" נאכפת:
         // HTML מוסר, ניקוד מוסר מהשדה הרגיל, והעותק המנוקד נבנה מהגולמי.
         let raw = "<b>בְּרֵאשִׁית</b>  בָּרָא אלהים";
         let (mut engine, _dir) = make_engine();
         engine
-            .add_document(
+            .add_document_at(
                 1,
                 "title",
                 "ref",
@@ -17120,7 +18887,7 @@ mod tests {
             .unwrap();
         engine
             .add_documents_batch(vec![DocumentInput {
-                id: 2,
+                ordinal: 1,
                 title: "title".to_string(),
                 reference: "ref".to_string(),
                 topics: "/root".to_string(),
@@ -17130,16 +18897,16 @@ mod tests {
                 file_path: "/books/b.txt".to_string(),
                 content_hash: None,
                 text_hash: None,
+                source_hash: None,
                 text_vocalized: Some("<b>בְּרֵאשִׁית</b>  בָּרָא אלהים".to_string()),
-                section_id: None,
-                generation_order: None,
+                section_ordinal: None,
                 extra_facets: None,
                 text_storage: None,
             }])
             .unwrap();
         engine
             .upsert_documents_batch(vec![DocumentInput {
-                id: 3,
+                ordinal: 2,
                 title: "title".to_string(),
                 reference: "ref".to_string(),
                 topics: "/root".to_string(),
@@ -17149,9 +18916,9 @@ mod tests {
                 file_path: "/books/c.txt".to_string(),
                 content_hash: None,
                 text_hash: None,
+                source_hash: None,
                 text_vocalized: Some("<b>בְּרֵאשִׁית</b>  בָּרָא אלהים".to_string()),
-                section_id: None,
-                generation_order: None,
+                section_ordinal: None,
                 extra_facets: None,
                 text_storage: None,
             }])
@@ -17237,7 +19004,7 @@ mod tests {
             "<h1>ספר בראשית</h1>\n<h2>פרק א</h2>\nבְּרֵאשִׁית ברא אלהים\n<h2>פרק ב</h2>\nויכלו השמים";
         let (mut engine, _dir) = make_engine();
         let added = engine
-            .add_text_book_bytes(
+            .add_text_book_bytes_placed(
                 "בראשית".to_string(),
                 "/root".to_string(),
                 "/books/bereshit.txt".to_string(),
@@ -17275,8 +19042,6 @@ mod tests {
                 text.to_string(),
                 "בראשית".to_string(),
                 "/root".to_string(),
-                5,
-                DEFAULT_GENERATION_ORDER,
                 None,
             ))
         );
@@ -17291,7 +19056,7 @@ mod tests {
     fn add_text_book_empty_text_adds_nothing() {
         let (mut engine, _dir) = make_engine();
         let added = engine
-            .add_text_book(
+            .add_text_book_placed(
                 "ריק".to_string(),
                 "/root".to_string(),
                 "/books/empty.txt".to_string(),
@@ -17324,7 +19089,7 @@ mod tests {
             },
         ];
         let added = engine
-            .add_pdf_book(
+            .add_pdf_book_placed(
                 "ספר".to_string(),
                 "/root".to_string(),
                 "C:/books/sefer.pdf".to_string(),
@@ -18026,7 +19791,7 @@ mod tests {
     fn add_pdf_book_all_garbage_adds_nothing() {
         let (mut engine, _dir) = make_engine();
         let added = engine
-            .add_pdf_book(
+            .add_pdf_book_placed(
                 "סרוק".to_string(),
                 "/root".to_string(),
                 "C:/books/scanned.pdf".to_string(),
@@ -18258,23 +20023,23 @@ mod tests {
         // typo-only single word expands through a Levenshtein-1 automaton
         // scan (VARIATION_CEILING_RESEARCH §3.ג): full edit-distance-1
         // coverage, a superset of the historical literal variant list.
-        // "ספגר" — an insertion of ג, which is NOT in INSERTION_LETTERS — was
+        // "ברכגה" — an insertion of ג, which is NOT in INSERTION_LETTERS — was
         // invisible to the sampled variants and must now match; a distance-2
-        // word must not.
+        // word must not. (A word needs four letters for the full distance.)
         let (mut engine, _dir) = make_engine();
-        add(&mut engine, 1, "ספר בראשית", "/books/a.txt");
-        add(&mut engine, 2, "ספגר אחר", "/books/b.txt");
+        add(&mut engine, 1, "ברכה בראשית", "/books/a.txt");
+        add(&mut engine, 2, "ברכגה אחר", "/books/b.txt");
         add(&mut engine, 3, "תורה צוה", "/books/c.txt");
         engine.commit().unwrap();
 
         let mut options: HashMap<String, HashMap<String, bool>> = HashMap::new();
         options.insert(
-            "ספר_0".to_string(),
+            "ברכה_0".to_string(),
             HashMap::from([("שגיאות כתיב".to_string(), true)]),
         );
         let mut ids: Vec<u64> = search_advanced_default(
             &engine,
-            "ספר".to_string(),
+            "ברכה".to_string(),
             vec!["/root".to_string()],
             100,
             0,
@@ -18910,6 +20675,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 typo_options("משה"),
+                None,
             )
             .unwrap()
             .expect("pattern");
@@ -18936,6 +20702,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 options.clone(),
+                None,
             )
             .unwrap()
             .expect("pattern");
@@ -18949,6 +20716,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             options,
+            None,
         )
         .expect("pattern");
         assert_eq!(hl.combined_pattern, query_shape.combined_pattern);
@@ -18968,6 +20736,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 typo_options("משה"),
+                None,
             )
             .unwrap()
             .expect("pattern");
@@ -18977,6 +20746,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             typo_options("משה"),
+            None,
         )
         .expect("pattern");
         // Nothing in the index matches → never worse than the pure-string
@@ -19005,6 +20775,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 options,
+                None,
             )
             .unwrap()
             .expect("pattern");
@@ -19056,10 +20827,105 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
+                None,
             )
             .unwrap()
             .expect("pattern");
         assert_eq!(hl.combined_pattern, charwise("שלום"));
+    }
+
+    /// Otzaria/otzaria#1926: affixes with typos must still paint the forms in
+    /// the text when the index holds thousands of affixed forms of the word.
+    #[test]
+    fn index_highlight_affix_typo_paints_found_variants_among_many_forms() {
+        let (mut engine, _dir) = make_engine();
+        let line_a = "ימים אחר הזמן שייעד להביא כלומר עתה ידעתי כי מצוא אשר צוה";
+        let line_b = "אבל כשאין עשרה לא. וכל זמן שאין שלשה מצוה להם ליחלק";
+        let letters: Vec<char> = "אבגדהוזחטיכלמנסעפצקרשת".chars().collect();
+        let mut filler = Vec::new();
+        for a in &letters {
+            for b in &letters {
+                filler.push(format!("{a}{b}מצוה מצוה{a}{b} {a}{b}זמן"));
+            }
+        }
+        add(&mut engine, 1, line_a, "/books/a.txt");
+        add(&mut engine, 2, line_b, "/books/b.txt");
+        add(&mut engine, 3, &filler.join(" "), "/books/filler.txt");
+        engine.commit().unwrap();
+
+        let word_options: HashMap<String, bool> =
+            ["קידומות", "סיומות", "שגיאות כתיב", "כתיב מלא/חסר"]
+                .iter()
+                .map(|o| (o.to_string(), true))
+                .collect();
+        let options = HashMap::from([
+            ("זימון_0".to_string(), word_options.clone()),
+            ("מצוה_1".to_string(), word_options),
+        ]);
+        let matcher = engine
+            .generate_index_highlight_pattern(
+                "זימון מצוה".to_string(),
+                10,
+                HashMap::new(),
+                HashMap::new(),
+                options,
+                None,
+            )
+            .unwrap()
+            .expect("pattern")
+            .matcher
+            .expect("matcher");
+
+        let painted = |line: &str| -> Vec<String> {
+            let units: Vec<u16> = line.encode_utf16().collect();
+            matcher
+                .find_matches(line.to_string(), vec![])
+                .iter()
+                .flat_map(|m| {
+                    m.word_ranges.iter().map(|r| {
+                        String::from_utf16_lossy(
+                            &units[(m.start + r.start) as usize..(m.start + r.end) as usize],
+                        )
+                    })
+                })
+                .collect()
+        };
+        assert_eq!(painted(line_b), vec!["זמן", "מצוה"]);
+        // Word forms paint their root, as with affixes alone; typo terms paint whole.
+        assert_eq!(painted(line_a), vec!["זמן", "מצוא"]);
+    }
+
+    /// A one-sided expansion must keep painting a typo variant its own
+    /// branches cannot cover (`ברכתא` under prefixes only).
+    #[test]
+    fn index_highlight_one_sided_affix_typo_paints_variant() {
+        let (mut engine, _dir) = make_engine();
+        add(&mut engine, 1, "ברכתא תורה", "/books/a.txt");
+        engine.commit().unwrap();
+
+        let options = HashMap::from([(
+            "ברכת_0".to_string(),
+            HashMap::from([
+                ("קידומות".to_string(), true),
+                ("שגיאות כתיב".to_string(), true),
+            ]),
+        )]);
+        let matcher = engine
+            .generate_index_highlight_pattern(
+                "ברכת תורה".to_string(),
+                0,
+                HashMap::new(),
+                HashMap::new(),
+                options,
+                None,
+            )
+            .unwrap()
+            .expect("pattern")
+            .matcher
+            .expect("matcher");
+        let found = matcher.find_matches("ברכתא תורה".to_string(), vec![]);
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].start, found[0].end), (0, 10));
     }
 
     #[test]
@@ -19124,6 +20990,313 @@ mod tests {
         assert_eq!(counts.get("/books/a.txt").copied(), Some(2));
         assert_eq!(counts.get("/books/b.txt").copied(), Some(1));
         assert_eq!(counts.len(), 2);
+    }
+
+    /// Thousands of paths span many dictionary blocks, and only some of them match:
+    /// the batched ordinal-to-path pass must pair every path with its own count.
+    #[test]
+    fn test_count_by_book_many_paths_sparse_hits() {
+        let (mut engine, _dir) = make_engine();
+        let mut expected: HashMap<String, u32> = HashMap::new();
+        let mut id = 0;
+        for book in 0..3_000u32 {
+            let path = format!("/books/{:04}/ספר מספר {book} בספרייה.txt", book * 7 % 3_000);
+            for line in 0..(book % 4) {
+                id += 1;
+                let text = if (book + line) % 3 == 0 {
+                    "שלום עולם"
+                } else {
+                    "ביי"
+                };
+                add(&mut engine, id, text, &path);
+                if text.starts_with("שלום") {
+                    *expected.entry(path.clone()).or_insert(0) += 1;
+                }
+            }
+            if book == 1_500 {
+                engine.commit().unwrap();
+            }
+        }
+        engine.commit().unwrap();
+
+        let counts = engine
+            .count_by_book(vec!["שלום".to_string()], vec!["/root".to_string()], 0, 100)
+            .unwrap();
+
+        assert!(expected.len() > 1_000);
+        assert_eq!(counts, expected);
+    }
+
+    /// Segments are collected on the engine's own pool: concurrent callers, and
+    /// callers running inside rayon's global pool, neither deadlock nor diverge.
+    #[test]
+    fn multithread_search_executor_serves_concurrent_and_nested_searches() {
+        use rayon::prelude::*;
+        let (mut engine, _dir) = make_engine();
+        let mut id = 0;
+        for segment in 0..4 {
+            for line in 0..50 {
+                id += 1;
+                let text = if line % 2 == 0 {
+                    "שלום עולם"
+                } else {
+                    "ביי"
+                };
+                add(&mut engine, id, text, &format!("/books/{segment}.txt"));
+            }
+            engine.commit().unwrap();
+        }
+        assert_eq!(
+            matches!(
+                engine.index.search_executor(),
+                tantivy::Executor::ThreadPool(_)
+            ),
+            search_executor_threads() > 1
+        );
+        let by_book = || {
+            engine
+                .count_by_book(vec!["שלום".to_string()], vec!["/root".to_string()], 0, 100)
+                .unwrap()
+        };
+        let expected = by_book();
+        assert_eq!(expected.values().sum::<u32>(), 100);
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..20 {
+                        assert_eq!(by_book(), expected);
+                    }
+                });
+            }
+        });
+        (0..64)
+            .into_par_iter()
+            .for_each(|_| assert_eq!(by_book(), expected));
+    }
+
+    /// The first page ranks the following ones, so they and the counts are served
+    /// from the page cache; a commit drops it.
+    #[test]
+    fn later_pages_and_counts_come_from_the_page_cache() {
+        let (mut engine, _dir) = make_engine();
+        for id in 1..=30u64 {
+            let text = if id % 3 == 0 {
+                "שלום עולם"
+            } else {
+                "שלום"
+            };
+            add(&mut engine, id, text, &format!("/books/{}.txt", id % 4));
+            if id == 15 {
+                engine.commit().unwrap();
+            }
+        }
+        engine.commit().unwrap();
+        let page = |engine: &SearchEngine, offset| {
+            let page = engine
+                .search_and_count_exact(
+                    "שלום".to_string(),
+                    vec![],
+                    4,
+                    offset,
+                    ResultsOrder::Catalogue,
+                    false,
+                    false,
+                    None,
+                )
+                .unwrap();
+            let ids: Vec<u64> = page.results.iter().map(|r| r.id).collect();
+            (page.total_count, ids)
+        };
+        let by_book = |engine: &SearchEngine| {
+            engine
+                .count_by_book_exact("שלום".to_string(), vec![], false, false, None)
+                .unwrap()
+        };
+
+        assert_eq!(page(&engine, 0), (30, vec![1, 2, 3, 4]));
+        assert_eq!(engine.page_cache.len(), 1);
+        let cached: Vec<_> = (1..8).map(|n| page(&engine, n * 4)).collect();
+        let books = by_book(&engine);
+        assert_eq!(by_book(&engine), books);
+        assert_eq!(engine.page_cache.len(), 1);
+        engine.page_cache.clear();
+        let fresh: Vec<_> = (1..8).map(|n| page(&engine, n * 4)).collect();
+        assert_eq!(cached, fresh);
+        assert_eq!(cached[6], (30, vec![29, 30]));
+        engine.page_cache.clear();
+        assert_eq!(by_book(&engine), books);
+        assert_eq!(books.values().sum::<u32>(), 30);
+
+        add(&mut engine, 31, "שלום", "/books/new.txt");
+        engine.commit().unwrap();
+        assert_eq!(engine.page_cache.len(), 0);
+        assert_eq!(page(&engine, 28), (31, vec![29, 30, 31]));
+    }
+
+    /// A reload that changed no segment (the reader's own watcher reloads after every
+    /// commit) keeps the cached pages.
+    #[test]
+    fn a_reload_without_changes_keeps_the_page_cache() {
+        let (mut engine, _dir) = make_engine();
+        for id in 1..=5u64 {
+            add(&mut engine, id, "שלום", "/books/a.txt");
+        }
+        engine.commit().unwrap();
+        let search = |engine: &SearchEngine| {
+            engine
+                .search_and_count_exact(
+                    "שלום".to_string(),
+                    vec![],
+                    2,
+                    0,
+                    ResultsOrder::Catalogue,
+                    false,
+                    false,
+                    None,
+                )
+                .unwrap()
+                .total_count
+        };
+        assert_eq!(search(&engine), 5);
+        engine.index_reader.reload().unwrap();
+        assert_eq!(search(&engine), 5);
+        assert_eq!(engine.page_cache.len(), 1);
+    }
+
+    /// A loader that keeps each segment's columns reads every document as one read alone.
+    #[test]
+    fn a_document_loader_reads_each_document_as_a_single_read_does() {
+        let (mut engine, _dir) = make_engine();
+        for id in 1..=6u64 {
+            add(&mut engine, id, "שלום", &format!("/books/{}.txt", id % 2));
+            if id == 3 {
+                engine.commit().unwrap();
+            }
+        }
+        add(&mut engine, 7, "סרוק", "/books/scan.pdf");
+        engine.commit().unwrap();
+        let searcher = engine.index_reader.searcher();
+        let addresses: Vec<DocAddress> = searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .flat_map(|(ord, reader)| {
+                (0..reader.max_doc()).map(move |doc| DocAddress::new(ord as u32, doc))
+            })
+            .collect();
+        assert!(searcher.segment_readers().len() > 1);
+        let mut loader = DocumentLoader::new(&searcher);
+        for &address in addresses.iter().chain(addresses.iter().rev()) {
+            let alone = load_document(&searcher, address).unwrap();
+            let loaded = loader.load(address).unwrap();
+            assert_eq!(
+                loaded.to_json(&engine.schema),
+                alone.to_json(&engine.schema)
+            );
+            assert!(loaded
+                .get_first(engine.schema.get_field("title").unwrap())
+                .is_some());
+        }
+    }
+
+    /// A fuzzy query's cache key names its word: two fuzzy searches never share a page.
+    #[test]
+    fn fuzzy_searches_for_different_words_do_not_share_a_cached_page() {
+        let (mut engine, _dir) = make_engine();
+        add(&mut engine, 1, "שלום", "/books/a.txt");
+        add(&mut engine, 2, "ירושלים", "/books/b.txt");
+        engine.commit().unwrap();
+        let ids = |word: &str| -> Vec<u64> {
+            engine
+                .search_and_count_fuzzy(
+                    word.to_string(),
+                    vec![],
+                    10,
+                    0,
+                    1,
+                    ResultsOrder::Catalogue,
+                    false,
+                    false,
+                    None,
+                )
+                .unwrap()
+                .results
+                .iter()
+                .map(|r| r.id)
+                .collect()
+        };
+        assert_eq!(ids("שלום"), vec![1]);
+        assert_eq!(ids("ירושלים"), vec![2]);
+    }
+
+    /// The index-based display pattern is computed once per index snapshot: equal
+    /// requests share it, and a commit brings in the variants it added.
+    #[test]
+    fn index_highlight_pattern_is_cached_per_snapshot() {
+        let (mut engine, _dir) = make_engine();
+        add(&mut engine, 1, "ירושלים עיר הקודש", "/books/a.txt");
+        engine.commit().unwrap();
+        let typo: HashMap<String, HashMap<String, bool>> = [(
+            "ירושלים_0".to_string(),
+            [("שגיאות כתיב".to_string(), true)].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect();
+        let pattern = |engine: &SearchEngine| {
+            engine
+                .generate_index_highlight_pattern(
+                    "ירושלים".to_string(),
+                    0,
+                    HashMap::new(),
+                    HashMap::new(),
+                    typo.clone(),
+                    None,
+                )
+                .unwrap()
+                .expect("pattern")
+                .word_patterns
+        };
+        let first = pattern(&engine);
+        assert_eq!(pattern(&engine), first);
+        engine.highlight_cache.clear();
+        assert_eq!(pattern(&engine), first);
+
+        add(&mut engine, 2, "ירושלם עיר הקודש", "/books/a.txt");
+        engine.commit().unwrap();
+        assert_ne!(pattern(&engine), first);
+    }
+
+    /// A cancelled request id stops its counts, and leaves nothing behind for
+    /// the same search without it; other ids and untagged calls run.
+    #[test]
+    fn cancelled_lexical_request_fails_its_counts_only() {
+        let (mut engine, _dir) = make_engine();
+        for id in 1..=20u64 {
+            add(
+                &mut engine,
+                id,
+                "שלום עולם",
+                &format!("/books/{}.txt", id % 3),
+            );
+        }
+        engine.commit().unwrap();
+        let by_book = |id: Option<u32>| {
+            engine.count_by_book_exact("שלום".to_string(), vec![], false, false, id)
+        };
+        let count =
+            |id: Option<u32>| engine.count_exact("שלום".to_string(), vec![], false, false, id);
+
+        engine.cancel_lexical_search(9);
+        for err in [by_book(Some(9)).unwrap_err(), count(Some(9)).unwrap_err()] {
+            assert!(LexicalSearchCancelled::is(&err));
+            assert_eq!(err.to_string(), LexicalSearchCancelled::MESSAGE);
+        }
+        let expected = by_book(None).unwrap();
+        assert_eq!(expected.values().sum::<u32>(), 20);
+        assert_eq!(by_book(Some(10)).unwrap(), expected);
+        assert_eq!(count(Some(10)).unwrap(), 20);
+        assert_eq!(count(None).unwrap(), 20);
     }
 
     #[test]
@@ -19257,7 +21430,7 @@ mod tests {
         engine.commit().unwrap();
 
         engine
-            .upsert_document(
+            .upsert_document_at(
                 1,
                 "title",
                 "ref",
@@ -19321,9 +21494,10 @@ mod tests {
         );
     }
 
-    fn fingerprint_doc(id: u64, text: &str, file_path: &str, hash: Option<u64>) -> DocumentInput {
+    /// Line `id - 1` of `file_path`.
+    fn fingerprint_doc(id: u32, text: &str, file_path: &str, hash: Option<u64>) -> DocumentInput {
         DocumentInput {
-            id,
+            ordinal: id - 1,
             title: "ספר".to_string(),
             reference: "ref".to_string(),
             topics: "/root".to_string(),
@@ -19333,9 +21507,9 @@ mod tests {
             file_path: file_path.to_string(),
             content_hash: hash,
             text_hash: hash,
+            source_hash: None,
             text_vocalized: None,
-            section_id: None,
-            generation_order: None,
+            section_ordinal: None,
             extra_facets: None,
             text_storage: None,
         }
@@ -19420,6 +21594,219 @@ mod tests {
         assert!(engine.count_documents_by_file_path().unwrap().is_empty());
     }
 
+    /// The doc store keeps `reference`, `id` and the stored texts, and `segment` only where
+    /// `id` does not imply it; results still carry every field, read from the columns.
+    #[test]
+    fn the_doc_store_keeps_only_what_no_column_answers() {
+        let (mut engine, _dir) = make_engine();
+        engine
+            .add_text_book_placed(
+                "ספר טקסט".to_string(),
+                "/root".to_string(),
+                "id:1".to_string(),
+                1,
+                DEFAULT_GENERATION_ORDER,
+                "<h1>ספר</h1>
+שורה עם מילה ייחודית"
+                    .to_string(),
+                None,
+                TextStorage::InIndex,
+                None,
+            )
+            .unwrap();
+        engine
+            .add_pdf_book_placed(
+                "ספר סרוק".to_string(),
+                "/root".to_string(),
+                "/pdf/a.pdf".to_string(),
+                2,
+                DEFAULT_GENERATION_ORDER,
+                vec![PdfPageInput {
+                    reference: "עמוד 5".to_string(),
+                    text: "עמוד עם מילה ייחודית".to_string(),
+                    page_index: 4,
+                }],
+                None,
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        engine.index_reader.reload().unwrap();
+
+        let searcher = engine.index_reader.searcher();
+        for (ord, reader) in searcher.segment_readers().iter().enumerate() {
+            for doc in reader.doc_ids_alive() {
+                let stored: TantivyDocument =
+                    searcher.doc(DocAddress::new(ord as u32, doc)).unwrap();
+                let mut names: Vec<&str> = stored
+                    .field_values()
+                    .map(|(field, _)| engine.schema.get_field_name(field))
+                    .collect();
+                names.sort_unstable();
+                names.dedup();
+                let pdf = names.contains(&"segment");
+                let mut expected = vec!["id", "reference", TEXT_STORED_FIELD];
+                if pdf {
+                    expected.push("segment");
+                }
+                expected.sort_unstable();
+                assert_eq!(names, expected);
+            }
+        }
+
+        let mut results = engine
+            .search_exact(
+                "ייחודית".to_string(),
+                vec![],
+                10,
+                0,
+                ResultsOrder::Catalogue,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        let pdf = results.pop().unwrap();
+        let text = results.pop().unwrap();
+        assert_eq!(
+            (
+                text.title.as_str(),
+                text.is_pdf,
+                text.file_path.as_str(),
+                text.segment
+            ),
+            ("ספר טקסט", false, "id:1", 1)
+        );
+        assert_eq!(
+            (
+                pdf.title.as_str(),
+                pdf.is_pdf,
+                pdf.file_path.as_str(),
+                pdf.segment
+            ),
+            ("ספר סרוק", true, "/pdf/a.pdf", 4)
+        );
+        let by_id = engine.get_document_by_id(pdf.id).unwrap().unwrap();
+        assert_eq!(
+            (by_id.title, by_id.is_pdf, by_id.segment),
+            (pdf.title, true, 4)
+        );
+    }
+
+    /// `id` has no term index: deleting, replacing and fetching by id scan its column.
+    #[test]
+    fn lookups_by_id_need_no_id_index() {
+        let (mut engine, _dir) = make_engine();
+        assert!(!engine
+            .schema
+            .get_field_entry(engine.schema.get_field("id").unwrap())
+            .is_indexed());
+        for id in 1..=4 {
+            engine
+                .add_documents_batch(vec![fingerprint_doc(
+                    id,
+                    &format!("שורה {id}"),
+                    "id:1",
+                    None,
+                )])
+                .unwrap();
+            engine.commit().unwrap();
+        }
+        // "id:1" is the index's first book: number 1.
+        let id = |line: u64| (1u64 << 32) + line;
+        engine.delete_document_by_id(id(2)).unwrap();
+        engine
+            .upsert_documents_batch(vec![
+                fingerprint_doc(3, "ראשונה", "id:1", None),
+                fingerprint_doc(3, "אחרונה", "id:1", None),
+                fingerprint_doc(5, "חדשה", "id:1", None),
+            ])
+            .unwrap();
+        engine.commit().unwrap();
+        engine.index_reader.reload().unwrap();
+
+        assert!(engine.get_document_by_id(id(2)).unwrap().is_none());
+        assert_eq!(
+            engine.get_document_by_id(id(1)).unwrap().unwrap().text,
+            "שורה 1"
+        );
+        assert_eq!(
+            engine.get_document_by_id(id(3)).unwrap().unwrap().text,
+            "אחרונה"
+        );
+        assert_eq!(
+            engine.get_document_by_id(id(5)).unwrap().unwrap().text,
+            "חדשה"
+        );
+        assert_eq!(engine.get_document_count(), 4);
+    }
+
+    /// One document of a book holds its fingerprints, so the columns cost nothing on the
+    /// rest; the book's value is read from it, whatever its other documents lack.
+    #[test]
+    fn book_fingerprints_live_on_one_document() {
+        let (mut engine, _dir) = make_engine();
+        let text = "<h1>ספר</h1>
+שורה ראשונה
+שורה שנייה
+שורה שלישית";
+        engine
+            .add_text_book_placed(
+                "ספר".to_string(),
+                "/root".to_string(),
+                "id:1".to_string(),
+                1,
+                DEFAULT_GENERATION_ORDER,
+                text.to_string(),
+                None,
+                TextStorage::InIndex,
+                None,
+            )
+            .unwrap();
+        engine
+            .add_documents_batch(vec![
+                fingerprint_doc(100, "א", "id:2", Some(5)),
+                fingerprint_doc(101, "ב", "id:2", Some(5)),
+                fingerprint_doc(102, "ג", "id:2", None),
+            ])
+            .unwrap();
+        engine.commit().unwrap();
+        engine.index_reader.reload().unwrap();
+
+        let searcher = engine.index_reader.searcher();
+        let mut holders = 0;
+        for reader in searcher.segment_readers() {
+            for name in ["contentHash", "textHash"] {
+                let column = reader.fast_fields().u64(name).unwrap();
+                holders += reader
+                    .doc_ids_alive()
+                    .filter(|&doc| column.first(doc).is_some())
+                    .count();
+            }
+        }
+        assert_eq!(holders, 4, "two books, two columns, one document each");
+
+        let text_hash = compute_content_fingerprint(text.to_string());
+        assert_eq!(
+            engine.get_book_text_fingerprints().unwrap()["id:1"],
+            text_hash
+        );
+        assert_eq!(
+            engine
+                .get_book_text_fingerprint("id:1".to_string())
+                .unwrap(),
+            text_hash
+        );
+        assert_ne!(engine.get_book_fingerprints().unwrap()["id:1"], 0);
+        assert_eq!(engine.get_book_fingerprints().unwrap()["id:2"], 5);
+        assert_eq!(
+            engine
+                .get_book_text_fingerprint("id:2".to_string())
+                .unwrap(),
+            5
+        );
+    }
+
     #[test]
     fn get_book_fingerprints_conflicting_docs_collapse_to_zero() {
         let (mut engine, _dir) = make_engine();
@@ -19444,7 +21831,7 @@ mod tests {
         let text_b = "<h1>ספר ב</h1>\nשורה אחרת";
         for (order, path, text) in [(1u32, "id:1", text_a), (2, "id:2", text_b)] {
             engine
-                .add_text_book(
+                .add_text_book_placed(
                     "ספר".to_string(),
                     "/root".to_string(),
                     path.to_string(),
@@ -19505,40 +21892,50 @@ mod tests {
 
     #[test]
     fn text_fingerprint_survives_catalogue_order_change() {
-        // מהות ההפרדה בין החתימות: אינדוקס-מחדש בסדר קטלוגי אחר (ספר נוסף
-        // לספרייה) משנה את הקנונית אך לא את חתימת הטקסט — כך אימות דריפט
-        // תוכן אינו נפסל משינויי קטלוג (issue Otzaria#828).
-        let text = "<h1>ספר</h1>\nשורה של תוכן";
+        // מקום הספר בקטלוג אינו באינדקס כלל: הזזתו אינה משנה אף חתימה ואף מזהה,
+        // ואינדוקס-מחדש של הספר שומר על מספרו (issue Otzaria#828).
+        let text = "<h1>ספר</h1>
+שורה של תוכן";
         let (mut engine, _dir) = make_engine();
-        let index = |engine: &mut SearchEngine, order: u32| {
+        let index = |engine: &mut SearchEngine| {
             engine
                 .add_text_book(
                     "ספר".to_string(),
                     "/root".to_string(),
                     "id:1".to_string(),
-                    order,
-                    DEFAULT_GENERATION_ORDER,
                     text.to_string(),
                     None,
                     TextStorage::InIndex,
+                    None,
                     None,
                 )
                 .unwrap();
             engine.commit().unwrap();
         };
+        let place = |engine: &SearchEngine, catalogue_order| {
+            engine
+                .set_book_order(vec![BookOrderEntry {
+                    file_path: "id:1".to_string(),
+                    catalogue_order,
+                    generation_order: 0,
+                }])
+                .unwrap()
+        };
 
-        index(&mut engine, 5);
-        let canonical_before = engine.get_book_fingerprints().unwrap()["id:1"];
-        let text_before = engine.get_book_text_fingerprints().unwrap()["id:1"];
+        index(&mut engine);
+        place(&engine, 5);
+        let before = engine.get_book_stamps().unwrap();
+        assert_eq!(place(&engine, 6), 2);
+        assert_eq!(engine.get_book_stamps().unwrap(), before);
 
         engine.delete_documents_by_file_path("id:1").unwrap();
-        index(&mut engine, 6);
-        let canonical_after = engine.get_book_fingerprints().unwrap()["id:1"];
-        let text_after = engine.get_book_text_fingerprints().unwrap()["id:1"];
-
-        assert_ne!(canonical_before, canonical_after);
-        assert_eq!(text_before, text_after);
-        assert_eq!(text_after, compute_content_fingerprint(text.to_string()));
+        index(&mut engine);
+        assert_eq!(engine.get_book_stamps().unwrap(), before);
+        assert_eq!(before[0].book_number, 1);
+        assert_eq!(
+            before[0].text_hash,
+            compute_content_fingerprint(text.to_string())
+        );
     }
 
     #[test]
@@ -19740,6 +22137,7 @@ mod tests {
                 2,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert_eq!(count, 1);
@@ -19770,6 +22168,7 @@ mod tests {
                 0,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert_eq!(count, 2);
@@ -19868,6 +22267,7 @@ mod tests {
                 2,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert_eq!(count, 3, "ranking boosts must not change the recall set");
@@ -19989,6 +22389,7 @@ mod tests {
                 max_distance,
                 false,
                 false,
+                None,
             )
             .unwrap()
     }
@@ -20450,7 +22851,7 @@ mod tests {
         engine.optimize().unwrap();
 
         engine
-            .upsert_document(
+            .upsert_document_at(
                 1,
                 "title",
                 "ref",
@@ -20499,7 +22900,7 @@ mod tests {
             engine.index.writer(DEFAULT_WRITER_HEAP_SIZE).unwrap();
 
         let err = engine
-            .add_document(
+            .add_document_at(
                 1,
                 "title",
                 "ref",
@@ -20632,7 +23033,7 @@ mod tests {
         let stored = crate::hebrew_query::normalize_text_for_indexing(raw);
         assert_eq!(stored, "ובזה יובן ש\"ס (עא:) הממלא גרונם, מים וכו'");
         engine
-            .add_document(
+            .add_document_at(
                 1,
                 "title",
                 "ref",
@@ -21086,6 +23487,8 @@ mod tests {
                 SearchScope::WordDistance,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap();
         assert!(
@@ -21110,6 +23513,8 @@ mod tests {
                 false,
                 SearchScope::WordDistance,
                 SearchScope::WordDistance,
+                None,
+                None,
                 None,
                 None,
             )
@@ -21137,6 +23542,7 @@ mod tests {
                 false,
                 SearchScope::WordDistance,
                 SearchScope::WordDistance,
+                None,
                 None,
                 None,
             )
@@ -21167,6 +23573,8 @@ mod tests {
                 SearchScope::WordDistance,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap();
         assert!(!count.truncated, "under the cap the count must not flag");
@@ -21190,6 +23598,7 @@ mod tests {
                 false,
                 SearchScope::WordDistance,
                 SearchScope::WordDistance,
+                None,
                 None,
                 None,
             )
@@ -21998,6 +24407,7 @@ mod tests {
             3,
             false,
             false,
+            None,
         );
         assert!(count.is_err(), "distance > 2 should error, not panic");
     }
@@ -22064,13 +24474,25 @@ mod tests {
 
         assert_eq!(
             engine
-                .count_exact("שלום".to_string(), vec!["/root".to_string()], false, false)
+                .count_exact(
+                    "שלום".to_string(),
+                    vec!["/root".to_string()],
+                    false,
+                    false,
+                    None
+                )
                 .unwrap(),
             2
         );
 
         let by_book = engine
-            .count_by_book_exact("שלום".to_string(), vec!["/root".to_string()], false, false)
+            .count_by_book_exact(
+                "שלום".to_string(),
+                vec!["/root".to_string()],
+                false,
+                false,
+                None,
+            )
             .unwrap();
         assert_eq!(by_book.get("/books/a.txt").copied(), Some(2));
 
@@ -22102,7 +24524,7 @@ mod tests {
                     וַיֹּ\u{05A3}אמֶר אֱלֹהִים יְהִי אוֹר\n\
                     וּבָרָא עוֹלָם";
         engine
-            .add_text_book(
+            .add_text_book_placed(
                 "בראשית".to_string(),
                 "/tanakh".to_string(),
                 "/books/b.txt".to_string(),
@@ -22254,7 +24676,7 @@ mod tests {
         assert_eq!(page.results.len(), 1);
 
         let by_book = engine
-            .count_by_book_exact("בָּרָא".to_string(), vec![], true, false)
+            .count_by_book_exact("בָּרָא".to_string(), vec![], true, false, None)
             .unwrap();
         assert_eq!(by_book.get("/books/b.txt"), Some(&1));
     }
@@ -22407,7 +24829,7 @@ mod tests {
                     כאן נדון רק במלאכת שבת\n\
                     מתעסק וגם אינו מתכוין באותה שורה";
         engine
-            .add_text_book(
+            .add_text_book_placed(
                 "ספר הבדיקה".to_string(),
                 "/root".to_string(),
                 "/books/scope.txt".to_string(),
@@ -22510,6 +24932,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
             .into_iter()
@@ -22538,6 +24961,7 @@ mod tests {
                 false,
                 SearchScope::SameSection,
                 SearchScope::SameSection,
+                None,
                 None,
                 None,
                 None,
@@ -22646,6 +25070,7 @@ mod tests {
                 None,
                 mode,
                 count,
+                None,
             )
             .unwrap()
     }
@@ -22842,6 +25267,7 @@ mod tests {
                 None,
                 Some(WordMatchMode::AnyWord),
                 None,
+                None,
             )
             .unwrap()
             .into_iter()
@@ -22868,7 +25294,7 @@ mod tests {
             "תֵּדַע יָדֹעַ זַרְעֲךָ",
         ];
         engine
-            .add_text_book(
+            .add_text_book_placed(
                 "ספר הבדיקה".to_string(),
                 "/root".to_string(),
                 "/books/highlight_parity.txt".to_string(),
@@ -22914,6 +25340,7 @@ mod tests {
                         &HashMap::new(),
                         &HashMap::new(),
                         &HashMap::new(),
+                        false,
                     )
                     .unwrap();
                     if !highlight.matcher.find_matches(line, &[]).is_empty() {
@@ -22926,6 +25353,446 @@ mod tests {
                 "שורה {line:?}: החיפוש וההדגשה חייבים להתאים באותו מרווח"
             );
         }
+    }
+
+    // ── Any-order word distance (Otzaria/otzaria#2006) ────────────────────
+
+    const ANY_ORDER_LINES: [&str; 7] = [
+        "חייב להחזיר",
+        "להחזיר חייב",
+        "להחזיר את החפץ חייב",
+        "להחזיר את החפץ הזה חייב",
+        "חייב לשלם ולא להחזיר",
+        "אמר רבי יוחנן",
+        "אמר רבי אמר",
+    ];
+
+    /// Line `i` lands at segment `2 * i`: filler lines keep the ordered
+    /// search's cross-line matches out of these tests.
+    fn lines_engine(lines: &[&str]) -> (SearchEngine, TempDir) {
+        let (mut engine, dir) = make_engine();
+        engine
+            .add_text_book_placed(
+                "ספר הסדר".to_string(),
+                "/root".to_string(),
+                "/books/any_order.txt".to_string(),
+                9,
+                0,
+                lines.join("\nמילים אחרות לגמרי בשורה\n"),
+                None,
+                TextStorage::InIndex,
+                None,
+            )
+            .unwrap();
+        engine.commit().unwrap();
+        (engine, dir)
+    }
+
+    /// One advanced query, run through every public advanced entry point.
+    struct AdvancedCall<'a> {
+        query: &'a str,
+        negative: &'a str,
+        distance: u32,
+        custom_spacing: HashMap<String, String>,
+        options: HashMap<String, HashMap<String, bool>>,
+        any_order: Option<bool>,
+    }
+
+    impl<'a> AdvancedCall<'a> {
+        fn new(query: &'a str, distance: u32, any_order: Option<bool>) -> Self {
+            Self {
+                query,
+                negative: "",
+                distance,
+                custom_spacing: HashMap::new(),
+                options: HashMap::new(),
+                any_order,
+            }
+        }
+
+        fn search(&self, engine: &SearchEngine) -> Vec<SearchResult> {
+            self.search_in_order(engine, ResultsOrder::Catalogue)
+        }
+
+        fn search_in_order(&self, engine: &SearchEngine, order: ResultsOrder) -> Vec<SearchResult> {
+            engine
+                .search_advanced(
+                    self.query.to_string(),
+                    self.negative.to_string(),
+                    vec!["/root".to_string()],
+                    100,
+                    0,
+                    self.distance,
+                    self.distance,
+                    self.custom_spacing.clone(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    self.options.clone(),
+                    HashMap::new(),
+                    order,
+                    false,
+                    false,
+                    SearchScope::WordDistance,
+                    SearchScope::WordDistance,
+                    None,
+                    None,
+                    None,
+                    self.any_order,
+                )
+                .unwrap()
+        }
+
+        fn lines(&self, engine: &SearchEngine) -> Vec<u64> {
+            self.search(engine).iter().map(|r| r.segment / 2).collect()
+        }
+
+        fn count(&self, engine: &SearchEngine) -> u32 {
+            engine
+                .count_advanced(
+                    self.query.to_string(),
+                    self.negative.to_string(),
+                    vec!["/root".to_string()],
+                    self.distance,
+                    self.distance,
+                    self.custom_spacing.clone(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    self.options.clone(),
+                    HashMap::new(),
+                    false,
+                    false,
+                    SearchScope::WordDistance,
+                    SearchScope::WordDistance,
+                    None,
+                    None,
+                    self.any_order,
+                    None,
+                )
+                .unwrap()
+        }
+
+        fn count_by_book(&self, engine: &SearchEngine) -> u32 {
+            engine
+                .count_by_book_advanced(
+                    self.query.to_string(),
+                    self.negative.to_string(),
+                    vec!["/root".to_string()],
+                    self.distance,
+                    self.distance,
+                    self.custom_spacing.clone(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    self.options.clone(),
+                    HashMap::new(),
+                    false,
+                    false,
+                    SearchScope::WordDistance,
+                    SearchScope::WordDistance,
+                    None,
+                    None,
+                    self.any_order,
+                    None,
+                )
+                .unwrap()
+                .values()
+                .sum()
+        }
+
+        fn facet_count(&self, engine: &SearchEngine) -> u64 {
+            engine
+                .get_facet_counts_advanced(
+                    self.query.to_string(),
+                    self.negative.to_string(),
+                    vec!["/root".to_string()],
+                    "/".to_string(),
+                    self.distance,
+                    self.distance,
+                    self.custom_spacing.clone(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    self.options.clone(),
+                    HashMap::new(),
+                    false,
+                    false,
+                    SearchScope::WordDistance,
+                    SearchScope::WordDistance,
+                    None,
+                    None,
+                    self.any_order,
+                )
+                .unwrap()
+                .iter()
+                .filter(|facet| facet.path == "/root")
+                .map(|facet| facet.count)
+                .sum()
+        }
+
+        fn page_count(&self, engine: &SearchEngine) -> u32 {
+            engine
+                .search_and_count_advanced(
+                    self.query.to_string(),
+                    self.negative.to_string(),
+                    vec!["/root".to_string()],
+                    100,
+                    0,
+                    self.distance,
+                    self.distance,
+                    self.custom_spacing.clone(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    self.options.clone(),
+                    HashMap::new(),
+                    ResultsOrder::Catalogue,
+                    false,
+                    false,
+                    SearchScope::WordDistance,
+                    SearchScope::WordDistance,
+                    None,
+                    None,
+                    None,
+                    self.any_order,
+                )
+                .unwrap()
+                .total_count
+        }
+    }
+
+    #[test]
+    fn any_order_finds_reversed_words_within_the_window_only() {
+        let (engine, _dir) = lines_engine(&ANY_ORDER_LINES);
+        let lines = |distance, any_order| {
+            AdvancedCall::new("חייב להחזיר", distance, any_order).lines(&engine)
+        };
+        // Two words: at most `distance` words between them, in either order.
+        assert_eq!(lines(0, Some(true)), [0, 1]);
+        assert_eq!(lines(1, Some(true)), [0, 1]);
+        assert_eq!(lines(2, Some(true)), [0, 1, 2, 4]);
+        assert_eq!(lines(3, Some(true)), [0, 1, 2, 3, 4]);
+        assert_eq!(
+            AdvancedCall::new("להחזיר חייב", 2, Some(true)).lines(&engine),
+            [0, 1, 2, 4]
+        );
+        // Three words: the window is what an ordered match may span, (k-1)·(d+1).
+        assert_eq!(
+            AdvancedCall::new("להחזיר החפץ חייב", 1, None).lines(&engine),
+            [2, 3]
+        );
+        for query in ["להחזיר החפץ חייב", "חייב החפץ להחזיר"] {
+            assert_eq!(
+                AdvancedCall::new(query, 1, Some(true)).lines(&engine),
+                [2, 3]
+            );
+            assert!(AdvancedCall::new(query, 0, Some(true))
+                .lines(&engine)
+                .is_empty());
+        }
+        // The ordered search is unchanged, whether the flag is off or absent.
+        for any_order in [None, Some(false)] {
+            assert_eq!(lines(0, any_order), [0]);
+            assert_eq!(lines(3, any_order), [0, 4]);
+        }
+    }
+
+    #[test]
+    fn any_order_relevance_ranks_tighter_windows_first() {
+        let (engine, _dir) =
+            lines_engine(&["להחזיר את החפץ הזה חייב", "להחזיר את חייב", "חייב להחזיר"]);
+        let call = AdvancedCall::new("חייב להחזיר", 3, Some(true));
+        let ranked: Vec<u64> = call
+            .search_in_order(&engine, ResultsOrder::Relevance)
+            .iter()
+            .map(|r| r.segment / 2)
+            .collect();
+        assert_eq!(ranked, [2, 1, 0]);
+        assert_eq!(call.lines(&engine), [0, 1, 2]);
+    }
+
+    #[test]
+    fn any_order_relevance_ranks_the_tightest_overlapping_window() {
+        let (engine, _dir) = lines_engine(&["חייב את החפץ הזה להחזיר חייב", "חייב את להחזיר"]);
+        let call = AdvancedCall::new("חייב להחזיר", 5, Some(true));
+        let ranked: Vec<u64> = call
+            .search_in_order(&engine, ResultsOrder::Relevance)
+            .iter()
+            .map(|r| r.segment / 2)
+            .collect();
+        assert_eq!(
+            ranked,
+            [0, 1],
+            "the adjacent reversed match must outrank distance two"
+        );
+    }
+
+    #[test]
+    fn any_order_gives_each_repeated_word_its_own_occurrence() {
+        let (engine, _dir) = lines_engine(&ANY_ORDER_LINES);
+        let lines = |query, distance| AdvancedCall::new(query, distance, Some(true)).lines(&engine);
+        // Line 5 holds "אמר" once; line 6 twice, two positions apart.
+        assert!(lines("אמר אמר", 0).is_empty());
+        assert_eq!(lines("אמר אמר", 1), [6]);
+        assert_eq!(lines("אמר רבי אמר", 0), [6]);
+        assert_eq!(lines("רבי אמר אמר", 0), [6]);
+        assert!(lines("רבי אמר רבי", 5).is_empty());
+    }
+
+    #[test]
+    fn any_order_is_ignored_with_custom_spacing() {
+        let (engine, _dir) = lines_engine(&ANY_ORDER_LINES);
+        let mut call = AdvancedCall::new("חייב להחזיר", 0, Some(true));
+        call.custom_spacing = HashMap::from([("0-1".to_string(), "3".to_string())]);
+        assert_eq!(call.lines(&engine), [0, 4]);
+        let pattern = generate_highlight_pattern(
+            "חייב להחזיר".to_string(),
+            0,
+            call.custom_spacing.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            Some(true),
+        )
+        .unwrap();
+        let matcher = pattern.matcher.unwrap();
+        assert!(matcher
+            .find_matches(ANY_ORDER_LINES[2].to_string(), Vec::new())
+            .is_empty());
+        assert_eq!(
+            matcher
+                .find_matches(ANY_ORDER_LINES[4].to_string(), Vec::new())
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn negative_query_follows_the_any_order_flag() {
+        let (engine, _dir) = lines_engine(&ANY_ORDER_LINES);
+        // "החפץ" is in lines 2 and 3; the negative words are reversed in both,
+        // three positions apart in line 2 and four in line 3.
+        let mut call = AdvancedCall::new("החפץ", 2, None);
+        call.negative = "חייב להחזיר";
+        assert_eq!(call.lines(&engine), [2, 3]);
+        call.any_order = Some(true);
+        assert_eq!(call.lines(&engine), [3]);
+        assert_eq!(call.count(&engine), 1);
+    }
+
+    #[test]
+    fn any_order_counts_agree_with_search() {
+        let (engine, _dir) = lines_engine(&ANY_ORDER_LINES);
+        for (query, distance, any_order) in [
+            ("חייב להחזיר", 0, Some(true)),
+            ("חייב להחזיר", 2, Some(true)),
+            ("להחזיר חייב", 3, Some(true)),
+            ("להחזיר חייב", 3, None),
+            ("אמר אמר", 1, Some(true)),
+        ] {
+            let call = AdvancedCall::new(query, distance, any_order);
+            let found = call.search(&engine).len() as u32;
+            let label = format!("{query:?} distance={distance} any_order={any_order:?}");
+            assert_eq!(call.count(&engine), found, "{label}");
+            assert_eq!(call.count_by_book(&engine), found, "{label}");
+            assert_eq!(call.facet_count(&engine), found as u64, "{label}");
+            assert_eq!(call.page_count(&engine), found, "{label}");
+        }
+    }
+
+    /// The query word count a snippet paints, from its highlight markup.
+    fn painted_words(html: &str) -> Vec<String> {
+        html.split("<font color=red>")
+            .skip(1)
+            .map(|rest| rest.split("</font>").next().unwrap().to_string())
+            .collect()
+    }
+
+    /// Search, results snippet and both book highlighters agree on any-order
+    /// matches. With a prefix option every word keeps its own bounded affix
+    /// window — the engine's pattern — even when the caller waives boundaries.
+    #[test]
+    fn any_order_highlights_agree_with_search() {
+        let lines = [
+            "חייב להחזיר",
+            "להחזיר חייב",
+            "להחזיר את החפץ חייב",
+            "להחזיר וחייב",
+            "להחזיר אבגדחייב",
+            "אבגדחייב להחזיר",
+            "וחייב אחד להחזיר",
+            "חייב",
+        ];
+        let (engine, _dir) = lines_engine(&lines);
+        let prefix = HashMap::from([(
+            "חייב_0".to_string(),
+            HashMap::from([("קידומות".to_string(), true)]),
+        )]);
+        let mut prefixed = AdvancedCall::new("חייב להחזיר", 1, Some(true));
+        prefixed.options = prefix.clone();
+        // Four letters before the root exceed its prefix window, on either side.
+        assert_eq!(prefixed.lines(&engine), [0, 1, 3, 6]);
+        for options in [HashMap::new(), prefix] {
+            for distance in 0..=2 {
+                let mut call = AdvancedCall::new("חייב להחזיר", distance, Some(true));
+                call.options = options.clone();
+                let results = call.search(&engine);
+                let index_pattern = engine
+                    .generate_index_highlight_pattern(
+                        "חייב להחזיר".to_string(),
+                        distance,
+                        HashMap::new(),
+                        HashMap::new(),
+                        options.clone(),
+                        Some(true),
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .matcher
+                    .unwrap();
+                let plain_pattern = generate_highlight_pattern(
+                    "חייב להחזיר".to_string(),
+                    distance,
+                    HashMap::new(),
+                    HashMap::new(),
+                    options.clone(),
+                    Some(true),
+                )
+                .unwrap()
+                .matcher
+                .unwrap();
+                for (index, line) in lines.iter().enumerate() {
+                    let label = format!("{line:?} distance={distance} options={options:?}");
+                    let hit = results.iter().find(|r| r.segment as usize == 2 * index);
+                    for matcher in [&index_pattern, &plain_pattern] {
+                        for boundaries in [Vec::new(), vec![false, false]] {
+                            assert_eq!(
+                                !matcher
+                                    .find_matches(line.to_string(), boundaries)
+                                    .is_empty(),
+                                hit.is_some(),
+                                "{label}"
+                            );
+                        }
+                    }
+                    if let Some(hit) = hit {
+                        assert_eq!(painted_words(&hit.text).len(), 2, "{label}: {}", hit.text);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn any_order_snippet_paints_the_reversed_occurrence_only() {
+        let (engine, _dir) = lines_engine(&["חייב בדבר ואחר כך להחזיר חייב"]);
+        // Only the last two words are within the window; the first "חייב" stays plain.
+        let results = AdvancedCall::new("חייב להחזיר", 0, Some(true)).search(&engine);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].text,
+            "חייב בדבר ואחר כך <font color=red>להחזיר</font> <font color=red>חייב</font>"
+        );
     }
 
     #[test]
@@ -22949,6 +25816,8 @@ mod tests {
                 SearchScope::WordDistance,
                 SearchScope::WordDistance,
                 Some(WordMatchMode::AnyWord),
+                None,
+                None,
                 None,
             )
             .unwrap();
@@ -23043,6 +25912,7 @@ mod tests {
                 None,
                 Some(WordMatchMode::AtLeast),
                 Some(2),
+                None,
             )
             .unwrap()
             .into_iter()
@@ -23078,7 +25948,7 @@ mod tests {
         extra: &[&str],
     ) {
         engine
-            .add_document(
+            .add_document_at(
                 id,
                 "title",
                 "ref",
@@ -23101,6 +25971,7 @@ mod tests {
                 facets.iter().map(|s| s.to_string()).collect(),
                 false,
                 false,
+                None,
             )
             .unwrap()
     }
@@ -23172,7 +26043,7 @@ mod tests {
                     המלך דוד לא אמר כאן דבר"
             .to_string();
         engine
-            .add_text_book(
+            .add_text_book_placed(
                 "תהלים".to_string(),
                 "/root".to_string(),
                 "book:a".to_string(),
@@ -23480,11 +26351,11 @@ mod tests {
         let mut bounded = BoundedGroups::new();
         let cap = GROUP_COLLECTOR_MAX_GROUPS as u64;
         for i in 0..cap {
-            bounded.add_entry((1u8, i), (i, i, DocAddress::new(0, i as u32)));
+            bounded.add_entry((1u8, i), (i, i, DocAddress::new(0, i as u32), i));
         }
-        bounded.add_entry((1u8, 0), (0, 0, DocAddress::new(1, 0)));
+        bounded.add_entry((1u8, 0), (0, 0, DocAddress::new(1, 0), 0));
         for i in cap..cap + 10 {
-            bounded.add_entry((1u8, i), (i, i, DocAddress::new(2, (i % 1000) as u32)));
+            bounded.add_entry((1u8, i), (i, i, DocAddress::new(2, (i % 1000) as u32), i));
         }
         assert!(bounded.truncated);
         assert_eq!(bounded.groups.len(), GROUP_COLLECTOR_MAX_GROUPS);
@@ -23501,9 +26372,9 @@ mod tests {
         let cap = GROUP_COLLECTOR_MAX_GROUPS as u64;
         let high_base = 1_000_000u64;
         for i in high_base..high_base + cap {
-            bounded.add_entry((1u8, i), (i, i, DocAddress::new(0, (i % 1000) as u32)));
+            bounded.add_entry((1u8, i), (i, i, DocAddress::new(0, (i % 1000) as u32), i));
         }
-        bounded.add_entry((1u8, 1), (1, 1, DocAddress::new(1, 1)));
+        bounded.add_entry((1u8, 1), (1, 1, DocAddress::new(1, 1), 1));
         assert!(bounded.truncated);
         assert_eq!(bounded.groups.len(), GROUP_COLLECTOR_MAX_GROUPS);
         // הטובה נכנסה, הגרועה ביותר פונתה.
@@ -23541,19 +26412,25 @@ mod tests {
         let mut bounded = BoundedGroups::new();
         for i in 0..GROUP_COLLECTOR_MAX_GROUPS as u64 {
             let sort = 1000 + i;
-            bounded.add_entry((1u8, sort), (sort, sort, DocAddress::new(0, i as u32)));
+            bounded.add_entry(
+                (1u8, sort),
+                (sort, sort, DocAddress::new(0, i as u32), sort),
+            );
         }
         assert!(!bounded.truncated);
-        bounded.add_entry((1u8, 5), (5, 5, DocAddress::new(0, 1)));
+        bounded.add_entry((1u8, 5), (5, 5, DocAddress::new(0, 1), 5));
         assert!(bounded.truncated);
         assert!(bounded.groups.contains_key(&(1u8, 5)));
         let worst_key = (1u8, 1000 + GROUP_COLLECTOR_MAX_GROUPS as u64 - 1);
         assert!(!bounded.groups.contains_key(&worst_key));
         // מסמך לקבוצה קיימת נצבר גם בתקרה, והמונה מדויק.
-        bounded.add_entry((1u8, 5), (6, 6, DocAddress::new(0, 2)));
+        bounded.add_entry((1u8, 5), (6, 6, DocAddress::new(0, 2), 6));
         assert_eq!(bounded.groups[&(1u8, 5)].count, 2);
         // קבוצה חדשה גרועה מכולן — נדחית.
-        bounded.add_entry((1u8, 999_999), (999_999, 999_999, DocAddress::new(0, 3)));
+        bounded.add_entry(
+            (1u8, 999_999),
+            (999_999, 999_999, DocAddress::new(0, 3), 999_999),
+        );
         assert!(!bounded.groups.contains_key(&(1u8, 999_999)));
         assert_eq!(bounded.groups.len(), GROUP_COLLECTOR_MAX_GROUPS);
     }
@@ -23910,6 +26787,7 @@ mod tests {
                 candidate_window_multiplier: 3.0,
                 foundational_bonus: 0.004,
                 foundational_candidate_share: 0.25,
+                window_penalty: 0.03,
             };
             let preset = RankingProfile::from_profile(SearchProfile::Balanced);
             assert_eq!(
@@ -23937,6 +26815,7 @@ mod tests {
                     candidate_window_multiplier: 3.0,
                     foundational_bonus: 0.004,
                     foundational_candidate_share: 0.25,
+                    window_penalty: 0.03,
                     query_cache_enabled: preset.query_cache_enabled,
                     embedding_cache_enabled: preset.embedding_cache_enabled,
                     telemetry_enabled: preset.telemetry_enabled,
@@ -23960,7 +26839,7 @@ mod tests {
         #[test]
         fn an_option_out_of_range_is_refused_by_its_name() {
             type Spoil = fn(&mut SemanticRankingOptions);
-            let cases: [(&str, Spoil); 22] = [
+            let cases: [(&str, Spoil); 24] = [
                 ("rrf_k", |o| {
                     o.fusion_strategy = SemanticFusionStrategy::Rrf;
                     o.rrf_k = 0;
@@ -24007,6 +26886,8 @@ mod tests {
                 ("foundational_candidate_share", |o| {
                     o.foundational_candidate_share = 1.5
                 }),
+                ("window_penalty", |o| o.window_penalty = 0.25),
+                ("window_penalty", |o| o.window_penalty = f64::NAN),
             ];
             for (field, spoil) in cases {
                 let mut options = defaults();
@@ -24052,6 +26933,7 @@ mod tests {
                 candidate_window_multiplier: 10.0,
                 foundational_bonus: 1.0,
                 foundational_candidate_share: 0.0,
+                window_penalty: 0.2,
             };
             ranking_profile(&ends)
                 .expect("the ends of every range are values a calibration may land on");
@@ -24314,6 +27196,7 @@ mod tests {
             SemanticHighlightTarget {
                 file_path: file_path.to_string(),
                 id,
+                window: 0,
             }
         }
 
@@ -24483,7 +27366,7 @@ mod tests {
                 for (index, text) in lines.iter().enumerate() {
                     id += 1;
                     engine
-                        .add_document(
+                        .add_document_at(
                             id, "title", "ref", topics, text, 0, false, path, None, None, None,
                         )
                         .unwrap();
@@ -24873,7 +27756,7 @@ mod tests {
             let first = page(&engine, 5, 0);
             let second = page(&engine, 5, 5);
             let lexical = engine
-                .count_exact_with_status("שבת".to_string(), Vec::new(), false, false)
+                .count_exact_with_status("שבת".to_string(), Vec::new(), false, false, None)
                 .unwrap();
             for response in [&first, &second] {
                 assert_eq!(response.lexical_total_count, lexical.count);
@@ -25242,6 +28125,25 @@ mod tests {
             storage: TextStorage,
             library: Option<&Path>,
         ) -> Built {
+            built_under(
+                dir,
+                without_column,
+                books,
+                storage,
+                library,
+                production_chunking(),
+            )
+        }
+
+        /// [`built_with`], the vectors built under `chunking`.
+        fn built_under(
+            dir: &TempDir,
+            without_column: bool,
+            books: &[(&str, String)],
+            storage: TextStorage,
+            library: Option<&Path>,
+            chunking: otzaria_semantic_search::semantic::chunker::ChunkerConfig,
+        ) -> Built {
             let index = dir.path().join("index");
             fs::create_dir_all(&index).unwrap();
             if without_column {
@@ -25252,7 +28154,7 @@ mod tests {
             assert_eq!(engine.chunk_key_field.is_none(), without_column);
             for (order, (path, text)) in books.iter().enumerate() {
                 engine
-                    .add_text_book(
+                    .add_text_book_placed(
                         "בראשית".to_string(),
                         "/root".to_string(),
                         path.to_string(),
@@ -25267,7 +28169,6 @@ mod tests {
             }
             engine.commit().unwrap();
 
-            let chunking = production_chunking();
             let model_file = mock::write_stub_onnx_package(&dir.path().join("model"));
             let model = ModelIdentity {
                 family_id: "test-mock@0000000".to_string(),
@@ -25356,13 +28257,14 @@ mod tests {
                 field("topics") => Facet::from_text("/root").unwrap(),
                 field("contentHash") => 0u64,
                 field("textHash") => 0u64,
-                field("sectionId") => id & !0xFFFF_FFFF,
-                field("generationSort") => 0u64,
+                field(SECTION_OFFSET_FIELD) => 0u64,
                 field("lineHash") => 0u64
             );
             document.add_u64(field(CHUNK_KEY_FIELD), column);
             let writer = engine.writer_mut().unwrap();
-            writer.delete_term(Term::from_field_u64(field("id"), id));
+            writer
+                .delete_query(Box::new(IdSetQuery::new([id])))
+                .unwrap();
             writer.add_document(document).unwrap();
             engine.commit().unwrap();
         }
@@ -25639,12 +28541,18 @@ mod tests {
             book_of(&FIRST, RECURS, neighbour, &[&FIRST])
         }
 
+        /// Whether `result` is a [`SHORT`] line of [`book_of`], third in every block. By
+        /// position: the snippet of a short line is the window it was embedded with.
+        fn is_short(result: &SemanticSearchResult) -> bool {
+            result.segment % 5 == 2
+        }
+
         /// The line of each result of `response` that is [`SHORT`], in the page's order.
         fn shorts(response: &SemanticSearchResponse) -> Vec<u64> {
             response
                 .results
                 .iter()
-                .filter(|result| result.snippet_html == SHORT)
+                .filter(|result| is_short(result))
                 .map(|result| result.segment)
                 .collect()
         }
@@ -25707,7 +28615,7 @@ mod tests {
             let shorts: Vec<u64> = response
                 .results
                 .iter()
-                .filter(|result| result.snippet_html == SHORT)
+                .filter(|result| is_short(result))
                 .map(|result| result.segment)
                 .collect();
             let repeat = 5 * (RECURS as u64 + 1) + 2;
@@ -25865,7 +28773,7 @@ mod tests {
                 let mut lines: Vec<(&str, u64)> = response
                     .results
                     .iter()
-                    .filter(|result| result.snippet_html == SHORT)
+                    .filter(|result| is_short(result))
                     .map(|result| (result.file_path.as_str(), result.segment))
                     .take(4)
                     .collect();
@@ -25876,6 +28784,246 @@ mod tests {
                     "without column: {without_column}"
                 );
             }
+        }
+
+        /// A heading too short to stand alone is embedded with the lines of its section: its
+        /// result shows, and its passage highlight marks, that text rather than the heading.
+        #[test]
+        fn a_short_headings_result_shows_and_marks_the_text_it_was_embedded_as() {
+            const HEADING: &str = "סימן כה";
+            const FIRST: &str = "ויאמר אלהים יהי אור ויהי אור, וירא אלהים את האור כי טוב,";
+            const SECOND: &str = "ויבדל אלהים בין האור ובין החשך, ויקרא אלהים לאור יום.";
+            let text = [
+                "<h1>בראשית</h1>",
+                "<h2>סימן כה</h2>",
+                FIRST,
+                SECOND,
+                "<h2>סימן כו</h2>",
+                "ויהי ערב ויהי בקר יום אחד, ויאמר אלהים יהי רקיע בתוך המים.",
+            ]
+            .join("\n");
+            let embedded = [HEADING, FIRST, SECOND].join(" ");
+            let dir = TempDir::new().unwrap();
+            let engine = open(&dir, built_of(&dir, false, text));
+
+            let response = semantic_page(&engine, &embedded, 10);
+            assert!(
+                response.fallback_reason.is_none(),
+                "{:?}",
+                response.fallback_reason
+            );
+            let heading = response
+                .results
+                .iter()
+                .find(|result| result.segment == 1)
+                .expect("the heading's vector is a result");
+            assert_eq!(heading.source, SemanticResultSource::Semantic);
+            assert_eq!(heading.snippet_html, embedded);
+            assert_eq!(heading.matched_window, 0);
+
+            let marked = engine
+                .semantic_passage_highlights(
+                    "ויבדל אלהים בין האור ובין החשך".to_string(),
+                    vec![SemanticHighlightTarget {
+                        file_path: BOOK.to_string(),
+                        id: heading.id,
+                        window: heading.matched_window,
+                    }],
+                    &SemanticCancellationToken::new(),
+                )
+                .unwrap();
+            assert!(marked[0].is_highlighted, "{marked:?}");
+            assert!(
+                marked[0].snippet_html.contains("<mark>")
+                    && marked[0].snippet_html.contains(HEADING),
+                "{}",
+                marked[0].snippet_html
+            );
+        }
+
+        /// A line of 300 distinct words, some 1,500 characters.
+        fn long_line() -> String {
+            let letters: Vec<char> = "אבגדהוזחטיכלמנסעפצקרשת".chars().collect();
+            (0..300)
+                .map(|n| format!("{}{}ים", letters[n % 22], letters[(n / 22) % 22]))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        fn long_book(long: &str) -> String {
+            format!("בראשית ברא אלהים את השמים ואת הארץ\n{long}\n{PROBE}")
+        }
+
+        /// What the long line's window `window` is in its text.
+        fn window_piece(long: &str, window: u8) -> String {
+            let (span, _) = crate::semantic_keys::window_span(long, window).unwrap();
+            long.chars().skip(span.start).take(span.len()).collect()
+        }
+
+        /// A query quoting a long line's middle finds it by that window, which is named, shown
+        /// and marked; the column holds only the first window.
+        #[test]
+        fn a_long_lines_middle_is_found_shown_and_marked_by_its_window() {
+            use otzaria_semantic_search::semantic::chunk_key::ChunkKey;
+            use otzaria_semantic_search::semantic::chunker::Chunker;
+            let long = long_line();
+            let piece = window_piece(&long, 2);
+            let first_word = long.split(' ').next().unwrap().to_string();
+            assert!(!piece.contains(&first_word));
+            for without_column in [false, true] {
+                let dir = TempDir::new().unwrap();
+                let engine = open(&dir, built_of(&dir, without_column, long_book(&long)));
+                if !without_column {
+                    let searcher = engine.index_reader.searcher();
+                    let address = engine
+                        .address_in_book(&searcher, BOOK, (1u64 << 32) + 2)
+                        .unwrap()
+                        .unwrap();
+                    let column = searcher
+                        .segment_reader(address.segment_ord)
+                        .fast_fields()
+                        .u64(CHUNK_KEY_FIELD)
+                        .unwrap()
+                        .first(address.doc_id);
+                    let alone = [LineRef {
+                        text: &long,
+                        section: 0,
+                    }];
+                    let chunker = Chunker::new(production_chunking()).unwrap();
+                    let first = chunker.embedded_text(&alone, 0).unwrap();
+                    assert_eq!(column, Some(ChunkKey::of(&first).column_value()));
+                }
+
+                let response = semantic_page(&engine, &piece, 10);
+                assert!(
+                    response.fallback_reason.is_none(),
+                    "{:?}",
+                    response.fallback_reason
+                );
+                let top = &response.results[0];
+                assert_eq!(top.segment, 1, "without column: {without_column}");
+                assert_eq!(top.source, SemanticResultSource::Semantic);
+                assert_eq!(top.matched_window, 2, "without column: {without_column}");
+                // Shown within the snippet budget, as every semantic result's line is.
+                let shown = format!("…{piece}…");
+                assert_eq!(
+                    top.snippet_html,
+                    bounded_plain_snippet(&shown, HighlightConfig::default().max_chars)
+                );
+                assert!(
+                    response
+                        .results
+                        .iter()
+                        .filter(|result| result.segment == 1)
+                        .count()
+                        == 1,
+                    "the line is one result, whichever of its windows match"
+                );
+
+                let target = |window| SemanticHighlightTarget {
+                    file_path: BOOK.to_string(),
+                    id: top.id,
+                    window,
+                };
+                let query: String = piece
+                    .split(' ')
+                    .skip(20)
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let marked = engine
+                    .semantic_passage_highlights(
+                        query,
+                        vec![target(top.matched_window), target(0)],
+                        &SemanticCancellationToken::new(),
+                    )
+                    .unwrap();
+                assert!(marked[0].is_highlighted, "{marked:?}");
+                assert!(marked[0].snippet_html.contains("<mark>"));
+                assert!(
+                    !marked[0].snippet_html.contains(&first_word),
+                    "{}",
+                    marked[0].snippet_html
+                );
+                assert_ne!(marked[0].snippet_html, marked[1].snippet_html);
+            }
+        }
+
+        /// A set built without windows — the published family's — opens with this build and
+        /// resolves as before: one vector a line, every hit its line's first window.
+        #[test]
+        fn a_set_without_windows_opens_and_resolves_as_before() {
+            let long = long_line();
+            let mut counts = Vec::new();
+            for chunking in [production_chunking().anchor(), production_chunking()] {
+                let dir = TempDir::new().unwrap();
+                let built = built_under(
+                    &dir,
+                    false,
+                    &[(BOOK, long_book(&long))],
+                    TextStorage::InIndex,
+                    None,
+                    chunking.clone(),
+                );
+                let engine = open(&dir, built);
+                let status = engine.semantic_status();
+                assert!(status.available, "{:?}", status.last_error);
+                counts.push(status.vector_count);
+                let top = search(&engine, SemanticRetrievalMode::SemanticOnly);
+                let top = top.results.first().expect("a semantic hit");
+                assert_eq!(top.snippet_html, PROBE);
+                assert_eq!(top.matched_window, 0);
+                if chunking.window_chars == 0 {
+                    let response = semantic_page(&engine, &window_piece(&long, 2), 10);
+                    assert!(response.fallback_reason.is_none());
+                    assert!(response
+                        .results
+                        .iter()
+                        .all(|result| result.matched_window == 0
+                            && !result.snippet_html.starts_with('…')));
+                }
+            }
+            let windows = crate::semantic_keys::window_keys(&long).len() as u32;
+            assert_eq!(counts, [3, 3 + windows]);
+        }
+
+        /// The shown window is the embedded one: capped at `max_chunk_chars`, a blank line's
+        /// spaces collapsed, and a short line mid-section with the two lines before it too.
+        #[test]
+        fn a_short_lines_window_is_shown_capped_and_with_its_section_on_both_sides() {
+            let long = "אברהם הוליד את יצחק ".repeat(30).trim_end().to_string();
+            let around = [
+                "שורה ראשונה ארוכה דיה לעמוד לבדה",
+                "שורה שנייה ארוכה דיה לעמוד לבדה",
+                "ויהי ערב",
+                "שורה שלישית ארוכה דיה לעמוד לבדה",
+                "שורה רביעית ארוכה דיה לעמוד לבדה",
+            ];
+            let mut lines = vec!["<h1>בראשית</h1>", "<h2>סימן כה</h2>", "", &long];
+            lines.push("<h2>סימן כו</h2>");
+            lines.extend(around);
+            lines.push("<h2>סימן כז</h2>");
+            let dir = TempDir::new().unwrap();
+            let engine = built_of(&dir, false, lines.join("\n")).engine;
+            let searcher = engine.index_reader.searcher();
+            // The text as the index stores it, a heading's without its tags.
+            let line = |ordinal: u64, text| {
+                let id = (1u64 << 32) + ordinal + 1;
+                let address = engine
+                    .address_in_book(&searcher, BOOK, id)
+                    .unwrap()
+                    .unwrap();
+                (address, BOOK, id, text, 0)
+            };
+            let asked = [line(1, "סימן כה"), line(5, around[0]), line(7, around[2])];
+            let shown = engine.embedded_window_texts(&searcher, &asked).unwrap();
+
+            let max = production_chunking().max_chunk_chars;
+            let capped: String = format!("סימן כה  {long}").chars().take(max).collect();
+            let capped = capped.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert_eq!(shown[0].as_deref(), Some(capped.as_str()));
+            assert_eq!(shown[1], None, "a line long enough stands alone");
+            assert_eq!(shown[2], Some(around.join(" ")));
         }
 
         /// A filtered search after a commit that left the book it admits alone plans again —
@@ -25914,7 +29062,7 @@ mod tests {
             assert_eq!(filtered(&engine).results[0].snippet_html, PROBE);
             assert_eq!(walks(&engine), 1, "the first plan reads the book");
             engine
-                .add_text_book(
+                .add_text_book_placed(
                     "ספר אחר".to_string(),
                     "/other".to_string(),
                     "/books/other.txt".to_string(),
@@ -25985,7 +29133,7 @@ mod tests {
         /// A book that holds the probe at its line 1, committed.
         fn add_copy(engine: &mut SearchEngine, book: &str, order: u32) {
             engine
-                .add_text_book(
+                .add_text_book_placed(
                     "ספר אחר".to_string(),
                     "/other".to_string(),
                     book.to_string(),
@@ -26064,6 +29212,142 @@ mod tests {
             assert_eq!(capped, [(BOOK.to_string(), 1)]);
             add_copy(&mut engine, "/books/fourth.txt", 3);
             assert_eq!(probe_lines(&engine).len(), 4);
+        }
+
+        /// Changed-book windows have a bounded discovery budget. Exceeding it never
+        /// exposes a partial arrival set as complete: unfiltered planning backs off and
+        /// filtered planning reports why an update is needed.
+        #[test]
+        fn changed_window_discovery_overflow_backs_off_without_partial_results() {
+            use crate::semantic_resolver::LiveResolver;
+            let dir = TempDir::new().unwrap();
+            let mut engine = opened(&dir);
+            let long = (0..600)
+                .map(|n| format!("מילה{n:04}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            engine.delete_documents_by_file_path(BOOK).unwrap();
+            engine
+                .add_text_book_placed(
+                    "ספר".into(),
+                    "/root".into(),
+                    BOOK.into(),
+                    0,
+                    0,
+                    long,
+                    None,
+                    TextStorage::InIndex,
+                    None,
+                )
+                .unwrap();
+            engine.commit().unwrap();
+            let vectors = dir.path().join("vectors");
+            let generation = otzaria_semantic_search::semantic::segment_set::info(&vectors)
+                .unwrap()
+                .unwrap()
+                .generation;
+            let view = engine.semantic_set_view(&vectors, generation).unwrap();
+            let mut resolver = LiveResolver::new(
+                engine.index_reader.searcher(),
+                engine.chunk_key_field,
+                &engine.semantic_resolver,
+            )
+            .unwrap();
+            let cancel = CancellationToken::new();
+            let unfiltered = SidecarSearchFilters {
+                book_paths: None,
+                facets: None,
+                include_pdf: None,
+            };
+            let filtered = SidecarSearchFilters {
+                book_paths: None,
+                facets: Some(vec!["/root".into()]),
+                include_pdf: None,
+            };
+            let previous = crate::semantic_resolver::WINDOW_ARRIVAL_CAP.with(|cap| cap.replace(1));
+            let unfiltered = resolver.plan(&unfiltered, &view, &cancel);
+            let filtered = resolver.plan(&filtered, &view, &cancel);
+            crate::semantic_resolver::WINDOW_ARRIVAL_CAP.with(|cap| cap.set(previous));
+            assert!(
+                unfiltered.unwrap().is_none(),
+                "no truncated unfiltered plan"
+            );
+            let error = filtered
+                .err()
+                .expect("a filter cannot silently omit discovered windows");
+            assert!(
+                error
+                    .to_string()
+                    .contains("changed-book window occurrences"),
+                "{error}"
+            );
+        }
+
+        /// The working-set cap is shared across Rayon workers and changed books,
+        /// rather than allowing each book to allocate the complete budget independently.
+        #[test]
+        fn changed_window_discovery_budget_is_shared_across_books() {
+            use crate::semantic_resolver::LiveResolver;
+            let dir = TempDir::new().unwrap();
+            let mut engine = open(
+                &dir,
+                built_of_books(
+                    &dir,
+                    false,
+                    &[
+                        (BOOK, "ספר ראשון עם שורה ארוכה מספיק לחיפוש".into()),
+                        (OTHER, "ספר שני עם שורה אחרת ארוכה מספיק לחיפוש".into()),
+                    ],
+                ),
+            );
+            let long = (0..180)
+                .map(|n| format!("מילה{n:04}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let windows = crate::semantic_keys::window_keys(&long).len();
+            assert!(windows > 1);
+            for (order, path) in [BOOK, OTHER].into_iter().enumerate() {
+                engine.delete_documents_by_file_path(path).unwrap();
+                engine
+                    .add_text_book_placed(
+                        "ספר".into(),
+                        "/root".into(),
+                        path.into(),
+                        order as u32,
+                        0,
+                        long.clone(),
+                        None,
+                        TextStorage::InIndex,
+                        None,
+                    )
+                    .unwrap();
+            }
+            engine.commit().unwrap();
+            let vectors = dir.path().join("vectors");
+            let generation = otzaria_semantic_search::semantic::segment_set::info(&vectors)
+                .unwrap()
+                .unwrap()
+                .generation;
+            let view = engine.semantic_set_view(&vectors, generation).unwrap();
+            let mut resolver = LiveResolver::new(
+                engine.index_reader.searcher(),
+                engine.chunk_key_field,
+                &engine.semantic_resolver,
+            )
+            .unwrap();
+            let filters = SidecarSearchFilters {
+                book_paths: None,
+                facets: None,
+                include_pdf: None,
+            };
+            let previous =
+                crate::semantic_resolver::WINDOW_ARRIVAL_CAP.with(|cap| cap.replace(windows + 1));
+            let planned = resolver.plan(&filters, &view, &CancellationToken::new());
+            crate::semantic_resolver::WINDOW_ARRIVAL_CAP.with(|cap| cap.set(previous));
+            assert!(
+                planned.unwrap().is_none(),
+                "each book fits, but their combined window working set exceeds the cap"
+            );
         }
 
         fn lookups(engine: &SearchEngine) -> u64 {
