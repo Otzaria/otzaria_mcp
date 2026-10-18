@@ -2,8 +2,9 @@
 
 This directory holds a **vendored copy** of the Rust crate from the
 `otzaria_search_engine` Flutter package: version **4.1.0 plus the `feat/stable-book-ids`
-branch** of `Otzaria/otzaria_search_engine`, commit `af382d9` (on top of `8f8e443`), which
-is not released yet.
+branch**, commit `6a92260fd269f0394e3b14748f18b76fc566dac7` of
+`https://github.com/palmoni5/otzaria_search_engine` (on top of `8f8e443`), which is not
+released yet.
 
 ## Why vendored, and why this exact version
 - The crate is not published to crates.io; it ships inside the pub.dev package.
@@ -22,13 +23,18 @@ is not released yet.
 - Vendoring exact bytes keeps the MCP self-contained and reproducible.
 
 ## Source
-Copied from `git archive af382d9 rust LICENSE CHANGELOG.md` of
-`Otzaria/otzaria_search_engine` (`rust/Cargo.toml`, `src/`, `resources/`,
-`vendor/tantivy-fst/`, plus `LICENSE` and `CHANGELOG.md`). Omitted: the Flutter plugin
-scaffolding, the crate's `tests/`, `examples/` and `Cargo.lock` (not needed to build the
-lib). To verify, run `git archive <commit> rust | tar -x` and
-`diff -r rust vendor/otzaria_search_engine/rust`: apart from the omitted files, the
-differences are the patches below.
+Copied from `git archive 6a92260fd269f0394e3b14748f18b76fc566dac7 rust LICENSE CHANGELOG.md`
+(`rust/Cargo.toml`, `src/`, `resources/`, `vendor/tantivy-fst/`, plus `LICENSE` and
+`CHANGELOG.md`). Omitted: the Flutter plugin scaffolding, the crate's `tests/`,
+`examples/` and `Cargo.lock` (not needed to build the lib). To verify, from a clone of the
+engine that has the commit:
+
+```sh
+mkdir /tmp/engine && git archive 6a92260fd269f0394e3b14748f18b76fc566dac7 rust | tar -x -C /tmp/engine
+diff -r /tmp/engine/rust <mcp>/vendor/otzaria_search_engine/rust
+```
+
+Apart from the omitted files, the differences are the patches below.
 
 The crate pulls two git dependencies at pinned revisions (fetched by cargo):
 `Otzaria/tantivy@8b88320` (via the workspace `[patch.crates-io]`, which must repeat the
