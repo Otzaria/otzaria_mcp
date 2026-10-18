@@ -1,18 +1,20 @@
 # Vendored: otzaria_search_engine (rust crate `search_engine`)
 
 This directory holds a **vendored copy** of the Rust crate from the
-`otzaria_search_engine` Flutter package: version **4.1.0 plus the `feat/stable-book-ids`
-branch**, commit `cdb31715b60a694b3d7483252f0ce23a25512cd8` of
-`https://github.com/palmoni5/otzaria_search_engine` (on top of `8f8e443`), which is not
-released yet.
+`otzaria_search_engine` Flutter package: version **4.1.0 plus merged stable-book-id
+support**, commit `30e8f1682428d5cc252b3e610f2c9cc06c04b81f` on the official
+`https://github.com/Otzaria/otzaria_search_engine` `refactor` branch. This includes
+PRs #52, #56 and #57; no new version or release tag has been published yet.
 
 ## Why vendored, and why this exact version
 - The crate is not published to crates.io; it ships inside the pub.dev package.
 - The engine must match the app that builds the Tantivy index. This version writes
   **index schema version 7** and reads only schema 7 (`MIN_READABLE_SCHEMA_VERSION`):
   an index built by an older app (schema 5/6) is refused by `check_index_compatibility`
-  until the app rebuilds it. Official books keep **no line text in the index**: results
-  read each line back from `seforim.db` through the engine's *library line source*.
+  until the app rebuilds it. Official books normally read line text back from
+  `seforim.db` through the engine's *library line source*. Books with restored
+  `line_note` bodies keep that reconstructed text in the index so search results
+  include the same text that was indexed.
 - Schema 7 ids are `(bookNumber << 32) + ordinal + 1`, with book numbers the engine hands
   out on a book's first write. The catalogue and generation order are no longer in the
   ids or in a `generation` field: the app writes them to `otzaria_book_order.json` in the
@@ -26,14 +28,14 @@ released yet.
 - Vendoring exact bytes keeps the MCP self-contained and reproducible.
 
 ## Source
-Copied from `git archive cdb31715b60a694b3d7483252f0ce23a25512cd8 rust LICENSE CHANGELOG.md`
+Copied from `git archive 30e8f1682428d5cc252b3e610f2c9cc06c04b81f rust LICENSE CHANGELOG.md`
 (`rust/Cargo.toml`, `src/`, `resources/`, `vendor/tantivy-fst/`, plus `LICENSE` and
 `CHANGELOG.md`). Omitted: the Flutter plugin scaffolding, the crate's `tests/`,
 `examples/` and `Cargo.lock` (not needed to build the lib). To verify, from a clone of the
 engine that has the commit:
 
 ```sh
-mkdir /tmp/engine && git archive cdb31715b60a694b3d7483252f0ce23a25512cd8 rust | tar -x -C /tmp/engine
+mkdir /tmp/engine && git archive 30e8f1682428d5cc252b3e610f2c9cc06c04b81f rust | tar -x -C /tmp/engine
 diff -r /tmp/engine/rust <mcp>/vendor/otzaria_search_engine/rust
 ```
 

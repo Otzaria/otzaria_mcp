@@ -6,8 +6,9 @@ default-members = ["mcp"]
 resolver = "2"
 
 # `search_engine` is VENDORED (not a submodule) at vendor/otzaria_search_engine —
-# the otzaria_search_engine rust crate (4.1.0 + feat/stable-book-ids, index schema
-# version 7). Matching the engine to the index is required: an older engine refuses a
+# the otzaria_search_engine rust crate (4.1.0 + merged stable-book-id support,
+# official commit 30e8f1682428d5cc252b3e610f2c9cc06c04b81f, index schema 7).
+# Matching the engine to the index is required: an older engine refuses a
 # newer index (`engine_too_old`) and a newer one may need a rebuild.
 # See vendor/otzaria_search_engine/VENDORED.md.
 

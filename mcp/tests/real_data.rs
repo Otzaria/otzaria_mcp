@@ -268,7 +268,7 @@ fn categories_and_toc() {
 
 const INDEXED_BOOKS: &[i64] = &[1, 103, 382];
 
-/// Build (once per test process) a tiny schema-5 index the way the app indexes official
+/// Build (once per test process) a tiny schema-7 index the way the app indexes official
 /// books, or use `OTZARIA_TEST_INDEX`. Returns the index dir.
 fn test_index(db_path: &Path, db: &Db) -> PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
