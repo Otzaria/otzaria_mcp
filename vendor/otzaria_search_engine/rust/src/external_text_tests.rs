@@ -144,7 +144,7 @@ pub(crate) fn books() -> Vec<Book> {
     ]
 }
 
-fn train_dictionary() -> Vec<u8> {
+pub(crate) fn train_dictionary() -> Vec<u8> {
     let samples: Vec<Vec<u8>> = (0..2000)
         .map(|n| {
             format!(
@@ -301,7 +301,7 @@ fn index_library_books_as(
         let facets = Some(vec![format!("/era/{}", book.generation_order)]);
         let stored_lines = store_image_rows.then(|| app_stored_lines(book)).flatten();
         let added = match app_indexing_input(book) {
-            BookInput::Bytes(bytes) => engine.add_text_book_bytes(
+            BookInput::Bytes(bytes) => engine.add_text_book_bytes_placed(
                 book.title.to_string(),
                 book.topics.to_string(),
                 file_path,
@@ -312,7 +312,7 @@ fn index_library_books_as(
                 storage,
                 stored_lines,
             ),
-            BookInput::Text(text) => engine.add_text_book(
+            BookInput::Text(text) => engine.add_text_book_placed(
                 book.title.to_string(),
                 book.topics.to_string(),
                 file_path,
@@ -346,7 +346,7 @@ pub(crate) fn index_library_books_committed(
 fn index_books_extras(engine: &mut SearchEngine) {
     // Text that is never in the library database stays in the index in both modes.
     engine
-        .add_pdf_book(
+        .add_pdf_book_placed(
             "ספר סרוק".to_string(),
             "/תנך/תורה".to_string(),
             "/pdf/scan.pdf".to_string(),
@@ -361,7 +361,7 @@ fn index_books_extras(engine: &mut SearchEngine) {
         )
         .unwrap();
     engine
-        .add_text_book(
+        .add_text_book_placed(
             "ספר אישי".to_string(),
             "/אישי".to_string(),
             "uid:7".to_string(),
@@ -375,7 +375,7 @@ fn index_books_extras(engine: &mut SearchEngine) {
         .unwrap();
     engine
         .add_documents_batch(vec![DocumentInput {
-            id: 99,
+            ordinal: 0,
             title: "סמן".to_string(),
             reference: "סמן".to_string(),
             topics: "/אישי".to_string(),
@@ -385,9 +385,9 @@ fn index_books_extras(engine: &mut SearchEngine) {
             file_path: "/empty/book.txt".to_string(),
             content_hash: None,
             text_hash: None,
+            source_hash: None,
             text_vocalized: None,
-            section_id: None,
-            generation_order: None,
+            section_ordinal: None,
             extra_facets: None,
             text_storage: None,
         }])
@@ -484,7 +484,7 @@ fn fixture() -> Fixture {
     }
 }
 
-fn guard() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn guard() -> std::sync::MutexGuard<'static, ()> {
     let guard = line_source::TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -796,6 +796,7 @@ fn probes() -> Vec<(String, Probe)> {
                         grouping,
                         any_word.then_some(WordMatchMode::AnyWord),
                         None,
+                        None,
                     )
                     .unwrap()
                 }),
@@ -919,7 +920,8 @@ fn assert_answers_like_stored(stored_index: &SearchEngine, library_index: &Searc
         let base = (u64::from(book.catalogue_order) + 1) << 32;
         ids.extend((1..=book.rows.len() as u64).map(|ordinal| base + ordinal));
     }
-    ids.push(99);
+    // The empty-book marker, whose number the engine gave it.
+    ids.push((u64::from(stored_index.book_number_for_tests("/empty/book.txt")) << 32) + 1);
     for id in ids {
         let a = stored_index
             .get_document_by_id(id)
@@ -971,7 +973,7 @@ fn assert_answers_like_stored(stored_index: &SearchEngine, library_index: &Searc
 }
 
 /// `(filePath, has textStored, lineCheck)` of every live document.
-fn doc_store_view(engine: &SearchEngine) -> Vec<(String, bool, Option<u64>)> {
+pub(crate) fn doc_store_view(engine: &SearchEngine) -> Vec<(String, bool, Option<u64>)> {
     use tantivy::schema::Value;
     let searcher = engine.corpus_searcher();
     let schema = searcher.schema().clone();
@@ -981,9 +983,11 @@ fn doc_store_view(engine: &SearchEngine) -> Vec<(String, bool, Option<u64>)> {
     for (ord, reader) in searcher.segment_readers().iter().enumerate() {
         let checks = reader.fast_fields().u64("lineCheck").unwrap();
         for doc_id in reader.doc_ids_alive() {
-            let doc: tantivy::TantivyDocument = searcher
-                .doc(tantivy::DocAddress::new(ord as u32, doc_id))
-                .unwrap();
+            let doc: tantivy::TantivyDocument = crate::doc_store::load_document(
+                &searcher,
+                tantivy::DocAddress::new(ord as u32, doc_id),
+            )
+            .unwrap();
             let path = doc
                 .get_first(path_f)
                 .and_then(|v| v.as_str())
@@ -1002,7 +1006,9 @@ fn doc_store_view(engine: &SearchEngine) -> Vec<(String, bool, Option<u64>)> {
 #[test]
 fn library_documents_keep_no_text_in_the_doc_store() {
     let _guard = guard();
-    let f = fixture();
+    let mut f = fixture();
+    f.external.merge_into_one_segment();
+    f.stored.merge_into_one_segment();
     let size = |p: &Path| -> u64 {
         std::fs::read_dir(p)
             .unwrap()
@@ -1032,7 +1038,7 @@ fn library_documents_keep_no_text_in_the_doc_store() {
         .all(|(_, has_text, check)| *has_text && check.is_none()));
 }
 
-fn exact(e: &SearchEngine, word: &str) -> Vec<SearchResult> {
+pub(crate) fn exact(e: &SearchEngine, word: &str) -> Vec<SearchResult> {
     e.search_exact(
         word.to_string(),
         vec![],
@@ -1289,10 +1295,13 @@ fn image_rows_are_shown_from_the_index_without_reading_the_database() {
 fn stored_image_rows_add_only_their_cleaned_text_to_the_index() {
     use tantivy::schema::Value;
     let _guard = guard();
-    let f = fixture();
+    let mut f = fixture();
     let legacy_path = f.dir.path().join("legacy");
     std::fs::create_dir_all(&legacy_path).unwrap();
-    let legacy = index_books_as(&legacy_path, &books(), TextStorage::LibraryDb, false);
+    let mut legacy = index_books_as(&legacy_path, &books(), TextStorage::LibraryDb, false);
+    for engine in [&mut legacy, &mut f.external, &mut f.stored] {
+        engine.merge_into_one_segment();
+    }
     // `textStored` of the official books' documents, by (filePath, segment).
     let official_text = |e: &SearchEngine| -> std::collections::BTreeMap<(String, u64), String> {
         let searcher = e.corpus_searcher();
@@ -1302,9 +1311,11 @@ fn stored_image_rows_add_only_their_cleaned_text_to_the_index() {
         let mut out = std::collections::BTreeMap::new();
         for (ord, reader) in searcher.segment_readers().iter().enumerate() {
             for doc_id in reader.doc_ids_alive() {
-                let doc: tantivy::TantivyDocument = searcher
-                    .doc(tantivy::DocAddress::new(ord as u32, doc_id))
-                    .unwrap();
+                let doc: tantivy::TantivyDocument = crate::doc_store::load_document(
+                    &searcher,
+                    tantivy::DocAddress::new(ord as u32, doc_id),
+                )
+                .unwrap();
                 let path = doc.get_first(path_f).and_then(|v| v.as_str()).unwrap();
                 let text = doc.get_first(text_f).and_then(|v| v.as_str());
                 if let (true, Some(text)) = (path.starts_with("id:"), text) {
@@ -1360,7 +1371,7 @@ fn stored_lines_are_ignored_out_of_range_and_for_in_index_books() {
     let mut engine = SearchEngine::new(idx.to_str().unwrap());
     let text = format!("{LONG1}\n{LONG2}");
     let added = engine
-        .add_text_book(
+        .add_text_book_placed(
             book.title.to_string(),
             book.topics.to_string(),
             "id:1".to_string(),
@@ -1374,7 +1385,7 @@ fn stored_lines_are_ignored_out_of_range_and_for_in_index_books() {
         .unwrap();
     assert_eq!(added, 2);
     engine
-        .add_text_book(
+        .add_text_book_placed(
             "אישי".to_string(),
             "/t".to_string(),
             "uid:3".to_string(),
@@ -1467,7 +1478,7 @@ fn index_one(dir: &Path, book: &Book, storage: TextStorage) -> (SearchEngine, u3
     let mut engine = SearchEngine::new(idx.to_str().unwrap());
     let path = format!("id:{}", book.id);
     let added = match app_indexing_input(book) {
-        BookInput::Bytes(bytes) => engine.add_text_book_bytes(
+        BookInput::Bytes(bytes) => engine.add_text_book_bytes_placed(
             book.title.to_string(),
             book.topics.to_string(),
             path,
@@ -1478,7 +1489,7 @@ fn index_one(dir: &Path, book: &Book, storage: TextStorage) -> (SearchEngine, u3
             storage,
             app_stored_lines(book),
         ),
-        BookInput::Text(text) => engine.add_text_book(
+        BookInput::Text(text) => engine.add_text_book_placed(
             book.title.to_string(),
             book.topics.to_string(),
             path,
@@ -1962,7 +1973,7 @@ fn a_cross_line_hit_counts_while_the_source_is_suspended() {
         assert_eq!(results[0].continues_to_next_line, continues);
         assert_eq!(
             external
-                .count_exact(query.into(), vec![], false, false)
+                .count_exact(query.into(), vec![], false, false, None)
                 .unwrap(),
             1
         );
@@ -2220,9 +2231,9 @@ fn library_storage_needs_an_official_book_key() {
     let _guard = guard();
     let dir = TempDir::new().unwrap();
     let mut engine = SearchEngine::new(dir.path().to_str().unwrap());
-    for bad in ["/books/a.txt", "uid:3", "id:", "id:x", "id:-1", "id:007"] {
+    for bad in ["/books/a.txt", "id:", "id:x", "id:-1", "id:007"] {
         let err = engine
-            .add_text_book(
+            .add_text_book_placed(
                 "t".to_string(),
                 "/a".to_string(),
                 bad.to_string(),
@@ -2237,7 +2248,7 @@ fn library_storage_needs_an_official_book_key() {
         assert!(err.to_string().contains("id:<bookId>"), "{bad}: {err:#}");
     }
     let doc = |file_path: &str| DocumentInput {
-        id: 1,
+        ordinal: 0,
         title: "t".to_string(),
         reference: "r".to_string(),
         topics: "/a".to_string(),
@@ -2247,9 +2258,9 @@ fn library_storage_needs_an_official_book_key() {
         file_path: file_path.to_string(),
         content_hash: None,
         text_hash: None,
+        source_hash: None,
         text_vocalized: None,
-        section_id: None,
-        generation_order: None,
+        section_ordinal: None,
         extra_facets: None,
         text_storage: Some(TextStorage::LibraryDb),
     };
@@ -2269,20 +2280,25 @@ fn library_storage_needs_an_official_book_key() {
 }
 
 #[test]
-fn the_v4_schema_is_refused() {
-    let dir = TempDir::new().unwrap();
-    drop(SearchEngine::new(dir.path().to_str().unwrap()));
-    let meta = dir.path().join("otzaria_index_meta.json");
-    let raw = std::fs::read_to_string(&meta).unwrap();
-    std::fs::write(
-        &meta,
-        raw.replace("\"schema_version\": 5", "\"schema_version\": 4"),
-    )
-    .unwrap();
-    let compat = check_index_compatibility(dir.path().to_string_lossy().into_owned());
-    assert!(!compat.compatible);
-    assert_eq!(compat.status, "rebuild_required");
-    assert_eq!(compat.required_schema_version, 5);
+fn the_v5_and_v6_schemas_are_refused() {
+    for old in [5, 6] {
+        let dir = TempDir::new().unwrap();
+        drop(SearchEngine::new(dir.path().to_str().unwrap()));
+        let meta = dir.path().join("otzaria_index_meta.json");
+        let raw = std::fs::read_to_string(&meta).unwrap();
+        std::fs::write(
+            &meta,
+            raw.replace(
+                "\"schema_version\": 7",
+                &format!("\"schema_version\": {old}"),
+            ),
+        )
+        .unwrap();
+        let compat = check_index_compatibility(dir.path().to_string_lossy().into_owned());
+        assert!(!compat.compatible, "{old}");
+        assert_eq!(compat.status, "rebuild_required", "{old}");
+        assert_eq!(compat.required_schema_version, 7);
+    }
 }
 
 /// Read-only smoke test against a real library: indexes the first books of
@@ -2363,7 +2379,7 @@ fn real_library_smoke() {
         ] {
             let path = format!("id:{book_id}");
             match app_indexing_input(&book) {
-                BookInput::Bytes(bytes) => engine.add_text_book_bytes(
+                BookInput::Bytes(bytes) => engine.add_text_book_bytes_placed(
                     title.clone(),
                     "/smoke".to_string(),
                     path,
@@ -2374,7 +2390,7 @@ fn real_library_smoke() {
                     storage,
                     app_stored_lines(&book),
                 ),
-                BookInput::Text(text) => engine.add_text_book(
+                BookInput::Text(text) => engine.add_text_book_placed(
                     title.clone(),
                     "/smoke".to_string(),
                     path,
@@ -2693,7 +2709,7 @@ fn real_library_image_rows() {
         for (engine, (storage, lines)) in engines.iter_mut().zip(plans) {
             let path = format!("id:{book_id}");
             let added = match input.clone() {
-                BookInput::Bytes(bytes) => engine.add_text_book_bytes(
+                BookInput::Bytes(bytes) => engine.add_text_book_bytes_placed(
                     "ספר".into(),
                     "/img".into(),
                     path,
@@ -2704,7 +2720,7 @@ fn real_library_image_rows() {
                     storage,
                     lines,
                 ),
-                BookInput::Text(text) => engine.add_text_book(
+                BookInput::Text(text) => engine.add_text_book_placed(
                     "ספר".into(),
                     "/img".into(),
                     path,
@@ -2985,7 +3001,7 @@ fn real_library_perf() {
             ] {
                 let path = format!("id:{book_id}");
                 match app_indexing_input(&book) {
-                    BookInput::Bytes(bytes) => engine.add_text_book_bytes(
+                    BookInput::Bytes(bytes) => engine.add_text_book_bytes_placed(
                         "ספר".into(),
                         "/perf".into(),
                         path,
@@ -2996,7 +3012,7 @@ fn real_library_perf() {
                         storage,
                         app_stored_lines(&book),
                     ),
-                    BookInput::Text(text) => engine.add_text_book(
+                    BookInput::Text(text) => engine.add_text_book_placed(
                         "ספר".into(),
                         "/perf".into(),
                         path,

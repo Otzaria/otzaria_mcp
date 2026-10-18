@@ -61,8 +61,9 @@ use tantivy::{DocAddress, Index, ReloadPolicy, Searcher, TantivyDocument};
 
 /// The id scheme this crate builds, and the only one this adapter can order a book under.
 ///
-/// `add_text_book` composes an id as `((catalogue_order + 1) << 32) + (ordinal + 1)`, so
-/// within one book ascending ids are the lines in corpus order. That is not a convention
+/// `add_text_book` composes an id as `(book_number << 32) + (ordinal + 1)`, the book's
+/// number assigned by the engine and never 0 or shared, so within one book ascending ids
+/// are the lines in corpus order. That is not a convention
 /// this module is trusting — it is arithmetic performed a few hundred lines away in
 /// [`crate::api::search_engine`] — but it stops being true the moment the scheme changes,
 /// which is why the version is pinned here rather than assumed.
@@ -88,6 +89,9 @@ pub struct TantivyCorpus {
     /// [`DOCUMENT_ID_SCHEME_VERSION`].
     books: BTreeMap<String, Vec<u64>>,
     locations: HashMap<u64, Location>,
+    /// Book key → its `contentHash`, which one of its documents holds: 0 for a book with
+    /// none (a PDF) or with two that disagree.
+    content_hashes: HashMap<String, u64>,
     /// The plan, computed at most once. `expected_line_ids` is called by both `pack` and
     /// `validate_artifact`, and chunking the library twice to answer the same question
     /// twice is the kind of cost a build notices.
@@ -263,6 +267,7 @@ impl TantivyCorpus {
             .map(Mutex::new);
         let mut books: BTreeMap<String, Vec<u64>> = BTreeMap::new();
         let mut locations: HashMap<u64, Location> = HashMap::new();
+        let mut content_hashes: HashMap<String, Option<u64>> = HashMap::new();
         let mut scanned: u64 = 0;
 
         for (segment_ord, reader) in searcher.segment_readers().iter().enumerate() {
@@ -276,6 +281,10 @@ impl TantivyCorpus {
                 .str("filePath")
                 .context("reading the `filePath` column")?
                 .context("the `filePath` column is required to group lines into books")?;
+            let hashes = reader
+                .fast_fields()
+                .u64("contentHash")
+                .context("reading the `contentHash` column")?;
 
             let mut key = String::new();
             for doc in reader.doc_ids_alive() {
@@ -305,6 +314,8 @@ impl TantivyCorpus {
                     );
                 }
                 books.entry(key.clone()).or_default().push(line_id);
+                let hash = content_hashes.entry(key.clone()).or_default();
+                *hash = crate::api::search_engine::combine_fingerprint(*hash, hashes.first(doc));
             }
         }
 
@@ -346,6 +357,10 @@ impl TantivyCorpus {
             chunking,
             books,
             locations,
+            content_hashes: content_hashes
+                .into_iter()
+                .map(|(book, hash)| (book, hash.unwrap_or(0)))
+                .collect(),
             plan: Mutex::new(None),
             library,
         };
@@ -443,9 +458,8 @@ impl TantivyCorpus {
     /// the application would filter and group by. A document the index counts but cannot
     /// describe has to stop the build.
     ///
-    /// `contentHash` is the one field where `0` is a real answer — a PDF has no fingerprint
-    /// in the library database — which is exactly why "the column has no value for this
-    /// document" and "the value is zero" must not collapse into each other.
+    /// `contentHash` is the book's, read where the scan found it: one document of a book
+    /// holds it, and `0` is a real answer — a PDF has no fingerprint in the library database.
     ///
     /// A line whose text is in the library database comes back with an empty `text` and
     /// the [`LibraryLine`] to read it from — see [`Self::library_text`].
@@ -454,9 +468,7 @@ impl TantivyCorpus {
         address: DocAddress,
         line_id: u64,
     ) -> Result<(CorpusLine, Option<LibraryLine>), String> {
-        let document: TantivyDocument = self
-            .searcher
-            .doc(address)
+        let document: TantivyDocument = crate::doc_store::load_document(&self.searcher, address)
             .map_err(|error| format!("reading line {line_id}: {error}"))?;
         let reader = self.searcher.segment_reader(address.segment_ord);
         let doc = address.doc_id;
@@ -499,7 +511,7 @@ impl TantivyCorpus {
                 .as_bool()
                 .ok_or_else(|| format!("line {line_id} carries a {name} that is not a bool"))
         };
-        // `sectionId`, `lineHash` and `contentHash` are FAST and **not stored**, so they
+        // `sectionId` and `lineHash` are FAST and **not stored**, so they
         // come off the columnar readers rather than out of the document. Reading them from
         // the stored document yields nothing at all — which, defaulted, is a zero in every
         // record of every artifact.
@@ -565,16 +577,25 @@ impl TantivyCorpus {
             )
         };
 
+        let content_hash = self
+            .content_hashes
+            .get(&source_book_key)
+            .copied()
+            .unwrap_or(0);
         Ok((
             CorpusLine {
                 source_book_key,
                 title: text_field("title")?,
                 reference: text_field("reference")?,
-                section_id: column_u64("sectionId")?,
+                section_id: {
+                    let column = crate::derived_columns::SectionIdColumn::open(reader)
+                        .map_err(|error| format!("reading the sectionId columns: {error}"))?;
+                    exactly_one(column.values_for_doc(doc), "sectionId", line_id)?
+                },
                 segment,
                 is_pdf: stored_bool("isPdf")?,
                 line_hash: column_u64("lineHash")?,
-                content_hash: column_u64("contentHash")?,
+                content_hash,
                 facets: self
                     .read_facets(address)
                     .map_err(|error| format!("reading the facets of line {line_id}: {error}"))?,
@@ -648,6 +669,33 @@ impl CorpusIndex for TantivyCorpus {
 }
 
 impl CorpusBooks for TantivyCorpus {
+    fn book_source_hash(&self, book_key: &str) -> Result<Option<u64>, PackError> {
+        let ids = self.books.get(book_key).ok_or_else(|| PackError::Corpus {
+            reason: format!("no book keyed {book_key:?} in this snapshot"),
+        })?;
+        let columns = self
+            .searcher
+            .segment_readers()
+            .iter()
+            .map(|reader| {
+                reader
+                    .fast_fields()
+                    .u64("textHash")
+                    .map_err(|error| PackError::Corpus {
+                        reason: format!("reading the textHash column: {error}"),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let source = ids.iter().fold(None, |seen, id| {
+            let address = self.locations[id].address;
+            crate::api::search_engine::combine_fingerprint(
+                seen,
+                columns[address.segment_ord as usize].first(address.doc_id),
+            )
+        });
+        Ok(source.filter(|&hash| hash != 0))
+    }
+
     fn book_keys(&self) -> Result<Vec<String>, PackError> {
         Ok(self.books.keys().cloned().collect())
     }
@@ -747,14 +795,13 @@ fn ensure_ids_encode_positions(books: &BTreeMap<String, Vec<u64>>) -> Result<()>
     let mut owner: HashMap<u32, &str> = HashMap::new();
     for (book_key, lines) in books {
         let high = (lines[0] >> 32) as u32;
-        // Scheme 1 composes the high half as `catalogue_order + 1`, so zero is not a
-        // catalogue position at all — it is what a raw ordinal looks like when nothing
-        // composed it, and `line_id = 1` would otherwise be accepted and stamped as
-        // scheme 1.
+        // Scheme 1 composes the high half as the book's number, never zero: zero is what a
+        // raw ordinal looks like when nothing composed it, and `line_id = 1` would otherwise
+        // be accepted and stamped as scheme 1.
         if high == 0 {
             anyhow::bail!(
                 "book {book_key:?} holds line {} with an id prefix of 0, and prefixes are \
-                 catalogue_order + 1 under document_id_scheme_version \
+                 book numbers, never 0, under document_id_scheme_version \
                  {DOCUMENT_ID_SCHEME_VERSION}",
                 lines[0]
             );
@@ -801,7 +848,7 @@ mod tests {
     fn engine_with_books(dir: &TempDir) -> SearchEngine {
         let mut engine = SearchEngine::new(dir.path().to_str().unwrap());
         engine
-            .add_text_book(
+            .add_text_book_placed(
                 "בראשית".to_string(),
                 "/מקרא/תורה".to_string(),
                 GENESIS.to_string(),
@@ -814,7 +861,7 @@ mod tests {
             )
             .unwrap();
         engine
-            .add_text_book(
+            .add_text_book_placed(
                 "משנה ברכות".to_string(),
                 "/משנה/זרעים".to_string(),
                 BERACHOT.to_string(),
@@ -895,6 +942,12 @@ mod tests {
             line.content_hash, 0,
             "contentHash is FAST-only and must be read columnar"
         );
+        let second = corpus.book_line_ids(GENESIS).unwrap()[1];
+        assert_eq!(
+            corpus.line(second).unwrap().unwrap().content_hash,
+            line.content_hash,
+            "every line carries its book's contentHash, which one document holds"
+        );
         assert_eq!(
             line.facets,
             vec!["/era/תנך".to_string(), "/מקרא/תורה".to_string()],
@@ -945,7 +998,7 @@ mod tests {
         let count_before = snapshot.line_count();
 
         engine
-            .add_text_book(
+            .add_text_book_placed(
                 "ספר נוסף".to_string(),
                 "/מקרא/נביאים".to_string(),
                 "/books/joshua.txt".to_string(),
@@ -1081,7 +1134,7 @@ mod tests {
         maimed.add_u64(field("segment"), 1);
         // Everything else present, so the refusal below can only be about the one field
         // that is not — otherwise this would pass for the wrong reason.
-        for name in ["sectionId", "lineHash", "contentHash", "generationSort"] {
+        for name in ["sectionOffset", "lineHash", "contentHash", "metadataHash"] {
             maimed.add_u64(field(name), 1);
         }
         // `isPdf` deliberately absent. Defaulted it would read as `false` — a filterable
@@ -1116,7 +1169,7 @@ mod tests {
     fn a_document_with_two_values_in_a_single_valued_field_is_refused() {
         use tantivy::{Index, TantivyDocument};
 
-        for (field_name, expected) in [("id", "id"), ("sectionId", "sectionId")] {
+        for (field_name, expected) in [("id", "id"), ("sectionOffset", "sectionId")] {
             let dir = TempDir::new().unwrap();
             let engine = engine_with_books(&dir);
             let next_id = corpus(&engine).book_line_ids(BERACHOT).unwrap()[0] + 1;
@@ -1144,7 +1197,7 @@ mod tests {
             doubled.add_bool(field("isPdf"), false);
             doubled.add_u64(field("id"), next_id);
             doubled.add_u64(field("segment"), 1);
-            for name in ["sectionId", "lineHash", "contentHash", "generationSort"] {
+            for name in ["sectionOffset", "lineHash", "contentHash", "metadataHash"] {
                 doubled.add_u64(field(name), 1);
             }
             // The second value, on the field under test.
@@ -1166,55 +1219,38 @@ mod tests {
         }
     }
 
-    /// The one catalogue position that cannot form an id is refused where the id is formed.
-    ///
-    /// `(u32::MAX + 1) << 32` overflows a `u64` and wraps to a base of zero in release —
-    /// which the corpus would then refuse as "no catalogue prefix", for a whole index,
-    /// blaming the reader for something the writer did.
+    /// The one book number that cannot form an id is never handed out: the engine refuses
+    /// the book where the id is composed, instead of the corpus refusing a whole index.
     #[test]
-    fn the_last_catalogue_position_is_refused_where_the_id_is_composed() {
+    fn the_last_book_number_is_refused_where_the_id_is_composed() {
         let dir = TempDir::new().unwrap();
         let mut engine = SearchEngine::new(dir.path().to_str().unwrap());
+        engine.force_book_number_for_tests(BERACHOT, u32::MAX - 1);
         let refused = engine.add_text_book(
             "ספר אחרון".to_string(),
             "/מקרא".to_string(),
             GENESIS.to_string(),
-            u32::MAX,
-            0,
             "שורה ארוכה דיה לעמוד בפני עצמה".to_string(),
             None,
             TextStorage::InIndex,
             None,
+            None,
         );
-        let error = refused.expect_err("the last catalogue position cannot form an id");
-        assert!(format!("{error}").contains("overflows u64"), "{error}");
+        let error = refused.expect_err("the last book number cannot form an id");
+        assert!(format!("{error}").contains("handed out"), "{error}");
     }
 
-    /// Scheme 1 composes the high half as `catalogue_order + 1`, so a prefix of zero is not
-    /// a catalogue position — it is what a bare ordinal looks like when nothing composed
-    /// it. `line_id = 1` would otherwise be accepted and stamped as scheme 1.
+    /// Scheme 1 composes the high half as the book's number, which is never 0, so a prefix of
+    /// zero is what a bare ordinal looks like when nothing composed it. `line_id = 1` would
+    /// otherwise be accepted and stamped as scheme 1.
     #[test]
     fn an_id_with_no_catalogue_prefix_is_refused() {
         let dir = TempDir::new().unwrap();
         let mut engine = SearchEngine::new(dir.path().to_str().unwrap());
-        engine
-            .add_document(
-                1,
-                "t",
-                "r",
-                "/root",
-                "שורה ארוכה דיה לעמוד בפני עצמה",
-                0,
-                false,
-                GENESIS,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
+        engine.add_raw_document_for_tests(1, GENESIS, "שורה ארוכה דיה לעמוד בפני עצמה");
         engine.commit().unwrap();
 
-        let error = expect_refusal(&engine, "an id with no catalogue prefix must be refused");
+        let error = expect_refusal(&engine, "an id with no book prefix must be refused");
         assert!(error.contains("id prefix of 0"), "{error}");
     }
 
@@ -1235,7 +1271,7 @@ mod tests {
     }
 
     /// The ordering this adapter performs is only correct because the ids encode a
-    /// position — and the public `add_document` accepts any `u64` at all.
+    /// position — and an index written by another build may hold any `u64` at all.
     ///
     /// Without this check a caller could hand the engine ids from another scheme (or none),
     /// and a build would sort a book's lines into an order nobody chose, hand the chunker
@@ -1248,21 +1284,7 @@ mod tests {
         let shared = TempDir::new().unwrap();
         let mut engine = SearchEngine::new(shared.path().to_str().unwrap());
         for (id, path) in [(1u64 << 32 | 1, GENESIS), (1u64 << 32 | 2, BERACHOT)] {
-            engine
-                .add_document(
-                    id,
-                    "t",
-                    "r",
-                    "/root",
-                    "שורה ארוכה דיה לעמוד בפני עצמה",
-                    0,
-                    false,
-                    path,
-                    None,
-                    None,
-                    None,
-                )
-                .unwrap();
+            engine.add_raw_document_for_tests(id, path, "שורה ארוכה דיה לעמוד בפני עצמה");
         }
         engine.commit().unwrap();
         let error = expect_refusal(&engine, "two books cannot share an id prefix");
@@ -1273,21 +1295,7 @@ mod tests {
         let mixed = TempDir::new().unwrap();
         let mut engine = SearchEngine::new(mixed.path().to_str().unwrap());
         for id in [1u64 << 32 | 1, 2u64 << 32 | 1] {
-            engine
-                .add_document(
-                    id,
-                    "t",
-                    "r",
-                    "/root",
-                    "שורה ארוכה דיה לעמוד בפני עצמה",
-                    0,
-                    false,
-                    GENESIS,
-                    None,
-                    None,
-                    None,
-                )
-                .unwrap();
+            engine.add_raw_document_for_tests(id, GENESIS, "שורה ארוכה דיה לעמוד בפני עצמה");
         }
         engine.commit().unwrap();
         let error = expect_refusal(&engine, "a book's ids must share one prefix");
@@ -1296,21 +1304,7 @@ mod tests {
         // Position zero: ids are 1-based, so a zero low half is not a position at all.
         let zero = TempDir::new().unwrap();
         let mut engine = SearchEngine::new(zero.path().to_str().unwrap());
-        engine
-            .add_document(
-                1u64 << 32,
-                "t",
-                "r",
-                "/root",
-                "שורה ארוכה דיה לעמוד בפני עצמה",
-                0,
-                false,
-                GENESIS,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
+        engine.add_raw_document_for_tests(1u64 << 32, GENESIS, "שורה ארוכה דיה לעמוד בפני עצמה");
         engine.commit().unwrap();
         let error = expect_refusal(&engine, "position 0 does not exist under scheme 1");
         assert!(error.contains("position 0"), "{error}");

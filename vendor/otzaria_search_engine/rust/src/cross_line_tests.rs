@@ -15,7 +15,7 @@ fn engine() -> (SearchEngine, TempDir) {
 
 fn add_book(engine: &mut SearchEngine, order: u32, path: &str, lines: &[&str]) {
     engine
-        .add_text_book(
+        .add_text_book_placed(
             format!("ספר {order}"),
             "/t".to_string(),
             path.to_string(),
@@ -78,6 +78,7 @@ fn advanced_with(
         None,
         None,
         None,
+        None,
     )
     .unwrap()
 }
@@ -99,6 +100,8 @@ fn count_advanced(e: &SearchEngine, query: &str, distance: u32) -> u32 {
         false,
         SearchScope::WordDistance,
         SearchScope::WordDistance,
+        None,
+        None,
         None,
         None,
     )
@@ -180,7 +183,7 @@ fn a_phrase_continues_onto_the_next_line() {
     assert!(text.find("ויאמר").unwrap() > text.find("<br>").unwrap());
     assert!(text.find("ובין").unwrap() < text.find("<br>").unwrap());
     assert_eq!(
-        e.count_exact("ובין המים ויאמר אלהים".into(), vec![], false, false)
+        e.count_exact("ובין המים ויאמר אלהים".into(), vec![], false, false, None)
             .unwrap(),
         1
     );
@@ -259,18 +262,41 @@ fn a_phrase_never_continues_into_another_book() {
 }
 
 #[test]
+fn the_next_line_shown_is_from_the_hit_s_own_book_when_ids_collide() {
+    let (mut e, _dir) = engine();
+    // Same catalogue position, so the two books' lines share ids.
+    add_book(
+        &mut e,
+        0,
+        "id:1",
+        &[
+            "ויבדל בין המים אשר מתחת לרקיע ובין המים",
+            "ויאמר אלהים יקוו המים",
+        ],
+    );
+    add_book(&mut e, 0, "uid:1", &["אחת", "שתיים שלוש"]);
+    e.commit().unwrap();
+    let results = exact(&e, "ובין המים ויאמר אלהים");
+    let hit = results.iter().find(|r| r.file_path == "id:1").unwrap();
+    assert!(hit.continues_to_next_line);
+    assert!(hit.text.contains("<br>"), "{}", hit.text);
+    assert!(hit.text.contains("ויאמר"), "{}", hit.text);
+    assert!(!hit.text.contains("שתיים"), "{}", hit.text);
+}
+
+#[test]
 fn a_hit_in_line_and_across_the_break_counts_once() {
     let (e, _dir) = book_engine(&["אמר רבי יוחנן דבר אמר", "רבי יוחנן אמר", "שורה אחרת"]);
     let results = exact(&e, "אמר רבי");
     // Line 0 holds the phrase in line and across the break; it is one hit, shown in line.
     assert_eq!(hits(&results), [(0, false)]);
     assert_eq!(
-        e.count_exact("אמר רבי".into(), vec![], false, false)
+        e.count_exact("אמר רבי".into(), vec![], false, false, None)
             .unwrap(),
         1
     );
     let by_book = e
-        .count_by_book_exact("אמר רבי".into(), vec![], false, false)
+        .count_by_book_exact("אמר רבי".into(), vec![], false, false, None)
         .unwrap();
     assert_eq!(by_book.values().sum::<u32>(), 1);
     let page = e
@@ -334,6 +360,42 @@ fn word_distance_counts_the_words_of_both_lines() {
 }
 
 #[test]
+fn any_order_stays_within_one_line() {
+    let (e, _dir) = book_engine(&["השמים ואת הארץ", "והארץ היתה תהו ובהו"]);
+    let any_order = |query: &str, distance| {
+        e.search_advanced(
+            query.to_string(),
+            String::new(),
+            vec![],
+            100,
+            0,
+            distance,
+            0,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            ResultsOrder::Catalogue,
+            false,
+            false,
+            SearchScope::WordDistance,
+            SearchScope::WordDistance,
+            None,
+            None,
+            None,
+            Some(true),
+        )
+        .unwrap()
+    };
+    assert_eq!(hits(&advanced(&e, "השמים היתה", 3)), [(0, true)]);
+    assert!(any_order("השמים היתה", 3).is_empty());
+    assert!(any_order("היתה השמים", 5).is_empty());
+    assert_eq!(hits(&any_order("הארץ השמים", 1)), [(0, false)]);
+}
+
+#[test]
 fn advanced_word_options_apply_across_the_break() {
     let (e, _dir) = book_engine(&["ראה כי טוב השמים", "והארץ היתה"]);
     let prefixes: HashMap<String, HashMap<String, bool>> = [(
@@ -392,7 +454,7 @@ fn pdf_lines_join_across_pages_but_not_across_a_dropped_line() {
         },
     ];
     let added = e
-        .add_pdf_book(
+        .add_pdf_book_placed(
             "ספר".into(),
             "/t".into(),
             "/b/book.pdf".into(),
@@ -501,7 +563,7 @@ fn either_paired_reading_can_end_a_cross_line_phrase_part() {
             assert!(results[0].text.contains("היצא"), "{}", results[0].text);
             assert!(results[0].text.contains("אתך"), "{}", results[0].text);
             assert_eq!(
-                e.count_exact(query, vec![], false, false).unwrap(),
+                e.count_exact(query, vec![], false, false, None).unwrap(),
                 1,
                 "{left}"
             );
@@ -525,7 +587,7 @@ fn either_paired_reading_can_start_a_cross_line_phrase_part() {
             assert_eq!(hits(&results), [(0, true)], "{right}: {query}");
             assert!(results[0].text.contains("הוצא"), "{}", results[0].text);
             assert!(results[0].text.contains("היצא"), "{}", results[0].text);
-            assert_eq!(e.count_exact(query, vec![], false, false).unwrap(), 1);
+            assert_eq!(e.count_exact(query, vec![], false, false, None).unwrap(), 1);
         }
         assert!(exact(&e, "החיה הוצא היצא").is_empty(), "{right}");
     }
@@ -623,7 +685,7 @@ fn real_library_cross_line_cost() {
                 .collect();
             lines += rows.len();
             engine
-                .add_text_book(
+                .add_text_book_placed(
                     format!("ספר {book}"),
                     "/x".into(),
                     format!("/x/{book}"),
@@ -756,6 +818,7 @@ fn real_library_cross_line_cost() {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .unwrap()
                 .results
@@ -880,7 +943,7 @@ fn acronym_snippets_paint_complete_alternatives_without_stray_expansion_words() 
 }
 
 fn add_filtered_book(e: &mut SearchEngine, order: u32, topics: &str, text: &str, extra: &[&str]) {
-    e.add_text_book(
+    e.add_text_book_placed(
         format!("ספר {order}"),
         topics.into(),
         format!("/filter/{order}.txt"),
