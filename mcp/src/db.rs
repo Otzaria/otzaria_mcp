@@ -1,6 +1,6 @@
 //! Read-only access to Otzaria's `seforim.db`.
 //!
-//! Supports the current library (schema 6 / db_version 32: text split into
+//! Supports the current library (schema 7: footnote bodies in `line_note`, text split into
 //! `line_content` and compressed with zstd dictionaries, `version_line`, `line_ref`,
 //! `line_dh`, `link_anchor`, `link_coverage`, `link_suppressed_side`, publication data,
 //! category descriptions, …) and degrades gracefully on older databases (schema ≤ 5,
@@ -12,8 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use anyhow::{Context, Result};
-use rusqlite::types::Value;
+use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use search_engine::inline_notes::{rehydrate_inline_notes, BookNote};
 use serde::Serialize;
 
 use crate::paths::Paths;
@@ -24,6 +25,7 @@ pub use crate::text::strip_html_tags;
 
 /// A decoded line: (lineIndex, line.id, heRef, html).
 pub type LineRow = (i64, i64, Option<String>, String);
+type StoredLineRow = (i64, i64, Option<String>, Value);
 
 /// The connection plus the codec for its compressed rows (one per connection).
 pub struct Inner {
@@ -36,6 +38,8 @@ pub struct Inner {
 pub struct Caps {
     /// `line_content` table (schema 6): text is not in `line.content`.
     pub split_content: bool,
+    /// Complete schema-7 `line_note` layout; its bodies are uncompressed TEXT.
+    pub line_notes: bool,
     /// Rows are zstd frames (a `zstd_dict` table exists).
     pub compressed: bool,
     pub line_ref: bool,
@@ -81,8 +85,12 @@ impl Caps {
         let book_cols = columns("book")?;
         let link_cols = columns("link")?;
         let cat_cols = columns("category")?;
+        let note_cols = columns("line_note")?;
         Ok(Caps {
             split_content: t("line_content"),
+            line_notes: ["lineId", "noteIndex", "charPos", "marker", "body"]
+                .iter()
+                .all(|name| note_cols.contains(*name)),
             compressed: t("zstd_dict"),
             line_ref: t("line_ref"),
             line_dh: t("line_dh"),
@@ -247,7 +255,44 @@ impl Db {
         }
     }
 
-    /// Decoded text of the given `line.id`s (batched), as raw HTML.
+    /// Load only notes belonging to the requested base rows, in bounded SQL batches.
+    /// As in the engine, malformed noteIndex/body rows are skipped; a missing
+    /// charPos falls back to the associated marker or end of line.
+    fn notes_by_line_id(&self, inner: &Inner, ids: &[i64]) -> Result<HashMap<i64, Vec<BookNote>>> {
+        let mut notes: HashMap<i64, Vec<BookNote>> = HashMap::new();
+        if !self.caps.line_notes {
+            return Ok(notes);
+        }
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        for chunk in ids.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut stmt = inner.conn.prepare(&format!(
+                "SELECT lineId, noteIndex, charPos, marker, body FROM line_note \
+                 WHERE lineId IN ({placeholders}) ORDER BY lineId, noteIndex"
+            ))?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter()))?;
+            while let Some(row) = rows.next()? {
+                let (ValueRef::Integer(id), ValueRef::Integer(_), ValueRef::Text(body)) =
+                    (row.get_ref(0)?, row.get_ref(1)?, row.get_ref(4)?)
+                else {
+                    continue;
+                };
+                notes.entry(id).or_default().push(BookNote {
+                    char_pos: match row.get_ref(2)? {
+                        ValueRef::Integer(pos) => pos,
+                        _ => -1,
+                    },
+                    has_marker: matches!(row.get_ref(3)?, ValueRef::Text(_)),
+                    body: String::from_utf8_lossy(body).into_owned(),
+                });
+            }
+        }
+        Ok(notes)
+    }
+
+    /// Decoded text of the given `line.id`s (batched), with base notes restored.
     pub(crate) fn texts_by_line_id(
         &self,
         inner: &mut Inner,
@@ -264,6 +309,13 @@ impl Db {
                 self.content_col(),
                 self.content_join()
             );
+            // A WAL writer may replace content and notes in one transaction.
+            // Read both from one snapshot, then release it before decoding.
+            let snapshot = self
+                .caps
+                .line_notes
+                .then(|| inner.conn.unchecked_transaction())
+                .transpose()?;
             let rows: Vec<(i64, Value)> = {
                 let mut stmt = inner.conn.prepare(&sql)?;
                 let rows = stmt
@@ -273,8 +325,14 @@ impl Db {
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 rows
             };
+            let notes = self.notes_by_line_id(inner, chunk)?;
+            snapshot.map(|snapshot| snapshot.commit()).transpose()?;
             for (id, v) in rows {
-                out.insert(id, inner.codec.text_lossy(&v));
+                let html = inner.codec.text_lossy(&v);
+                let restored = notes
+                    .get(&id)
+                    .and_then(|notes| rehydrate_inline_notes(&html, notes));
+                out.insert(id, restored.unwrap_or(html));
             }
         }
         Ok(out)
@@ -366,25 +424,62 @@ impl Db {
         start: i64,
         end: i64,
     ) -> Result<Vec<LineRow>> {
+        let snapshot = self
+            .caps
+            .line_notes
+            .then(|| inner.conn.unchecked_transaction())
+            .transpose()?;
+        let rows = self.stored_lines_in_range(inner, book_id, start, end)?;
+        let ids: Vec<_> = rows.iter().map(|row| row.1).collect();
+        let notes = self.notes_by_line_id(inner, &ids)?;
+        snapshot.map(|snapshot| snapshot.commit()).transpose()?;
+        Ok(rows
+            .into_iter()
+            .map(|(li, id, he_ref, value)| {
+                let html = inner.codec.text_lossy(&value);
+                let restored = notes
+                    .get(&id)
+                    .and_then(|notes| rehydrate_inline_notes(&html, notes));
+                (li, id, he_ref, restored.unwrap_or(html))
+            })
+            .collect())
+    }
+
+    /// Stored text without bodies: link_anchor offsets address these visible units.
+    pub(crate) fn raw_lines_in_range(
+        &self,
+        inner: &mut Inner,
+        book_id: i64,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<LineRow>> {
+        let rows = self.stored_lines_in_range(inner, book_id, start, end)?;
+        Ok(rows
+            .into_iter()
+            .map(|(li, id, he_ref, value)| (li, id, he_ref, inner.codec.text_lossy(&value)))
+            .collect())
+    }
+
+    fn stored_lines_in_range(
+        &self,
+        inner: &Inner,
+        book_id: i64,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<StoredLineRow>> {
         let sql = format!(
             "SELECT l.lineIndex, l.id, l.heRef, {} FROM line l {} \
               WHERE l.bookId = ?1 AND l.lineIndex BETWEEN ?2 AND ?3 ORDER BY l.lineIndex",
             self.content_col(),
             self.content_join()
         );
-        let rows: Vec<(i64, i64, Option<String>, Value)> = {
-            let mut stmt = inner.conn.prepare(&sql)?;
-            let rows = stmt
-                .query_map(rusqlite::params![book_id, start, end], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
-        };
-        Ok(rows
-            .into_iter()
-            .map(|(li, id, he_ref, v)| (li, id, he_ref, inner.codec.text_lossy(&v)))
-            .collect())
+        let mut stmt = inner.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params![book_id, start, end], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Era of every book with a generation (cached). Takes the connection lock on first
@@ -630,7 +725,7 @@ impl Db {
         let (sql, version_info) = match version {
             None => (
                 format!(
-                    "SELECT l.lineIndex, l.heRef, {} FROM line l {} \
+                    "SELECT l.id, l.lineIndex, l.heRef, {}, 1 FROM line l {} \
                       WHERE l.bookId = ?1 AND l.lineIndex >= ?2 ORDER BY l.lineIndex LIMIT ?3",
                     self.content_col(),
                     self.content_join()
@@ -667,9 +762,16 @@ impl Db {
                 } else {
                     "CASE WHEN l.heRef IS NULL THEN l.content ELSE COALESCE(vl.content, '') END"
                 };
+                // Only a row actually selected from the base gets base notes.
+                // Alternate edition text already contains its own inline notes.
+                let from_base = if self.caps.split_content {
+                    "l.heRef IS NULL OR (vl.lineId IS NOT NULL AND vl.content IS NULL)"
+                } else {
+                    "l.heRef IS NULL"
+                };
                 (
                     format!(
-                        "SELECT l.lineIndex, l.heRef, {case} FROM line l {} \
+                        "SELECT l.id, l.lineIndex, l.heRef, {case}, ({from_base}) FROM line l {} \
                            LEFT JOIN version_line vl ON vl.versionId = {vid} AND vl.lineId = l.id \
                           WHERE l.bookId = ?1 AND l.lineIndex >= ?2 ORDER BY l.lineIndex LIMIT ?3",
                         self.content_join()
@@ -682,19 +784,32 @@ impl Db {
             }
         };
 
-        let raw: Vec<(i64, Option<String>, Value)> = {
+        let snapshot = self
+            .caps
+            .line_notes
+            .then(|| inner.conn.unchecked_transaction())
+            .transpose()?;
+        let raw: Vec<(i64, i64, Option<String>, Value, bool)> = {
             let mut stmt = inner.conn.prepare(&sql)?;
             let rows = stmt
                 .query_map(rusqlite::params![book_id, line_index, limit], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
+        let base_ids: Vec<_> = raw.iter().filter(|row| row.4).map(|row| row.0).collect();
+        let notes = self.notes_by_line_id(&inner, &base_ids)?;
+        snapshot.map(|snapshot| snapshot.commit()).transpose()?;
         let lines: Vec<TextLine> = raw
             .into_iter()
-            .map(|(li, he_ref, v)| {
+            .map(|(id, li, he_ref, v, from_base)| {
                 let html = inner.codec.text_lossy(&v);
+                let restored = from_base
+                    .then(|| notes.get(&id))
+                    .flatten()
+                    .and_then(|notes| rehydrate_inline_notes(&html, notes));
+                let html = restored.unwrap_or(html);
                 TextLine {
                     line_index: li,
                     he_ref,

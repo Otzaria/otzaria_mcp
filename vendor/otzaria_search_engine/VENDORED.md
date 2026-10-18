@@ -2,7 +2,7 @@
 
 This directory holds a **vendored copy** of the Rust crate from the
 `otzaria_search_engine` Flutter package: version **4.1.0 plus the `feat/stable-book-ids`
-branch**, commit `6a92260fd269f0394e3b14748f18b76fc566dac7` of
+branch**, commit `cdb31715b60a694b3d7483252f0ce23a25512cd8` of
 `https://github.com/palmoni5/otzaria_search_engine` (on top of `8f8e443`), which is not
 released yet.
 
@@ -20,17 +20,20 @@ released yet.
   including the read-only one, loads it on open and re-reads it when it changes on disk
   (checked on every catalogue/generation search). Without the file, or for a book missing
   from it, results sort by book number (books in the mapping first).
+- Base DB text, commentaries and link snippets use the upstream public
+  `inline_notes::{BookNote, rehydrate_inline_notes}` renderer, so restored bodies
+  follow exactly the same marker, UTF-16 and block-boundary rules as indexing.
 - Vendoring exact bytes keeps the MCP self-contained and reproducible.
 
 ## Source
-Copied from `git archive 6a92260fd269f0394e3b14748f18b76fc566dac7 rust LICENSE CHANGELOG.md`
+Copied from `git archive cdb31715b60a694b3d7483252f0ce23a25512cd8 rust LICENSE CHANGELOG.md`
 (`rust/Cargo.toml`, `src/`, `resources/`, `vendor/tantivy-fst/`, plus `LICENSE` and
 `CHANGELOG.md`). Omitted: the Flutter plugin scaffolding, the crate's `tests/`,
 `examples/` and `Cargo.lock` (not needed to build the lib). To verify, from a clone of the
 engine that has the commit:
 
 ```sh
-mkdir /tmp/engine && git archive 6a92260fd269f0394e3b14748f18b76fc566dac7 rust | tar -x -C /tmp/engine
+mkdir /tmp/engine && git archive cdb31715b60a694b3d7483252f0ce23a25512cd8 rust | tar -x -C /tmp/engine
 diff -r /tmp/engine/rust <mcp>/vendor/otzaria_search_engine/rust
 ```
 

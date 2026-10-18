@@ -5,6 +5,10 @@ use crate::db::Db;
 use rusqlite::Connection;
 
 pub(crate) fn fixture_db() -> Db {
+    fixture_db_with(|_| {})
+}
+
+pub(crate) fn fixture_db_with(setup: impl FnOnce(&Connection)) -> Db {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TABLE category (id INTEGER PRIMARY KEY, parentId INTEGER, title TEXT NOT NULL, level INTEGER NOT NULL DEFAULT 0, orderIndex INTEGER NOT NULL DEFAULT 999, heShortDesc TEXT, heDesc TEXT);
@@ -63,6 +67,7 @@ pub(crate) fn fixture_db() -> Db {
          INSERT INTO alt_toc_entry VALUES (8, 7, NULL, 2, 0, 11, 1, 0);",
     )
     .unwrap();
+    setup(&conn);
     Db::from_connection(conn).unwrap()
 }
 

@@ -14,3 +14,6 @@ pub mod text;
 
 #[cfg(test)]
 mod fixture_tests;
+
+#[cfg(test)]
+mod schema7_tests;
