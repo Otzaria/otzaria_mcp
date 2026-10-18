@@ -12,7 +12,7 @@
   `link_range`/`link_coverage`, צדדים מוסתרים `link_suppressed_side`, תאריכי/מקומות הוצאה,
   תיאורים קצרים/ארוכים) — וגם מסדים ישנים (טקסט גלוי ב-`line.content`) בירידה הדרגתית.
 - **אינדקס Tantivy** — חיפוש טקסט מלא עם מורפולוגיה עברית. המנוע המקורי של אוצריא
-  (`otzaria_search_engine` **3.1.0**, הגרסה שהאפליקציה מצמידה היום, אינדקס בסכמה 5) עבר
+  (`otzaria_search_engine` **4.1.0 + מספרי ספרים יציבים**, אינדקס בסכמה 7) עבר
   **vendoring** ומשמש ישירות, כך שהחיפוש נאמן במדויק לזה שבאפליקציה — כולל אפשרויות
   החיפוש המתקדם, ביטויים שחוצים שורה, סינון לפי קטגוריה/תקופה/מחבר/ספרי יסוד, וקריאת
   טקסט השורות בחזרה מ-`seforim.db` (המנוע לא שומר את טקסט הספרים הרשמיים באינדקס).
@@ -149,7 +149,7 @@ Windows `%APPDATA%\Claude\claude_desktop_config.json`.
 ```
 לקוח AI ──MCP (stdio)── otzaria-mcp
                           ├── rusqlite + zstd → seforim.db  (ניווט/מטא/הפניות/קישורים)
-                          └── search_engine 3.1.0 (Tantivy) → index/  (+ קריאת שורות מ-seforim.db)
+                          └── search_engine (Tantivy) → index/  (+ קריאת שורות מ-seforim.db)
 ```
 
 - **קריאה-בלבד:** ה-DB נפתח `SQLITE_OPEN_READ_ONLY` + `query_only`; האינדקס נפתח
@@ -163,7 +163,10 @@ Windows `%APPDATA%\Claude\claude_desktop_config.json`.
   האינדקס); כשהיא משתנה ומתייצבת, נפתחים מחדש ה-DB והאינדקס מאחורי `RwLock`.
   גם חיבור קריאת השורות של מנוע החיפוש מתרענן כשמחליפים את קובץ המסד באותו נתיב.
   תוצאה שאינה תואמת עוד את האינדקס מסומנת `stale`.
-- **גרסת מנוע:** ה-crate המוונדר (3.1.0) חייב להתאים לסכימת האינדקס בדיסק (סכמה 5).
+- **גרסת מנוע:** ה-crate המוונדר חייב להתאים לסכימת האינדקס בדיסק (סכמה 7); אינדקס ישן
+  נדחה עד שהאפליקציה בונה אותו מחדש.
+- **סדר קטלוג/דורות:** נלקח מ-`otzaria_book_order.json` שהאפליקציה כותבת בתיקיית האינדקס,
+  ונקרא מחדש כשהוא משתנה. בלי הקובץ (או לספר שחסר בו) התוצאות ממוינות לפי מספר הספר במנוע.
   ראו [`vendor/otzaria_search_engine/VENDORED.md`](vendor/otzaria_search_engine/VENDORED.md).
 - **חיפוש סמנטי ("חיפוש חכם")** — עדיין לא נחשף; ראו [CHANGELOG](CHANGELOG.md) ("עבודה עתידית").
 
@@ -188,7 +191,7 @@ cargo clippy -p otzaria-mcp --all-targets --no-deps -- -D warnings
 
 ```
 Cargo.toml                      # workspace + [patch.crates-io] של המנוע
-vendor/otzaria_search_engine/   # מנוע Tantivy מוונדר (pub.dev 3.1.0) + open_read_only
+vendor/otzaria_search_engine/   # מנוע Tantivy מוונדר + open_read_only, refresh_line_source
 mcp/src/
   main.rs      # CLI + serve stdio
   paths.rs     # גילוי נתיבים

@@ -18,7 +18,9 @@ use otzaria_mcp::db::{Db, Era};
 use otzaria_mcp::paths::Paths;
 use otzaria_mcp::reload::Library;
 use otzaria_mcp::search::{Mode, Search, SearchHitSource, SearchRequest};
-use search_engine::api::search_engine::{configure_line_source, SearchEngine, TextStorage};
+use search_engine::api::search_engine::{
+    configure_line_source, BookOrderEntry, SearchEngine, TextStorage,
+};
 
 fn db_path() -> Option<PathBuf> {
     let p = std::env::var_os("OTZARIA_TEST_DB").or_else(|| std::env::var_os("OTZARIA_DB"))?;
@@ -280,6 +282,7 @@ fn test_index(db_path: &Path, db: &Db) -> PathBuf {
         std::fs::create_dir_all(&dir).unwrap();
         configure_line_source(db_path.to_string_lossy().into_owned()).unwrap();
         let mut engine = SearchEngine::new(dir.to_str().unwrap());
+        let mut order_entries = Vec::new();
         for (order, &book_id) in INDEXED_BOOKS.iter().enumerate() {
             let info = db.get_book_info(book_id).unwrap().unwrap();
             let t = db
@@ -305,16 +308,22 @@ fn test_index(db_path: &Path, db: &Db) -> PathBuf {
                     info.title.clone(),
                     topics,
                     format!("id:{book_id}"),
-                    order as u32,
-                    info.era.order() as u32,
                     text,
                     Some(extra),
                     TextStorage::LibraryDb,
                     None,
+                    None,
                 )
                 .unwrap();
             assert_eq!(added as i64, info.total_lines, "one document per line");
+            // The app's order mapping: catalogue position and era rank, by file path.
+            order_entries.push(BookOrderEntry {
+                file_path: format!("id:{book_id}"),
+                catalogue_order: order as u32,
+                generation_order: info.era.order() as u32,
+            });
         }
+        engine.set_book_order(order_entries).unwrap();
         engine.commit().unwrap();
         drop(engine);
         dir

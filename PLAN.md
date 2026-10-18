@@ -43,7 +43,7 @@
 הסיכון המרכזי (ביקורת #1): תוצאת חיפוש חייבת להחזיר **מזהה קנוני** — `bookId` **ו**-`lineIndex`
 — ולא להסתמך על `title → bookId` (שביר). האינדקס שומר: `segment` (=`line.lineIndex`),
 `filePath` (לספרי-טקסט = מפתח קטלוגי שמקודד את המזהה, למשל `id:<bookId>`/`uid:<bookId>`;
-ל-PDF = נתיב), `title`, `id` (סינתטי `catalogueOrder<<32|ordinal`, **לא** מפתח DB).
+ל-PDF = נתיב), `title`, `id` (סינתטי `(bookNumber<<32)+ordinal+1`, מספר ספר שהמנוע מקצה; **לא** מפתח DB).
 
 **המשימה הראשונה, לפני 9 הכלים:** לפתוח את האינדקס עם ה-crate, להריץ `search_and_count_advanced`,
 ולאמת שכל hit ממופה **חד-משמעית** ל-`(bookId, lineIndex)`:

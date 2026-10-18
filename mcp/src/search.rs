@@ -1,7 +1,7 @@
 //! Full-text search over Otzaria's Tantivy index, via the reused (vendored)
-//! `search_engine` 3.1.0 crate — reproducing the app's exact search semantics.
+//! `search_engine` crate — reproducing the app's exact search semantics.
 //!
-//! Index contract (schema 5, verified against the app's indexer):
+//! Index contract (schema 7, verified against the app's indexer):
 //!   * `file_path` = `id:<bookId>` for official text books (`uid:` = user book, `ext:` /
 //!     `attached:` = external or attached catalogues); for PDFs a file path and `is_pdf`.
 //!   * `segment` = the 0-based position of the line among the book's rows ordered by
@@ -12,6 +12,8 @@
 //!     A result whose row no longer matches the indexed text is `stale`.
 //!   * Facets: the category path (`/תנ״ך/תורה/…`) plus dimension facets `/author/<name>`,
 //!     `/era/<era>` and `/base` (OR inside a dimension, AND across dimensions).
+//!   * Catalogue/generation order comes from the app's `otzaria_book_order.json` in the
+//!     index directory; without it (or for books missing from it) hits sort by book number.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -399,6 +401,7 @@ impl Search {
                     grouping,
                     a.word_match.0,
                     a.word_match.1,
+                    None,
                 )
             }
         }
@@ -461,6 +464,7 @@ impl Search {
                     SearchScope::WordDistance,
                     a.word_match.0,
                     a.word_match.1,
+                    None,
                 )
             }
         }
@@ -476,6 +480,7 @@ impl Search {
                 req.facets.clone(),
                 req.match_nikud,
                 req.match_taamim,
+                None,
             ),
             Mode::Fuzzy => engine.count_by_book_fuzzy(
                 req.query.clone(),
@@ -483,6 +488,7 @@ impl Search {
                 fuzzy_distance(req),
                 req.match_nikud,
                 req.match_taamim,
+                None,
             ),
             Mode::Advanced => {
                 let a = Advanced::from(req)?;
@@ -504,6 +510,8 @@ impl Search {
                     SearchScope::WordDistance,
                     a.word_match.0,
                     a.word_match.1,
+                    None,
+                    None,
                 )
             }
         }

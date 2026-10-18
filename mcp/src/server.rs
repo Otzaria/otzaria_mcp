@@ -153,7 +153,8 @@ pub struct FullTextSearchParams {
     #[serde(default)]
     pub offset: Option<u32>,
     /// Result order: "catalogue" (default, library order), "relevance" or "generation"
-    /// (chronological by era).
+    /// (chronological by era). Both follow the order the app stored with the index; books
+    /// it does not list come after the listed ones.
     #[serde(default)]
     pub order: Option<String>,
     /// advanced/exact: max words allowed between adjacent query words (default 0, as in
