@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync", "signal", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 # rusqlite pinned to the same version/features the `search_engine` crate uses, so the
 # bundled SQLite is unified to a single C library (avoids duplicate-symbol conflicts).
 rusqlite = { version = "0.32", features = ["bundled"] }

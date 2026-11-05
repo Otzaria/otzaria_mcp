@@ -1,0 +1,89 @@
+{
+  "completed": 33,
+  "completed_latency": {
+    "max_us": 178511,
+    "p50_us": 138726,
+    "p95_us": 176296
+  },
+  "completed_per_second": 182.9434533926356,
+  "elapsed_us": 180383,
+  "errors": [],
+  "gate": {
+    "accepted": 33,
+    "blocking_tasks": 0,
+    "cancelled_before_start": 0,
+    "completed": 33,
+    "completed_after_cancellation": 0,
+    "completed_per_second": 181.84215392406028,
+    "execution": {
+      "count": 33,
+      "max_us": 100108,
+      "p50_us_upper_bound": 4096,
+      "p95_us_upper_bound": 4096,
+      "sum_us": 169553
+    },
+    "expired_before_start": 0,
+    "failed": 0,
+    "in_flight": 0,
+    "latency": {
+      "count": 33,
+      "max_us": 178366,
+      "p50_us_upper_bound": 262144,
+      "p95_us_upper_bound": 262144,
+      "sum_us": 4608337
+    },
+    "peak_in_flight": 33,
+    "peak_queued": 32,
+    "peak_running": 1,
+    "queue": {
+      "count": 33,
+      "max_us": 176292,
+      "p50_us_upper_bound": 262144,
+      "p95_us_upper_bound": 262144,
+      "sum_us": 4438781
+    },
+    "queue_capacity": 32,
+    "queue_timeout_ms": 30000,
+    "queued": 0,
+    "rejected": 223,
+    "running": 0,
+    "workers": 1
+  },
+  "max_blocking_workers": 1,
+  "memory_after": {
+    "high_water_rss_kib": 2792,
+    "rss_kib": 2792,
+    "threads": 4,
+    "virtual_kib": 276004
+  },
+  "memory_before": {
+    "high_water_rss_kib": 2356,
+    "rss_kib": 2356,
+    "threads": 3,
+    "virtual_kib": 253168
+  },
+  "memory_sampled_peak": {
+    "high_water_rss_kib": 2776,
+    "rss_kib": 2776,
+    "threads": 5,
+    "virtual_kib": 276016
+  },
+  "mode": "bounded",
+  "queue": {
+    "max_us": 176295,
+    "p50_us": 136512,
+    "p95_us": 174115
+  },
+  "queue_capacity": 32,
+  "rejected": 223,
+  "rejected_latency": {
+    "max_us": 7,
+    "p50_us": 0,
+    "p95_us": 1
+  },
+  "requests": 256,
+  "workload": {
+    "first_serial_operation_ms": 100,
+    "remaining_operation_ms": 2
+  }
+}
