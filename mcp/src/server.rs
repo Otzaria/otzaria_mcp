@@ -635,7 +635,7 @@ impl OtzariaServer {
         let legacy = p.facet;
         let (snap, resp) = run_blocking(admitted, self.lib.clone(), move |snap, db| {
             let search = Self::search_of(snap)?;
-            req.facets = build_facets(&db, filters, legacy)?;
+            req.facets = build_facets(db, filters, legacy)?;
             let facets = req.facets.clone();
             Ok((search.search(&req)?, facets))
         })
@@ -678,7 +678,7 @@ impl OtzariaServer {
         let category = p.category;
         let (snap, value) = run_blocking(admitted, self.lib.clone(), move |snap, db| {
             let search = Self::search_of(snap)?;
-            req.facets = build_facets(&db, filters, None)?;
+            req.facets = build_facets(db, filters, None)?;
             match by.as_str() {
                 "book" => {
                     let counts = search.count_by_book(&req)?;
@@ -785,7 +785,7 @@ impl OtzariaServer {
                 limit,
                 offset,
             )?;
-            link_payload(&db, links)
+            link_payload(db, links)
         })
         .await?;
         Self::respond(&snap, json!({ "count": links.len(), "links": links }))
