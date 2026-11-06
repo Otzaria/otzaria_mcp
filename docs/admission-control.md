@@ -20,14 +20,16 @@ Each `Library` owns two admission lanes:
 | Lane | Users | Running/admitted worker limit | Additional accepted requests |
 | --- | --- | ---: | ---: |
 | `read` | The 12 DB/navigation/metadata tools | 1 | 32 |
-| `search` | `full_text_search`, `search_facet_counts`, background index refresh | 1 | 32 |
+| `search` | `full_text_search`, `search_facet_counts`, background index refresh | 1 | 32 requests + 1 reserved refresh |
 
 The separate read lane allows short navigation reads while a long search is
 running. Search may still briefly contend with reads while resolving DB metadata;
 that contention is bounded by the two worker lanes. Index refresh takes the same
 search lane, including publication, so it cannot open another large engine while
 a search is using the current one. The watcher awaits each refresh and cannot
-build a backlog of refresh workers.
+build a backlog of refresh workers. A single reserved maintenance slot joins
+the same FIFO worker queue without a start deadline, preventing a full request
+queue from starving refresh. A running operation must still finish first.
 
 ## Admission and cancellation
 
@@ -63,9 +65,10 @@ thread limit. Semaphore fairness is documented in
 
 ## Runtime safety and errors
 
-Response metadata (`schema_version` and `db_schema_version`) is captured while
-building the snapshot. Response formatting therefore does not reacquire SQLite's
-mutex on a Tokio runtime thread. Large refresh builds run on the admitted blocking
+Response metadata is read from SQLite inside the admitted blocking worker, so
+WAL updates are visible without taking the SQLite mutex on a Tokio runtime
+thread. `db_schema_version` is read for `library_info`; each successful tool
+reads `db_version` for its response. Large refresh builds run on the admitted blocking
 worker. Releasing the retired snapshot occurs outside the short publication
 `RwLock`, because closing DB/index handles can take time.
 
@@ -89,7 +92,8 @@ validation, and result payload errors remain intact.
 observations. They include accepted/rejected counts; cancellation and expiry
 before start; normally returned and panicked closures; completions after
 cancellation; current and peak queue/in-flight/running counts; and completed work
-per second since lane creation. `blocking_tasks` counts worker leases, including
+per second since lane creation. The search lane observations include the reserved refresh slot, so its in-flight
+count can briefly exceed the client capacity by one. `blocking_tasks` counts worker leases, including
 a held lease or a pool-queued closure, not all Tokio process threads.
 
 Queue, execution, and accepted-request latency use constant-space logarithmic
@@ -110,8 +114,11 @@ this preserves the resource bound even when another subsystem saturates the pool
 mutex-waiting worker fan-out, queue expiry, explicit cancellation and dropped
 callers before/after start, expiry and cancellation in Tokio's own pool queue,
 shutdown, panic release, and preservation of a running operation after its start
-deadline. A server unit test holds SQLite's mutex while formatting a response on
-a current-thread runtime and fails if formatting waits for the database.
+deadline. Tests also check the reserved refresh slot and blocking-pool saturation.
+`mcp/tests/mcp_admission_regression.rs` exercises real MCP calls with WAL metadata
+updates, invalid arguments under a full queue, and a watcher refresh under load.
+A server unit test holds SQLite's mutex while formatting a response on a
+current-thread runtime and fails if formatting waits for the database.
 
 Build and run the process-isolated probe:
 
@@ -145,7 +152,8 @@ integration verification.
 
 ### Measured saturation results (2026-11-05)
 
-Each entry is the median of three separate processes. Raw per-run JSON and build
+These are the original pre-review results; they do not measure the later metadata
+refresh change. Each entry is the median of three separate processes. Raw per-run JSON and build
 scope/environment metadata are in
 [`benchmarks/admission-2026-11-05`](benchmarks/admission-2026-11-05/).
 
@@ -209,3 +217,22 @@ book counts, facets, snippets, and highlights. An independently created persiste
 fixture index written by the same old engine produced a byte-identical contract;
 it is available to verify opening an existing index during migration. This
 admission change does not edit the vendored engine.
+
+### Metadata freshness cost (review follow-up)
+
+On 2026-11-06, a local macOS ARM debug-build probe compared PR head
+`37aba102` with the follow-up metadata fix. Three fresh processes per variant
+served 600 sequential `get_text` MCP requests after 50 warmups, using the same
+synthetic 10,000-line SQLite database. The median of process medians was
+0.872 ms before vs 0.857 ms after for one line, and 1.734 ms before vs
+1.740 ms after for 50 lines. The median process p95 was 1.181 vs 0.907 ms and
+1.963 vs 2.022 ms respectively. These small, noisy samples show no clear
+regression in this scenario; they do not measure release builds, concurrent
+loads, compressed production data, or Tantivy searches.
+
+To reproduce with two separately built binaries (build into separate target
+directories):
+
+```sh
+python3 docs/benchmarks/metadata-latency.py /path/to/original-binary /path/to/fixed-binary
+```

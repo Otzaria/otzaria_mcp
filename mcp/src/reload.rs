@@ -18,12 +18,11 @@ use crate::admission::Gate;
 use crate::db::Db;
 use crate::paths::Paths;
 use crate::search::Search;
-use tokio_util::sync::CancellationToken;
 
 /// A consistent DB + index pair, tagged with the fingerprint it was built from.
 pub struct Snapshot {
     pub db: Arc<Db>,
-    /// Cached while opening, so response formatting never locks SQLite.
+    /// Versions observed at open time (for startup logging). Responses read fresh values.
     pub schema_version: Option<i64>,
     pub db_schema_version: Option<i64>,
     pub search: Option<Arc<Search>>,
@@ -107,7 +106,7 @@ impl Library {
             // A large index open must neither block a Tokio runtime thread nor
             // overlap another search/reload. Take the same admission lane used by
             // search handlers, and publish while that worker still owns its permit.
-            let admitted = match self.searches.acquire(CancellationToken::new()).await {
+            let admitted = match self.searches.acquire_maintenance().await {
                 Ok(admitted) => admitted,
                 Err(crate::admission::Error::Closed) => return,
                 Err(e) => {

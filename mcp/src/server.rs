@@ -22,6 +22,11 @@ pub struct OtzariaServer {
     lib: Arc<Library>,
 }
 
+struct ResponseSnapshot {
+    snapshot: Arc<Snapshot>,
+    schema_version: Option<i64>,
+}
+
 // ── tool parameter schemas ───────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -447,21 +452,21 @@ impl OtzariaServer {
             .acquire(context.ct)
             .await
             .map_err(admission_error)?;
-        let (snap, (stats, index)) = run_blocking(admitted, self.lib.clone(), move |snap, db| {
+        let (snap, (stats, index, db_schema_version)) = run_blocking(admitted, self.lib.clone(), move |snap, db| {
             let stats = db.library_stats()?;
             let index = match &snap.search {
                 Some(s) => json!({ "available": true, "info": s.info, "line_source": search::line_source_state() }),
                 None => json!({ "available": false, "reason": snap.search_error }),
             };
-            Ok((stats, index))
+            Ok((stats, index, db.db_schema_version()))
         }).await?;
         Self::respond(
             &snap,
             json!({
                 "db_version": snap.schema_version,
-                "db_schema_version": snap.db_schema_version,
+                "db_schema_version": db_schema_version,
                 "stats": stats,
-                "capabilities": snap.db.caps,
+                "capabilities": snap.snapshot.db.caps,
                 "index": index,
                 "admission": {
                     "read": self.lib.read_admission().metrics(),
@@ -612,16 +617,17 @@ impl OtzariaServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let query = required_text(p.query, "query")?;
+        let mode = Mode::parse(p.mode.as_deref().unwrap_or("advanced")).map_err(invalid)?;
+        let offset = search_offset(p.offset)?;
         let admitted = self
             .lib
             .search_admission()
             .acquire(context.ct)
             .await
             .map_err(admission_error)?;
-        let mode = Mode::parse(p.mode.as_deref().unwrap_or("advanced")).map_err(invalid)?;
         let mut req = SearchRequest::new(query, mode);
         req.limit = p.limit.unwrap_or(20).clamp(1, 100);
-        req.offset = search_offset(p.offset)?;
+        req.offset = offset;
         req.order = p.order.unwrap_or_else(|| "catalogue".to_string());
         req.distance = p.distance;
         req.options = word_options(p.options);
@@ -662,13 +668,13 @@ impl OtzariaServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let query = required_text(p.query, "query")?;
+        let mode = Mode::parse(p.mode.as_deref().unwrap_or("advanced")).map_err(invalid)?;
         let admitted = self
             .lib
             .search_admission()
             .acquire(context.ct)
             .await
             .map_err(admission_error)?;
-        let mode = Mode::parse(p.mode.as_deref().unwrap_or("advanced")).map_err(invalid)?;
         let by = p.by.unwrap_or_else(|| "category".to_string());
         let limit = p.limit.unwrap_or(30).clamp(1, 200) as usize;
         let mut req = SearchRequest::new(query, mode);
@@ -990,12 +996,12 @@ impl OtzariaServer {
     /// Stamp a tool payload with snapshot identity (schema_version, data_version)
     /// and return it as compact JSON text content.
     fn respond(
-        snap: &Snapshot,
+        snap: &ResponseSnapshot,
         mut payload: serde_json::Value,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("schema_version".into(), json!(snap.schema_version));
-            obj.insert("data_version".into(), json!(snap.fingerprint));
+            obj.insert("data_version".into(), json!(snap.snapshot.fingerprint));
         }
         let text = serde_json::to_string(&payload)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -1078,7 +1084,7 @@ async fn run_blocking<T, F>(
     admitted: Admitted,
     library: Arc<Library>,
     f: F,
-) -> Result<(Arc<Snapshot>, T), ErrorData>
+) -> Result<(ResponseSnapshot, T), ErrorData>
 where
     F: FnOnce(&Snapshot, &Db) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
@@ -1087,7 +1093,14 @@ where
         .run(move || {
             let snapshot = library.current();
             let result = f(&snapshot, &snapshot.db)?;
-            Ok((snapshot, result))
+            let schema_version = snapshot.db.schema_version();
+            Ok((
+                ResponseSnapshot {
+                    snapshot,
+                    schema_version,
+                },
+                result,
+            ))
         })
         .await
         .map_err(admission_error)?
@@ -1197,6 +1210,10 @@ mod tests {
             })
         };
         locked_rx.await.unwrap();
+        let snapshot = super::ResponseSnapshot {
+            snapshot: Arc::new(snapshot),
+            schema_version: Some(42),
+        };
         let response = super::OtzariaServer::respond(&snapshot, serde_json::json!({"ok": true}));
         let _ = release_tx.send(());
         holder.join().unwrap();

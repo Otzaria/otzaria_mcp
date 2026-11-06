@@ -358,3 +358,77 @@ async fn shutdown_cancels_waiters_and_prevents_new_admission() {
     assert!(matches!(result, Err(Error::Closed | Error::Cancelled)));
     eventually(|| gate.metrics().in_flight == 0).await;
 }
+
+#[tokio::test]
+async fn maintenance_has_reserved_fifo_slot_and_no_start_deadline() {
+    let gate = gate(1, Duration::from_millis(40));
+    let held = gate.acquire(CancellationToken::new()).await.unwrap();
+    let waiter = {
+        let gate = gate.clone();
+        tokio::spawn(async move {
+            match gate.acquire(CancellationToken::new()).await {
+                Ok(admitted) => admitted.run(|| 1).await,
+                Err(error) => Err(error),
+            }
+        })
+    };
+    eventually(|| gate.metrics().in_flight == 2).await;
+    let maintenance = {
+        let gate = gate.clone();
+        tokio::spawn(async move { gate.acquire_maintenance().await.unwrap().run(|| 2).await })
+    };
+    eventually(|| gate.metrics().in_flight == 3).await;
+    assert!(matches!(
+        gate.acquire(CancellationToken::new()).await,
+        Err(Error::Full)
+    ));
+    // The request expires; the reserved maintenance request must remain queued.
+    assert!(matches!(waiter.await.unwrap(), Err(Error::Expired)));
+    assert!(!maintenance.is_finished());
+    drop(held);
+    assert_eq!(maintenance.await.unwrap().unwrap(), 2);
+    assert_eq!(gate.metrics().peak_running, 1);
+}
+
+#[tokio::test]
+async fn maintenance_waiter_is_woken_by_shutdown() {
+    let gate = gate(0, Duration::from_secs(1));
+    let held = gate.acquire(CancellationToken::new()).await.unwrap();
+    let maintenance = {
+        let gate = gate.clone();
+        tokio::spawn(async move { gate.acquire_maintenance().await })
+    };
+    eventually(|| gate.metrics().in_flight == 2).await;
+    gate.close();
+    assert!(matches!(maintenance.await.unwrap(), Err(Error::Closed)));
+    drop(held);
+}
+
+#[test]
+fn maintenance_waits_for_saturated_blocking_pool_without_expiring() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let gate = gate(0, Duration::from_millis(30));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let hog = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        started_rx.await.unwrap();
+        let task = {
+            let gate = gate.clone();
+            tokio::spawn(async move { gate.acquire_maintenance().await.unwrap().run(|| 42).await })
+        };
+        eventually(|| gate.metrics().blocking_tasks == 1).await;
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        assert!(!task.is_finished());
+        release_tx.send(()).unwrap();
+        hog.await.unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), 42);
+    });
+}

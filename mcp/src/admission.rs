@@ -71,6 +71,7 @@ struct Shared {
     config: Config,
     capacity: Arc<Semaphore>,
     workers: Arc<Semaphore>,
+    maintenance: Arc<Semaphore>,
     shutdown: CancellationToken,
     since: Instant,
     metrics: Metrics,
@@ -98,6 +99,7 @@ impl Gate {
                 config,
                 capacity: Arc::new(Semaphore::new(total)),
                 workers: Arc::new(Semaphore::new(config.workers)),
+                maintenance: Arc::new(Semaphore::new(1)),
                 shutdown: CancellationToken::new(),
                 since: Instant::now(),
                 metrics: Metrics::default(),
@@ -108,6 +110,20 @@ impl Gate {
     /// Admission happens before callers capture a library snapshot or allocate a
     /// blocking task. Tokio's worker semaphore queues accepted callers FIFO.
     pub async fn acquire(&self, cancellation: CancellationToken) -> Result<Admitted, Error> {
+        self.acquire_inner(cancellation, false).await
+    }
+
+    /// One reserved slot for the library watcher. It joins the same FIFO worker
+    /// queue as requests but cannot be rejected or expire under sustained load.
+    pub async fn acquire_maintenance(&self) -> Result<Admitted, Error> {
+        self.acquire_inner(CancellationToken::new(), true).await
+    }
+
+    async fn acquire_inner(
+        &self,
+        cancellation: CancellationToken,
+        maintenance: bool,
+    ) -> Result<Admitted, Error> {
         let requested = Instant::now();
         let shared = &self.shared;
         if shared.shutdown.is_cancelled() {
@@ -116,10 +132,18 @@ impl Gate {
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let capacity = shared.capacity.clone().try_acquire_owned().map_err(|_| {
-            shared.metrics.rejected.fetch_add(1, Ordering::Relaxed);
-            Error::Full
-        })?;
+        let capacity = if maintenance {
+            tokio::select! {
+                biased;
+                _ = shared.shutdown.cancelled() => return Err(Error::Closed),
+                permit = shared.maintenance.clone().acquire_owned() => permit.map_err(|_| Error::Closed)?,
+            }
+        } else {
+            shared.capacity.clone().try_acquire_owned().map_err(|_| {
+                shared.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                Error::Full
+            })?
+        };
         let metrics = &shared.metrics;
         metrics.accepted.fetch_add(1, Ordering::Relaxed);
         let in_flight = metrics.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
@@ -139,12 +163,13 @@ impl Gate {
             cancellation: cancellation.clone(),
             _capacity: capacity,
         };
-        let deadline = tokio::time::Instant::from_std(requested + shared.config.queue_timeout);
+        let deadline = (!maintenance)
+            .then(|| tokio::time::Instant::from_std(requested + shared.config.queue_timeout));
         let worker = tokio::select! {
             biased;
             _ = shared.shutdown.cancelled() => return Err(Error::Closed),
             _ = cancellation.cancelled() => return Err(Error::Cancelled),
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = wait_for_deadline(deadline) => {
                 state.store(EXPIRED, Ordering::Release);
                 return Err(Error::Expired);
             },
@@ -202,7 +227,7 @@ impl Gate {
 pub struct Admitted {
     record: Record,
     _worker: WorkerPermit,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl Admitted {
@@ -228,7 +253,7 @@ impl Admitted {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 );
-            } else if Instant::now() >= deadline.into_std() {
+            } else if deadline.is_some_and(|deadline| Instant::now() >= deadline.into_std()) {
                 let _ = record.state.compare_exchange(
                     PENDING,
                     EXPIRED,
@@ -274,7 +299,7 @@ impl Admitted {
                     _ = cancellation.cancelled() => return Err(Error::Cancelled),
                 }
             },
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = wait_for_deadline(deadline) => {
                 if state.compare_exchange(PENDING, EXPIRED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                     return Err(Error::Expired);
                 }
@@ -289,6 +314,13 @@ impl Admitted {
         };
         guard.armed = false;
         result
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
