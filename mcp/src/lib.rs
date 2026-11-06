@@ -2,6 +2,7 @@
 //! (SQLite `seforim.db` + Tantivy index) exposed as MCP tools. The `main.rs`
 //! binary is a thin wrapper; these modules are also used by the integration tests.
 
+pub mod admission;
 pub mod db;
 pub mod links;
 pub mod paths;

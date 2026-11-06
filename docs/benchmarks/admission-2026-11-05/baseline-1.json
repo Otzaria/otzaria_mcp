@@ -1,0 +1,45 @@
+{
+  "completed": 256,
+  "completed_latency": {
+    "max_us": 677084,
+    "p50_us": 378223,
+    "p95_us": 646279
+  },
+  "completed_per_second": 358.6727495360645,
+  "elapsed_us": 713742,
+  "errors": [],
+  "gate": null,
+  "max_blocking_workers": 256,
+  "memory_after": {
+    "high_water_rss_kib": 5536,
+    "rss_kib": 5536,
+    "threads": 259,
+    "virtual_kib": 5193236
+  },
+  "memory_before": {
+    "high_water_rss_kib": 2264,
+    "rss_kib": 2264,
+    "threads": 3,
+    "virtual_kib": 9456
+  },
+  "memory_sampled_peak": {
+    "high_water_rss_kib": 5520,
+    "rss_kib": 5520,
+    "threads": 260,
+    "virtual_kib": 5193248
+  },
+  "mode": "baseline",
+  "queue": {
+    "max_us": 674940,
+    "p50_us": 376098,
+    "p95_us": 644080
+  },
+  "queue_capacity": null,
+  "rejected": 0,
+  "rejected_latency": null,
+  "requests": 256,
+  "workload": {
+    "first_serial_operation_ms": 100,
+    "remaining_operation_ms": 2
+  }
+}

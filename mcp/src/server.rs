@@ -1,13 +1,15 @@
 //! MCP server surface (rmcp): read-only tools over the current library snapshot.
-//! Every handler reads `self.lib.current()` (a cheap Arc clone) so a background
-//! hot-reload swap never yields mixed DB/index state, and every response is stamped
+//! Every handler acquires admission before creating a blocking task. The worker
+//! captures the current snapshot only when it starts, and responses are stamped
 //! with `schema_version` + `data_version` (the snapshot fingerprint).
 
 use std::sync::Arc;
 
+use crate::admission::{Admitted, Error as AdmissionError};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -18,6 +20,11 @@ use crate::search::{self, Mode, SearchRequest, WordOptions};
 #[derive(Clone)]
 pub struct OtzariaServer {
     lib: Arc<Library>,
+}
+
+struct ResponseSnapshot {
+    snapshot: Arc<Snapshot>,
+    schema_version: Option<i64>,
 }
 
 // ── tool parameter schemas ───────────────────────────────────────────────────
@@ -437,24 +444,34 @@ impl OtzariaServer {
     pub async fn library_info(
         &self,
         Parameters(_p): Parameters<NoParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let snap = self.lib.current();
-        let db = snap.db.clone();
-        let stats = run_blocking(move || db.library_stats()).await?;
-        let index = match &snap.search {
-            Some(s) => {
-                json!({ "available": true, "info": s.info, "line_source": search::line_source_state() })
-            }
-            None => json!({ "available": false, "reason": snap.search_error }),
-        };
-        self.respond(
+        let admitted = self
+            .lib
+            .read_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
+        let (snap, (stats, index, db_schema_version)) = run_blocking(admitted, self.lib.clone(), move |snap, db| {
+            let stats = db.library_stats()?;
+            let index = match &snap.search {
+                Some(s) => json!({ "available": true, "info": s.info, "line_source": search::line_source_state() }),
+                None => json!({ "available": false, "reason": snap.search_error }),
+            };
+            Ok((stats, index, db.db_schema_version()))
+        }).await?;
+        Self::respond(
             &snap,
             json!({
-                "db_version": snap.db.schema_version(),
-                "db_schema_version": snap.db.db_schema_version(),
+                "db_version": snap.schema_version,
+                "db_schema_version": db_schema_version,
                 "stats": stats,
-                "capabilities": snap.db.caps,
+                "capabilities": snap.snapshot.db.caps,
                 "index": index,
+                "admission": {
+                    "read": self.lib.read_admission().metrics(),
+                    "search": self.lib.search_admission().metrics(),
+                },
             }),
         )
     }
@@ -470,14 +487,22 @@ impl OtzariaServer {
     pub async fn search_books(
         &self,
         Parameters(p): Parameters<SearchBooksParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let query = required_text(p.query, "query")?;
-        let snap = self.lib.current();
+        let admitted = self
+            .lib
+            .read_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
         let limit = p.limit.unwrap_or(20).clamp(1, 100) as i64;
-        let db = snap.db.clone();
         let cat = p.category_id;
-        let books = run_blocking(move || db.search_books(&query, cat, limit)).await?;
-        self.respond(&snap, json!({ "count": books.len(), "books": books }))
+        let (snap, books) = run_blocking(admitted, self.lib.clone(), move |_snap, db| {
+            db.search_books(&query, cat, limit)
+        })
+        .await?;
+        Self::respond(&snap, json!({ "count": books.len(), "books": books }))
     }
 
     #[tool(
@@ -491,13 +516,21 @@ impl OtzariaServer {
     pub async fn lookup_title(
         &self,
         Parameters(p): Parameters<LookupTitleParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let name = required_text(p.name, "name")?;
-        let snap = self.lib.current();
+        let admitted = self
+            .lib
+            .read_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
         let limit = p.limit.unwrap_or(10).clamp(1, 50) as i64;
-        let db = snap.db.clone();
-        let books = run_blocking(move || db.lookup_title(&name, limit)).await?;
-        self.respond(&snap, json!({ "count": books.len(), "books": books }))
+        let (snap, books) = run_blocking(admitted, self.lib.clone(), move |_snap, db| {
+            db.lookup_title(&name, limit)
+        })
+        .await?;
+        Self::respond(&snap, json!({ "count": books.len(), "books": books }))
     }
 
     #[tool(
@@ -512,20 +545,25 @@ impl OtzariaServer {
     pub async fn get_text(
         &self,
         Parameters(p): Parameters<GetTextParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let snap = self.lib.current();
+        let admitted = self
+            .lib
+            .read_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
         let line_index = p.line_index.unwrap_or(0).max(0);
         let limit = p.limit.unwrap_or(50).clamp(1, 200) as i64;
         let strip_html = p.strip_html.unwrap_or(true);
         let book_id = p.book_id;
         let version = p.version.filter(|v| !v.trim().is_empty());
-        let db = snap.db.clone();
-        let result = run_blocking(move || {
+        let (snap, result) = run_blocking(admitted, self.lib.clone(), move |_snap, db| {
             db.get_text(book_id, line_index, limit, strip_html, version.as_deref())
         })
         .await?;
         match result {
-            Some(r) => self.respond(&snap, to_json(r)?),
+            Some(r) => Self::respond(&snap, to_json(r)?),
             None => Err(invalid(format!("no book found with book_id={book_id}"))),
         }
     }
@@ -542,13 +580,21 @@ impl OtzariaServer {
     pub async fn get_book_info(
         &self,
         Parameters(p): Parameters<BookIdParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let snap = self.lib.current();
+        let admitted = self
+            .lib
+            .read_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
         let book_id = p.book_id;
-        let db = snap.db.clone();
-        let info = run_blocking(move || db.get_book_info(book_id)).await?;
+        let (snap, info) = run_blocking(admitted, self.lib.clone(), move |_snap, db| {
+            db.get_book_info(book_id)
+        })
+        .await?;
         match info {
-            Some(i) => self.respond(&snap, book_info_payload(i)?),
+            Some(i) => Self::respond(&snap, book_info_payload(i)?),
             None => Err(invalid(format!("no book found with book_id={book_id}"))),
         }
     }
@@ -568,14 +614,20 @@ impl OtzariaServer {
     pub async fn full_text_search(
         &self,
         Parameters(p): Parameters<FullTextSearchParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let query = required_text(p.query, "query")?;
-        let snap = self.lib.current();
-        let search = self.search_of(&snap)?;
         let mode = Mode::parse(p.mode.as_deref().unwrap_or("advanced")).map_err(invalid)?;
+        let offset = search_offset(p.offset)?;
+        let admitted = self
+            .lib
+            .search_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
         let mut req = SearchRequest::new(query, mode);
         req.limit = p.limit.unwrap_or(20).clamp(1, 100);
-        req.offset = search_offset(p.offset)?;
+        req.offset = offset;
         req.order = p.order.unwrap_or_else(|| "catalogue".to_string());
         req.distance = p.distance;
         req.options = word_options(p.options);
@@ -585,11 +637,11 @@ impl OtzariaServer {
         req.match_nikud = p.match_nikud.unwrap_or(false);
         req.match_taamim = p.match_taamim.unwrap_or(false);
         req.grouping = p.grouping.unwrap_or_else(|| "none".to_string());
-        let db = snap.db.clone();
         let filters = p.filters;
         let legacy = p.facet;
-        let resp = run_blocking(move || {
-            req.facets = build_facets(&db, filters, legacy)?;
+        let (snap, resp) = run_blocking(admitted, self.lib.clone(), move |snap, db| {
+            let search = Self::search_of(snap)?;
+            req.facets = build_facets(db, filters, legacy)?;
             let facets = req.facets.clone();
             Ok((search.search(&req)?, facets))
         })
@@ -599,7 +651,7 @@ impl OtzariaServer {
         if !facets.is_empty() {
             v["facets"] = json!(facets);
         }
-        self.respond(&snap, v)
+        Self::respond(&snap, v)
     }
 
     #[tool(
@@ -613,21 +665,26 @@ impl OtzariaServer {
     pub async fn search_facet_counts(
         &self,
         Parameters(p): Parameters<SearchStatsParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let query = required_text(p.query, "query")?;
-        let snap = self.lib.current();
-        let search = self.search_of(&snap)?;
         let mode = Mode::parse(p.mode.as_deref().unwrap_or("advanced")).map_err(invalid)?;
+        let admitted = self
+            .lib
+            .search_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
         let by = p.by.unwrap_or_else(|| "category".to_string());
         let limit = p.limit.unwrap_or(30).clamp(1, 200) as usize;
         let mut req = SearchRequest::new(query, mode);
         req.distance = p.distance;
         req.options = word_options(p.options);
-        let db = snap.db.clone();
         let filters = p.filters;
         let category = p.category;
-        let value = run_blocking(move || {
-            req.facets = build_facets(&db, filters, None)?;
+        let (snap, value) = run_blocking(admitted, self.lib.clone(), move |snap, db| {
+            let search = Self::search_of(snap)?;
+            req.facets = build_facets(db, filters, None)?;
             match by.as_str() {
                 "book" => {
                     let counts = search.count_by_book(&req)?;
@@ -685,7 +742,7 @@ impl OtzariaServer {
             }
         })
         .await?;
-        self.respond(&snap, value)
+        Self::respond(&snap, value)
     }
 
     #[tool(
@@ -703,8 +760,14 @@ impl OtzariaServer {
     pub async fn get_links(
         &self,
         Parameters(p): Parameters<GetLinksParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let snap = self.lib.current();
+        let admitted = self
+            .lib
+            .read_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
         let book_id = p.book_id;
         let window = p.line_index.map(|s| {
             let s = s.max(0);
@@ -717,8 +780,7 @@ impl OtzariaServer {
         let direction = p.direction.unwrap_or_else(|| "outgoing".to_string());
         let limit = p.limit.unwrap_or(30).clamp(1, 200) as i64;
         let offset = p.offset.unwrap_or(0) as i64;
-        let db = snap.db.clone();
-        let links = run_blocking(move || {
+        let (snap, links) = run_blocking(admitted, self.lib.clone(), move |_snap, db| {
             let types = (!types.is_empty()).then_some(types);
             let links = db.get_links(
                 book_id,
@@ -729,10 +791,10 @@ impl OtzariaServer {
                 limit,
                 offset,
             )?;
-            link_payload(&db, links)
+            link_payload(db, links)
         })
         .await?;
-        self.respond(&snap, json!({ "count": links.len(), "links": links }))
+        Self::respond(&snap, json!({ "count": links.len(), "links": links }))
     }
 
     #[tool(
@@ -747,13 +809,21 @@ impl OtzariaServer {
     pub async fn resolve_ref(
         &self,
         Parameters(p): Parameters<ResolveRefParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let reference = required_text(p.reference, "reference")?;
-        let snap = self.lib.current();
+        let admitted = self
+            .lib
+            .read_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
         let limit = p.limit.unwrap_or(10).clamp(1, 50) as i64;
-        let db = snap.db.clone();
-        let candidates = run_blocking(move || db.resolve_ref(&reference, limit)).await?;
-        self.respond(
+        let (snap, candidates) = run_blocking(admitted, self.lib.clone(), move |_snap, db| {
+            db.resolve_ref(&reference, limit)
+        })
+        .await?;
+        Self::respond(
             &snap,
             json!({ "count": candidates.len(), "candidates": candidates }),
         )
@@ -771,20 +841,25 @@ impl OtzariaServer {
     pub async fn get_commentaries(
         &self,
         Parameters(p): Parameters<GetCommentariesParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let snap = self.lib.current();
+        let admitted = self
+            .lib
+            .read_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
         let start = p.line_index.unwrap_or(0).max(0);
         let end = p.end_line_index.unwrap_or(start).max(start);
         let limit = p.limit.unwrap_or(40).clamp(1, 200) as i64;
         let max_lines = p.max_lines_per_item.unwrap_or(3).clamp(1, 20) as i64;
         let ids = p.commentator_book_ids;
         let book_id = p.book_id;
-        let db = snap.db.clone();
-        let res = run_blocking(move || {
+        let (snap, res) = run_blocking(admitted, self.lib.clone(), move |_snap, db| {
             db.get_commentaries(book_id, start, end, ids.as_deref(), limit, max_lines)
         })
         .await?;
-        self.respond(&snap, to_json(res)?)
+        Self::respond(&snap, to_json(res)?)
     }
 
     #[tool(
@@ -798,16 +873,24 @@ impl OtzariaServer {
     pub async fn list_commentators(
         &self,
         Parameters(p): Parameters<ListCommentatorsParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let snap = self.lib.current();
+        let admitted = self
+            .lib
+            .read_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
         let window = p.line_index.map(|s| {
             let s = s.max(0);
             (s, p.end_line_index.unwrap_or(s).max(s))
         });
         let book_id = p.book_id;
-        let db = snap.db.clone();
-        let res = run_blocking(move || db.list_commentators(book_id, window)).await?;
-        self.respond(&snap, to_json(res)?)
+        let (snap, res) = run_blocking(admitted, self.lib.clone(), move |_snap, db| {
+            db.list_commentators(book_id, window)
+        })
+        .await?;
+        Self::respond(&snap, to_json(res)?)
     }
 
     #[tool(
@@ -821,13 +904,21 @@ impl OtzariaServer {
     pub async fn get_line_anchors(
         &self,
         Parameters(p): Parameters<LineParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let snap = self.lib.current();
+        let admitted = self
+            .lib
+            .read_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
         let (book_id, line_index) = (p.book_id, p.line_index);
-        let db = snap.db.clone();
-        let res = run_blocking(move || db.get_line_anchors(book_id, line_index)).await?;
+        let (snap, res) = run_blocking(admitted, self.lib.clone(), move |_snap, db| {
+            db.get_line_anchors(book_id, line_index)
+        })
+        .await?;
         match res {
-            Some(r) => self.respond(&snap, to_json(r)?),
+            Some(r) => Self::respond(&snap, to_json(r)?),
             None => Err(invalid(format!(
                 "no line {line_index} in book_id={book_id}"
             ))),
@@ -845,18 +936,23 @@ impl OtzariaServer {
     pub async fn get_book_toc(
         &self,
         Parameters(p): Parameters<GetBookTocParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let snap = self.lib.current();
+        let admitted = self
+            .lib
+            .read_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
         let limit = p.limit.unwrap_or(200).clamp(1, 1000) as i64;
         let book_id = p.book_id;
         let alt_structure_key = p.alt_structure_key;
         let parent_id = p.parent_id;
-        let db = snap.db.clone();
-        let toc = run_blocking(move || {
+        let (snap, toc) = run_blocking(admitted, self.lib.clone(), move |_snap, db| {
             db.get_book_toc(book_id, limit, alt_structure_key.as_deref(), parent_id)
         })
         .await?;
-        self.respond(&snap, to_json(toc)?)
+        Self::respond(&snap, to_json(toc)?)
     }
 
     #[tool(
@@ -870,25 +966,29 @@ impl OtzariaServer {
     pub async fn browse_categories(
         &self,
         Parameters(p): Parameters<BrowseCategoriesParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let snap = self.lib.current();
+        let admitted = self
+            .lib
+            .read_admission()
+            .acquire(context.ct)
+            .await
+            .map_err(admission_error)?;
         let limit = p.limit.unwrap_or(50).clamp(1, 200) as i64;
         let category_id = p.category_id;
         let path = p.path;
-        let db = snap.db.clone();
-        let view =
-            run_blocking(move || db.browse_categories(category_id, path.as_deref(), limit)).await?;
-        self.respond(&snap, to_json(view)?)
+        let (snap, view) = run_blocking(admitted, self.lib.clone(), move |_snap, db| {
+            db.browse_categories(category_id, path.as_deref(), limit)
+        })
+        .await?;
+        Self::respond(&snap, to_json(view)?)
     }
 
-    fn search_of(&self, snap: &Snapshot) -> Result<Arc<search::Search>, ErrorData> {
+    fn search_of(snap: &Snapshot) -> anyhow::Result<Arc<search::Search>> {
         snap.search.clone().ok_or_else(|| {
-            ErrorData::internal_error(
-                format!(
-                    "full-text search is unavailable: {}",
-                    snap.search_error.as_deref().unwrap_or("no Tantivy index")
-                ),
-                None,
+            anyhow::anyhow!(
+                "full-text search is unavailable: {}",
+                snap.search_error.as_deref().unwrap_or("no Tantivy index")
             )
         })
     }
@@ -896,13 +996,12 @@ impl OtzariaServer {
     /// Stamp a tool payload with snapshot identity (schema_version, data_version)
     /// and return it as compact JSON text content.
     fn respond(
-        &self,
-        snap: &Snapshot,
+        snap: &ResponseSnapshot,
         mut payload: serde_json::Value,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert("schema_version".into(), json!(snap.db.schema_version()));
-            obj.insert("data_version".into(), json!(snap.fingerprint));
+            obj.insert("schema_version".into(), json!(snap.schema_version));
+            obj.insert("data_version".into(), json!(snap.snapshot.fingerprint));
         }
         let text = serde_json::to_string(&payload)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -978,16 +1077,46 @@ fn link_payload(
         .collect()
 }
 
-/// Run a blocking DB/index call off the async runtime, mapping errors to MCP errors.
-async fn run_blocking<T, F>(f: F) -> Result<T, ErrorData>
+/// Capture a fresh snapshot inside the admitted worker, then map errors to MCP.
+/// Neither the async admission queue nor Tokio's blocking-pool queue retains a
+/// retired DB/index snapshot. The response uses the same snapshot as the work.
+async fn run_blocking<T, F>(
+    admitted: Admitted,
+    library: Arc<Library>,
+    f: F,
+) -> Result<(ResponseSnapshot, T), ErrorData>
 where
-    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    F: FnOnce(&Snapshot, &Db) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
+    admitted
+        .run(move || {
+            let snapshot = library.current();
+            let result = f(&snapshot, &snapshot.db)?;
+            let schema_version = snapshot.db.schema_version();
+            Ok((
+                ResponseSnapshot {
+                    snapshot,
+                    schema_version,
+                },
+                result,
+            ))
+        })
         .await
-        .map_err(|e| ErrorData::internal_error(format!("task join error: {e}"), None))?
-        .map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))
+        .map_err(admission_error)?
+        .map_err(|e: anyhow::Error| ErrorData::internal_error(format!("{e:#}"), None))
+}
+
+fn admission_error(e: AdmissionError) -> ErrorData {
+    // Stable machine-readable reasons let clients back off without parsing prose.
+    let reason = match &e {
+        AdmissionError::Full => "queue_full",
+        AdmissionError::Expired => "queue_expired",
+        AdmissionError::Cancelled => "cancelled",
+        AdmissionError::Closed => "shutting_down",
+        AdmissionError::Join(_) => "worker_failed",
+    };
+    ErrorData::internal_error(e.to_string(), Some(json!({ "reason": reason })))
 }
 
 fn required_text(value: String, field: &str) -> Result<String, ErrorData> {
@@ -1045,6 +1174,58 @@ mod tests {
             assert_eq!(value[0]["source_snippet"], "בראשית ברא");
             assert_eq!(value[0]["target_snippet"], "פירוש ראשון");
         }
+    }
+
+    #[tokio::test]
+    async fn response_metadata_never_locks_sqlite_on_the_runtime() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc,
+        };
+        use std::time::Duration;
+
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let snapshot = crate::reload::Snapshot {
+            db: Arc::new(crate::db::Db::from_connection(connection).unwrap()),
+            schema_version: Some(42),
+            db_schema_version: Some(6),
+            search: None,
+            fingerprint: "test-generation".into(),
+            search_error: None,
+        };
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let holder = {
+            let db = snapshot.db.clone();
+            let timed_out = timed_out.clone();
+            std::thread::spawn(move || {
+                let _held = db.lock();
+                locked_tx.send(()).unwrap();
+                // A regression that reads metadata through Db::meta_int blocks
+                // this current-thread Tokio runtime until the failsafe releases.
+                if release_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                    timed_out.store(true, Ordering::SeqCst);
+                }
+            })
+        };
+        locked_rx.await.unwrap();
+        let snapshot = super::ResponseSnapshot {
+            snapshot: Arc::new(snapshot),
+            schema_version: Some(42),
+        };
+        let response = super::OtzariaServer::respond(&snapshot, serde_json::json!({"ok": true}));
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        assert!(
+            !timed_out.load(Ordering::SeqCst),
+            "response formatting waited on SQLite"
+        );
+        let value = serde_json::to_value(response.unwrap()).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["schema_version"], 42);
+        assert_eq!(payload["data_version"], "test-generation");
     }
 
     #[test]

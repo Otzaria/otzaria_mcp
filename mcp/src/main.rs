@@ -76,17 +76,23 @@ async fn main() -> Result<()> {
         let snap = lib.current();
         eprintln!(
             "otzaria-mcp: db_version={:?} db_schema_version={:?} data_version={}",
-            snap.db.schema_version(),
-            snap.db.db_schema_version(),
-            snap.fingerprint
+            snap.schema_version, snap.db_schema_version, snap.fingerprint
         );
     }
-    tokio::spawn(Arc::clone(&lib).watch());
+    let watcher = tokio::spawn(Arc::clone(&lib).watch());
 
-    let server = OtzariaServer::new(lib);
-    let service = server.serve(stdio()).await?;
-    service.waiting().await?;
-    Ok(())
+    let server = OtzariaServer::new(lib.clone());
+    let result = async {
+        let service = server.serve(stdio()).await?;
+        service.waiting().await?;
+        Ok(())
+    }
+    .await;
+    // rmcp drains responses at EOF; once the transport is closed, no queued
+    // request or reload should start. Running synchronous operations finish.
+    lib.shutdown();
+    watcher.abort();
+    result
 }
 
 /// Parse CLI args into `PathArgs`. Returns `Ok(None)` when help/version was printed.

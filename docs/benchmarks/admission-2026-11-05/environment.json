@@ -1,0 +1,17 @@
+{
+  "date": "2026-11-05",
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+  "architecture": "x86_64",
+  "rust_profile": "unoptimized; debug=0; incremental=false; build_jobs=1",
+  "build_scope": "temporary standalone harness references committed admission.rs, admission_control.rs and admission_bench.rs by path; full MCP integration builds reported separately",
+  "tokio": "1.53.1",
+  "tokio-util": "0.7.20",
+  "serde": "1.0.229",
+  "serde_json": "1.0.154",
+  "runs_per_mode": 3,
+  "runtime_async_workers": 2,
+  "runtime_max_blocking_threads": 512,
+  "measurement": "fresh process per run; 1ms /proc/self/status sampling plus VmHWM; no per-worker synthetic memory allocation",
+  "container_cpu_max": "800000 100000",
+  "container_memory_max_bytes": "8589934592"
+}
