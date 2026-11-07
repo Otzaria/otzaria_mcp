@@ -23,11 +23,9 @@ serde_json = "1"
 anyhow = "1"
 schemars = "1.0"
 rmcp = { version = "2.2.0", features = ["transport-io", "schemars"] }
-# Otzaria's actual Tantivy search engine (vendored, see VENDORED.md). Reused so the MCP
-# reproduces the app's exact search semantics (Hebrew morphology, regex-phrase,
-# facets, cross-line phrases, library line source) rather than reimplementing them.
-# Default features = bundled SQLite, no semantic backend.
-search_engine = { path = "../vendor/otzaria_search_engine/rust" }
+# Rust-only adapter to the canonical app engine: no Flutter/ONNX runtime and no
+# copied search source. The reviewed Git revision and Cargo.lock pin updates.
+search_engine = { package = "otzaria-search-core", git = "https://github.com/Otzaria/otzaria_search_engine", rev = "b22aab7c7addd845d69919272074d437408e5cbe" }
 
 [dev-dependencies]
 tempfile = "3"

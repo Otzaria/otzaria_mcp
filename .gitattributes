@@ -1,0 +1,7 @@
+# Tantivy footers include checksums: preserve existing-index fixture bytes on
+# Windows as well as Unix, including JSON metadata and coordination files.
+mcp/tests/fixtures/canonical-7.0.1/index/* -text
+
+# Preserve audited raw command output, including terminal blank lines. The
+# transcript hashes in the provenance records refer to these exact bytes.
+docs/validation/**/*.log whitespace=-blank-at-eof

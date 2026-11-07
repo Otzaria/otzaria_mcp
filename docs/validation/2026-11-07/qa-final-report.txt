@@ -1,0 +1,151 @@
+INDEPENDENT QA REPORT — 2026-11-07
+
+Status: no remaining production-source correctness/concurrency blocker identified.
+This is an independent source review plus targeted execution report, not a claim
+that every supported platform or final PR CI has already passed. No production
+code was edited by QA; fixes were implemented by the assigned owners. No merges,
+remote comments, or local Flutter execution were performed by QA.
+
+Reviewed scope
+- Canonical production implementation: 3173eeededad79aeced96453aee9cae71cec2741.
+- Separate PR82 WorkGate/Rayon fix is included; writer lifecycle PR77 is already
+  upstream, and read_only remains independent of writer_closed.
+- MCP migration of main 249ae4e2aa80734a7e0b1ed08dbf7a98dd3e608b, initially tested
+  against the local identical core and subsequently benchmarked at published core
+  revision 72a64d0289833e512edd89811fc4a1d634d79381.
+- Reviewed later test-only Windows changes cedb3dc and 4b6bd560b77d1d2a77a15147f8570203aded65a7,
+  plus scoped Dart analyzer compatibility change c9aca3d. These do not change
+  production Rust search behavior. Final exact-head CI remains the merge gate.
+
+Independent executed checks (no broad rerun after documentation changes)
+Core: 20 passing, zero failed:
+  7 read_only contracts; 2 existing_index contracts; 1 writer_lifecycle;
+  1 semantic-integration read-only mutation guard; 1 actual PR82 cold-primer/
+  Rayon regression; 2 explicit line-source refresh contracts; 6 existing tests
+  additionally selected by the explicit_ filter. Fourteen directly target this
+  change. Per-binary SHA256, names and raw output: qa-core-independent.log.
+MCP: 37 passing, zero failed:
+  14 admission_control; 6 current_notes_tests; 1 current_notes_search;
+  1 existing schema10; 8 library_reload; 3 real MCP protocol regressions;
+  3 existing reload_regression; 1 exact 17-scenario contract with additional
+  relevance pagination assertion. Raw output: qa-mcp-independent.log.
+Nine no-data early returns in the implementer's real_data harness are NOT counted
+as independent data-backed passes here.
+
+Golden/provenance verification
+QA independently executed search_contract_baseline (SHA256 below) and compared
+its complete JSON to the migration golden: all 17 scenarios identical. Confirmed
+baseline HEAD 249ae4e2aa80734a7e0b1ed08dbf7a98dd3e608b, tree
+3bdb6192793bd254e1f66d9ee66c1c4697afa1df, unchanged tracked source/manifests/lock,
+and identical fixture source in baseline/migration. Three earlier baseline
+processes also produced byte-identical JSON. Contract example differences are
+rustfmt line wrapping only. No result ordering or output fields are normalized.
+All 26 frozen schema10 index files match the independently built canonical
+fixture byte-for-byte. Current schema11 note markup/highlight contract passes.
+
+Findings fixed and verified
+1. Concurrent refresh calls could queue the same observed generation, then both
+   rebuild it. Recheck of the published fingerprint now occurs inside the
+   admitted maintenance worker. QA independently reran the deterministic
+   concurrent_refreshes_of_one_generation_open_it_once regression successfully.
+2. Relevance fixture ties: Basic postings ignore repeated-term frequency. Distinct
+   token lengths 2/3/4/5/6 now give separate ranks. A pristine-baseline golden and
+   exact relevance page-versus-full-slice assertion passed independently.
+3. Windows all-file snapshot helper initially read a byte-range-locked writer
+   lock. Snapshot-before/drop-after arrangement retains EVERY file in the byte
+   comparison. QA caught a follow-up coverage gap: SearchEngine::new is lazy and
+   alone does not reacquire the writer. Final 4b6bd56 explicitly calls
+   set_economy_indexing(true) and open_index_writer() before opening the reader.
+   QA source-verified the final fix and inspected the implementer's focused
+   7/7 Linux rerun (core-windows-snapshot-fix.log); no independent rerun or Windows
+   success is implied by that inspection. Await exact-head Windows CI.
+4. Benchmark RSS label now explicitly states whole-process high-water memory,
+   including fixture indexing and warmup; it is not search-only memory.
+
+Source review conclusions
+- No persistent mutation bypass found for read_only lexical or semantic paths.
+  Recovery, installation, mutation and corruption-marker verification are
+  guarded before work. Sidecar info/coverage use read operations only.
+- Read-only handle retains documented Tantivy metadata coordination bookkeeping;
+  it is not a promise of a filesystem with all writes forbidden.
+- Both MCP mutexes remain. Admission precedes spawn_blocking, and running closures
+  retain permits despite cancelled/dropped callers. Started synchronous work is
+  not forcibly interrupted. Reserved FIFO maintenance, live metadata reads inside
+  workers, and validation before admission from merged PR4 remain intact.
+- Same-path source refresh invalidates scans before waiting, including scan-only
+  connections. Directory replacement requires close/reopen, not reader.reload.
+- Notes and base text use one SQLite read transaction. Current numeric hasMarker
+  takes precedence; corrupt compressed/UTF8 bodies error without leaking a
+  transaction. Legacy note rendering remains covered.
+- Process-global line source remains an ownership constraint; DB/index publication
+  is not a cross-file transaction. Stale text is marked and not highlighted.
+
+Dependency and adapter checks
+Independent offline normal-dependency graph comparison against exact upstream
+6fa52571: upstream default 167 unique packages; shared default 167, zero added or
+removed. Standalone headless facade 146 packages, no Flutter bridge runtime,
+Dart runtime, Tokio/rmcp or ONNX runtime. Generated FRB/Dart files unchanged.
+Reviewed the two line-scoped deprecated_member_use ignores against the saved
+code_assets 1.2.1/2.2.0 source: the compatible targetVersion getter exists in both;
+2.2.0 delegates to deploymentVersion.major. Runtime behavior and supported older
+API remain unchanged; no file-wide analyzer suppression was added. Flutter
+verification belongs to GitHub-hosted CI, not a local run by QA.
+
+Independent performance artifact review (no benchmark rerun by QA)
+Raw artifacts: docs/benchmarks/shared-core-2026-11-07.
+Verified all 12 raw JSON/log SHA256 values against final provenance.json, both
+isolated binary hashes, identical fixture/benchmark source, pristine baseline,
+and all 36 summary median/min/max entries. Each of six processes has 1,700
+measured requests, 85 warmups, and total-hit checksum 5,700. Throughput equals
+1,700/elapsed in each JSON. Same dev profile, debug=0, incremental=false, jobs=3;
+process order is B1,M1,M2,B2,B3,M3. Both fixture/source hashes match below.
+
+Median of three fresh processes, baseline -> migrated:
+  Throughput requests/s: 1024.010271 -> 1303.554286
+  Latency p50 ms:        0.851685 -> 0.697598
+  Latency p95 ms:        2.060907 -> 1.396368
+  Latency p99 ms:        3.844154 -> 2.399987
+  Whole-process VmHWM:   57740 -> 33124 KiB
+
+These are warm, serialized/uncontended observations on 17 scenarios and 15 lines,
+not production performance or an isolated effect of facade extraction. The
+canonical revision also includes upstream changes. VmHWM includes indexing and
+warmup; three pairs on a shared host are a small sample. Queue/resource behavior
+is measured separately by admission_bench, with rejected work reported rather
+than omitted. No synthetic speedup or full-library-memory claim is justified.
+The old .validation/baseline-provenance.json is an interim pre-RSS-label record;
+use the FINAL published benchmark provenance.json for benchmark hashes.
+
+Remaining validation limits
+- Exact-head Windows and Flutter/FRB CI must establish final platform success.
+- MCP atomic live DB/index replacement was executed on Linux and is cfg(unix).
+  Cross-platform release compilation does not prove Windows live replacement.
+  Core closed-reader directory replacement is separately covered.
+- No external real library dataset or production-scale load was available to QA.
+
+Key SHA256 identifiers
+  baseline Cargo.lock:
+    4d0fc774183d7e6c97ad66ef9d346e7777c52004724df8761f11ff7707635b6f
+  shared fixture source:
+    8152807d5d49fcf0350ec9eee97fc1d357fb6b1bd1b79d36a462e2be8ce1a6b2
+  shared benchmark source:
+    f93bb0c8be43458500c3c496761d4cebeaf951bc3d38f7118de5ca39cdf6a9e7
+  independently executed baseline contract binary:
+    b1b5d0bee77b411dd67872ed2f94fdfe72351ff4537bcacbd27d92cc5c1c2916
+  strict 17-scenario golden:
+    8281246968cb24d8abf3721142ba9fd8653518ea5e7e2ef5b9916a15970a4ea4
+  measured baseline benchmark binary:
+    1a0b638738f0cfa1b34fa8f65b23625a3b317c1df406af571b69c013e8108bc1
+  measured migrated benchmark binary:
+    2e7723b38b4c2bf20202fb1a2fd629c9aa1cc40f3948041e2b3c59c3222226a8
+
+Preserved QA evidence SHA256 (below; binary hashes are also in the raw test logs)
+f68b48975aab752ed1fc8699ba8a0b6e2798b72c397fdb03cde36752006e1143  qa-core-independent.log
+0f530935cf7f3a0c0a73dbceee1a0dbc8a5b2a6d01d5fd2cd02373b9a23a4195  qa-mcp-independent.log
+8281246968cb24d8abf3721142ba9fd8653518ea5e7e2ef5b9916a15970a4ea4  qa-baseline-contract.json
+e1bf7190a5ee58f74eb2400655f368fe4be6584a3474794e4054b3a16f5d76f4  qa-upstream_default-tree.txt
+28ad28240711057e51779a4a4f06b6469bba2c85f0255b6684c7de79397ae131  qa-shared_default-tree.txt
+3c9e2a3d7c0add6fd328ad9c30ee7a4f927f66de44ca1302a431dd53071a3ad2  qa-headless_default-tree.txt
+349e4716a532370ce4968f771220170c407ab8f006b1a965dbce51ab87e79e7f  core-windows-snapshot-fix.log
+5a207573a7a701d0725f709016b21277a89fbc71bf3891f17c25852f04cf8538  mcp-migration/docs/benchmarks/shared-core-2026-11-07/provenance.json
+7abc24ef5fe9306c6d3684db83d40932ea488d88e7f9ca1884119affb64f2315  mcp-migration/docs/benchmarks/shared-core-2026-11-07/summary.json

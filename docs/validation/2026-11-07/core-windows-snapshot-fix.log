@@ -1,0 +1,49 @@
+warning: unused import: `LexicalRequest`
+  --> src/api/search_engine.rs:61:57
+   |
+61 | use crate::lexical_cancellation::{LexicalCancellations, LexicalRequest};
+   |                                                         ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `search_engine` (lib) generated 1 warning (run `cargo fix --lib -p search_engine` to apply 1 suggestion)
+   Compiling otzaria-search-core v7.0.1 (/workspace/scratch/823dd8bcb941/engine/rust/core)
+    Finished `test` profile [unoptimized] target(s) in 0.61s
+     Running tests/read_only.rs (/workspace/scratch/823dd8bcb941/target/debug/deps/read_only-eb90706eb818600e)
+
+running 7 tests
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-a': 2 docs, 33 bytes in 3.687615ms (prepare 3.617982ms, keys 186.384µs, enqueue 30.215µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-a': 2 docs, 33 bytes in 2.386377ms (prepare 2.323134ms, keys 145.134µs, enqueue 28.192µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-a': 2 docs, 33 bytes in 5.020359ms (prepare 4.949544ms, keys 229.287µs, enqueue 25.838µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-b': 1 docs, 15 bytes in 394.301µs (prepare 358.348µs, keys 68.641µs, enqueue 4.407µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-b': 1 docs, 15 bytes in 353.591µs (prepare 290.288µs, keys 57.695µs, enqueue 5.248µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-b': 1 docs, 15 bytes in 445.307µs (prepare 407.851µs, keys 126.055µs, enqueue 5.298µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-a': 2 docs, 33 bytes in 4.044732ms (prepare 3.986856ms, keys 127.157µs, enqueue 20.841µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-b': 1 docs, 15 bytes in 632.382µs (prepare 591.422µs, keys 339.43µs, enqueue 4.938µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-a': 2 docs, 33 bytes in 3.495782ms (prepare 3.314305ms, keys 72.597µs, enqueue 152.104µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-a': 2 docs, 33 bytes in 4.272126ms (prepare 4.222413ms, keys 182.71µs, enqueue 15.533µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-b': 1 docs, 15 bytes in 900.062µs (prepare 865.681µs, keys 408.027µs, enqueue 4.787µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-b': 1 docs, 15 bytes in 2.924465ms (prepare 2.899178ms, keys 2.481006ms, enqueue 5.017µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-a': 2 docs, 33 bytes in 7.290775ms (prepare 7.231267ms, keys 140.557µs, enqueue 23.525µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-b': 1 docs, 15 bytes in 248.316µs (prepare 209.94µs, keys 53.98µs, enqueue 4.967µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] commit: 55.470622ms (reader reload 717.528µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] commit: 54.713832ms (reader reload 5.432045ms)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] commit: 65.751948ms (reader reload 2.493244ms)
+test read_only_handles_refuse_sidecar_mutation_even_without_an_enabled_backend ... ok
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] commit: 76.120738ms (reader reload 5.976608ms)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'book-c': 1 docs, 17 bytes in 4.261669ms (prepare 4.186899ms, keys 215.217µs, enqueue 29.703µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] commit: 70.625219ms (reader reload 5.821799ms)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] commit: 73.412487ms (reader reload 6.182821ms)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] add_text_book 'Device with note': 1 docs, 93 bytes in 1.601309ms (prepare 1.33645ms, keys 451.535µs, enqueue 34.49µs)
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] commit: 79.762615ms (reader reload 1.826572ms)
+test opening_preserves_ids_order_snippets_and_every_index_file ... ok
+test missing_or_incompatible_indexes_are_refused_without_creation_or_upgrade ... ok
+test every_lexical_mutation_is_rejected_before_work_or_lock_acquisition ... ok
+test concurrent_searches_and_external_order_changes_preserve_stable_ids ... ok
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] commit: 49.803985ms (reader reload 672.981µs)
+test explicit_reader_refresh_observes_a_commit_and_invalidates_cached_counts ... ok
+[2026-11-07T18:11:53Z INFO  search_engine::api::search_engine] commit: 56.24ms (reader reload 688.104µs)
+test schema_11_read_only_search_retains_note_provenance_and_highlights ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+

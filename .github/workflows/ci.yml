@@ -31,8 +31,16 @@ jobs:
       - name: rustfmt
         run: cargo fmt -p otzaria-mcp --check
       - name: clippy
-        # --no-deps: lint only our crate, not the vendored search_engine copy.
+        # The canonical engine has its own CI; lint the MCP adapter here.
         run: cargo clippy --locked -p otzaria-mcp --all-targets --no-deps -- -D warnings
+      - name: Verify headless dependency graph
+        shell: bash
+        run: |
+          cargo tree --locked -p otzaria-mcp --edges normal --prefix none > runtime-dependencies.txt
+          if grep -E '^(flutter_rust_bridge|allo-isolate|dart-sys|ort|ort-sys) v' runtime-dependencies.txt; then
+            echo 'Unexpected Flutter or ONNX runtime in the MCP dependency graph'
+            exit 1
+          fi
       - name: test
         # The real-data integration tests skip themselves when OTZARIA_TEST_DB is
         # unset (CI has no library), so only the unit/fixture tests run here.

@@ -38,8 +38,10 @@ pub struct Inner {
 pub struct Caps {
     /// `line_content` table (schema 6): text is not in `line.content`.
     pub split_content: bool,
-    /// Complete schema-7 `line_note` layout; its bodies are uncompressed TEXT.
+    /// Complete `line_note` layout, with current `hasMarker` or legacy `marker`.
     pub line_notes: bool,
+    /// Current numeric `hasMarker` layout takes precedence when both exist.
+    pub note_has_marker: bool,
     /// Rows are zstd frames (a `zstd_dict` table exists).
     pub compressed: bool,
     pub line_ref: bool,
@@ -88,9 +90,11 @@ impl Caps {
         let note_cols = columns("line_note")?;
         Ok(Caps {
             split_content: t("line_content"),
-            line_notes: ["lineId", "noteIndex", "charPos", "marker", "body"]
+            line_notes: ["lineId", "noteIndex", "charPos", "body"]
                 .iter()
-                .all(|name| note_cols.contains(*name)),
+                .all(|name| note_cols.contains(*name))
+                && (note_cols.contains("hasMarker") || note_cols.contains("marker")),
+            note_has_marker: note_cols.contains("hasMarker"),
             compressed: t("zstd_dict"),
             line_ref: t("line_ref"),
             line_dh: t("line_dh"),
@@ -256,9 +260,15 @@ impl Db {
     }
 
     /// Load only notes belonging to the requested base rows, in bounded SQL batches.
-    /// As in the engine, malformed noteIndex/body rows are skipped; a missing
-    /// charPos falls back to the associated marker or end of line.
-    fn notes_by_line_id(&self, inner: &Inner, ids: &[i64]) -> Result<HashMap<i64, Vec<BookNote>>> {
+    /// As in the engine, malformed note indices and NULL bodies are skipped.
+    /// Invalid marker flags or compressed bodies are errors, never missing text.
+    /// A missing charPos falls back to the associated marker or end of line.
+    fn notes_by_line_id(
+        &self,
+        conn: &Connection,
+        codec: &mut LineCodec,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<BookNote>>> {
         let mut notes: HashMap<i64, Vec<BookNote>> = HashMap::new();
         if !self.caps.line_notes {
             return Ok(notes);
@@ -268,24 +278,46 @@ impl Db {
         ids.dedup();
         for chunk in ids.chunks(400) {
             let placeholders = vec!["?"; chunk.len()].join(",");
-            let mut stmt = inner.conn.prepare(&format!(
-                "SELECT lineId, noteIndex, charPos, marker, body FROM line_note \
+            let marker_column = if self.caps.note_has_marker {
+                "hasMarker"
+            } else {
+                "marker"
+            };
+            let mut stmt = conn.prepare(&format!(
+                "SELECT lineId, noteIndex, charPos, {marker_column}, body FROM line_note \
                  WHERE lineId IN ({placeholders}) ORDER BY lineId, noteIndex"
             ))?;
             let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter()))?;
             while let Some(row) = rows.next()? {
-                let (ValueRef::Integer(id), ValueRef::Integer(_), ValueRef::Text(body)) =
-                    (row.get_ref(0)?, row.get_ref(1)?, row.get_ref(4)?)
+                let (ValueRef::Integer(id), ValueRef::Integer(note_index)) =
+                    (row.get_ref(0)?, row.get_ref(1)?)
                 else {
                     continue;
+                };
+                let body = row.get_ref(4)?;
+                if matches!(body, ValueRef::Null) {
+                    continue;
+                }
+                let has_marker = if self.caps.note_has_marker {
+                    match row.get_ref(3)? {
+                        ValueRef::Integer(0) => false,
+                        ValueRef::Integer(1) => true,
+                        other => anyhow::bail!(
+                            "line {id} note {note_index} has hasMarker {other:?}, not 0 or 1"
+                        ),
+                    }
+                } else {
+                    matches!(row.get_ref(3)?, ValueRef::Text(_))
                 };
                 notes.entry(id).or_default().push(BookNote {
                     char_pos: match row.get_ref(2)? {
                         ValueRef::Integer(pos) => pos,
                         _ => -1,
                     },
-                    has_marker: matches!(row.get_ref(3)?, ValueRef::Text(_)),
-                    body: String::from_utf8_lossy(body).into_owned(),
+                    has_marker,
+                    body: codec.note_body(body).with_context(|| {
+                        format!("line {id} note {note_index} cannot be decoded")
+                    })?,
                 });
             }
         }
@@ -325,7 +357,7 @@ impl Db {
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 rows
             };
-            let notes = self.notes_by_line_id(inner, chunk)?;
+            let notes = self.notes_by_line_id(&inner.conn, &mut inner.codec, chunk)?;
             snapshot.map(|snapshot| snapshot.commit()).transpose()?;
             for (id, v) in rows {
                 let html = inner.codec.text_lossy(&v);
@@ -431,7 +463,7 @@ impl Db {
             .transpose()?;
         let rows = self.stored_lines_in_range(inner, book_id, start, end)?;
         let ids: Vec<_> = rows.iter().map(|row| row.1).collect();
-        let notes = self.notes_by_line_id(inner, &ids)?;
+        let notes = self.notes_by_line_id(&inner.conn, &mut inner.codec, &ids)?;
         snapshot.map(|snapshot| snapshot.commit()).transpose()?;
         Ok(rows
             .into_iter()
@@ -784,13 +816,14 @@ impl Db {
             }
         };
 
+        let Inner { conn, codec } = &mut *inner;
         let snapshot = self
             .caps
             .line_notes
-            .then(|| inner.conn.unchecked_transaction())
+            .then(|| conn.unchecked_transaction())
             .transpose()?;
         let raw: Vec<(i64, i64, Option<String>, Value, bool)> = {
-            let mut stmt = inner.conn.prepare(&sql)?;
+            let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
                 .query_map(rusqlite::params![book_id, line_index, limit], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
@@ -799,12 +832,12 @@ impl Db {
             rows
         };
         let base_ids: Vec<_> = raw.iter().filter(|row| row.4).map(|row| row.0).collect();
-        let notes = self.notes_by_line_id(&inner, &base_ids)?;
+        let notes = self.notes_by_line_id(conn, codec, &base_ids)?;
         snapshot.map(|snapshot| snapshot.commit()).transpose()?;
         let lines: Vec<TextLine> = raw
             .into_iter()
             .map(|(id, li, he_ref, v, from_base)| {
-                let html = inner.codec.text_lossy(&v);
+                let html = codec.text_lossy(&v);
                 let restored = from_base
                     .then(|| notes.get(&id))
                     .flatten()

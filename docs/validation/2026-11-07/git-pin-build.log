@@ -1,0 +1,24 @@
+    Updating git repository `https://github.com/Otzaria/otzaria_search_engine`
+    Updating crates.io index
+     Locking 3 packages to highest compatible versions
+      Adding otzaria-search-core v7.0.1 (https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c)
+      Adding search_engine v7.0.1 (https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c)
+      Adding tantivy-fst v0.5.0 (https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c)
+   Compiling tantivy-fst v0.5.0 (https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c)
+   Compiling tantivy-sstable v0.7.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+   Compiling tantivy-columnar v0.7.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+   Compiling tantivy v0.26.2 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+   Compiling search_engine v7.0.1 (https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c)
+   Compiling otzaria-search-core v7.0.1 (https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c)
+   Compiling otzaria-mcp v0.2.0 (/workspace/scratch/823dd8bcb941/mcp-migration/mcp)
+    Finished `test` profile [unoptimized] target(s) in 39.12s
+  Executable unittests src/lib.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/otzaria_mcp-9cac148c21144ceb)
+  Executable unittests src/main.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/otzaria_mcp-d4dc28b099f4bc5a)
+  Executable tests/admission_control.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/admission_control-e8f7e26e5c96ad78)
+  Executable tests/current_notes_search.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/current_notes_search-84e42aebcf5a2d1e)
+  Executable tests/existing_index.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/existing_index-22697c6b833effd6)
+  Executable tests/library_reload.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/library_reload-65360ba73b7d50b7)
+  Executable tests/mcp_admission_regression.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/mcp_admission_regression-3f66bcdb47e683df)
+  Executable tests/real_data.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/real_data-7b4026bdb0c14103)
+  Executable tests/reload_regression.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/reload_regression-edb342003c0a6928)
+  Executable tests/shared_core_contract.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/shared_core_contract-95cdf30b51e0cabc)

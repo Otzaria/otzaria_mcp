@@ -1,0 +1,73 @@
+{
+  "date": "2026-11-07",
+  "base": "249ae4e2aa80734a7e0b1ed08dbf7a98dd3e608b",
+  "core_git_revision": "b22aab7c7addd845d69919272074d437408e5cbe",
+  "git_packages": [
+    [
+      "otzaria-search-core",
+      "git+https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c7addd845d69919272074d437408e5cbe"
+    ],
+    [
+      "search_engine",
+      "git+https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c7addd845d69919272074d437408e5cbe"
+    ],
+    [
+      "tantivy-fst",
+      "git+https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c7addd845d69919272074d437408e5cbe"
+    ]
+  ],
+  "target_directory": "target-mcp",
+  "profile": "dev/test, debug=0, incremental=false, jobs=3",
+  "substantive_tests_passed": 84,
+  "external_data_functions_early_returned": 9,
+  "clippy": "passed --all-targets --no-deps -- -D warnings",
+  "source_sha256": {
+    "Cargo.toml": "803ada200c209153b83fe1a697244a024ab6ae4b479d4c2425784e697b867bc2",
+    "Cargo.lock": "fe9b31821ea12cf26477d95f4e46a38c5364aea7cb5b3a3231e9db953173a5b7",
+    "mcp/Cargo.toml": "18d90ce91876348d4db9d9f750dbf3dfd5884093d2fcc36ad2c757b1a49bc4f7",
+    "mcp/src/admission.rs": "58611c6cc4c16acfc5d48bb81bc315391c25cd7226d4b2961d58f593e30cb7ad",
+    "mcp/src/current_notes_tests.rs": "029e1e6236aa7322923c58ae711415bcc5ead40a5881897f74bb7e2091355087",
+    "mcp/src/db.rs": "ea385c0268908ad5bb5a7f8a20fdd8f6cc896be599a89c42f6b0c369c5f4464d",
+    "mcp/src/fixture_tests.rs": "59f4c375e47e29ba390098bfca4e3b5d019cacacc8d304b4917598cf7f58ef23",
+    "mcp/src/lib.rs": "636aec62c2e85bc2ec2cf586a464c0209775062b01fbe4a45cc5459c4463661e",
+    "mcp/src/links.rs": "1899a24c7c59ba447f7eb330c6f8fda30bf2f343cd28cb4ea6c5036c48fe69b8",
+    "mcp/src/main.rs": "2c348974b35f35899e35df1eaece069048544c5559eb3002dbda452d8dd4f137",
+    "mcp/src/paths.rs": "35b4bd7a6e056ddae123f768c76586efc2c643bef395acf737dbbd47d72b0cee",
+    "mcp/src/refkey.rs": "a26efca6a7a77aeec25c316decf83b1fbcebcee06975347c349ccc4d594afe98",
+    "mcp/src/refs.rs": "68bd45baca5ad76edbe022939c1b48e81e710075588c8a4570f014d0e0efc8da",
+    "mcp/src/reload.rs": "3dbe1008c89061a8e1fe678bcce76b1596f29cb6ba292edd9793bc47b0233f91",
+    "mcp/src/schema7_tests.rs": "66f0a8d0cb537e55c558d2ad769122f56a7bebd95bfcf1c6c32f7657910a39f8",
+    "mcp/src/search.rs": "8a629d8d62b7df3c41320ad8eae3ba19ce5211092b3af5d6d8a01b78460829ad",
+    "mcp/src/server.rs": "8a652405e7ad79c882a424eeea46a61dfcf82ecb08552db5dc9a65729b6eae70",
+    "mcp/src/text.rs": "2a7ef19dc04e6face9315da88904bca5ac3d5f9ec3237ec6aaaf274a195a935a",
+    "mcp/tests/admission_control.rs": "2df3db549db228d1cbae16dd62d6b326ab1dcc117311ab247be98cf1517d693c",
+    "mcp/tests/current_notes_search.rs": "e15547b53381a34e1edbeb91f1647dcfac41b74d20ccd7e25cc47a40276558c6",
+    "mcp/tests/existing_index.rs": "1e515b87fe9a994fcd40e1318d65affc4aac4fbef437a6161129d9e47e9a364a",
+    "mcp/tests/library_reload.rs": "928b4d399ef96c6b7de8ca960d2d3f35d0c189cf2a4c23797f8c478379da179f",
+    "mcp/tests/mcp_admission_regression.rs": "85fda4ac37360c434ec8db3c41438fa48c79bf17cb67299a8f11f3995d393aef",
+    "mcp/tests/real_data.rs": "ad6c13c8423a39f7eeb22ca76c3251b9784334c8433ab67ba2a56bbc9b67dfe2",
+    "mcp/tests/reload_regression.rs": "b04fc7e090e09df70b4dd1718632a37ab54d2ebf07b4f0284279c163cde331d0",
+    "mcp/tests/shared_core_contract.rs": "06f29acdb0d506a07a50d9fb756e2cb1f64ad762b8d388b349545a0df2c36cf9",
+    "mcp/tests/support/search_contract.rs": "8152807d5d49fcf0350ec9eee97fc1d357fb6b1bd1b79d36a462e2be8ce1a6b2",
+    "mcp/examples/admission_bench.rs": "88b2b45148688a23e167c363e4cc416a9492d53cc352ed68d0a1f803d6fb9d5e",
+    "mcp/examples/search_benchmark.rs": "f93bb0c8be43458500c3c496761d4cebeaf951bc3d38f7118de5ca39cdf6a9e7",
+    "mcp/examples/search_contract.rs": "dfa03a8a3ee4926e7431f9db366b5f73c4c607f3c604ab26bf94bc38c3dbba83"
+  },
+  "evidence_sha256": {
+    "72a64d0-examples-build.log": "45706889df3eb46e60ca6394ec92a09d362951343d1adedf05ff03d764c908d1",
+    "baseline-contract-provenance.json": "6971e7a26e251650de028b3c36768b7db903d1547eeac0c9072bf3a658577fbe",
+    "core-pin-production-equivalence.txt": "de19a6883d59b3ea98aa824c07f09374678380563d307b6034d9996af942083f",
+    "core-windows-snapshot-fix.log": "349e4716a532370ce4968f771220170c407ab8f006b1a965dbce51ab87e79e7f",
+    "git-pin-build.log": "22034e566454320b5f4e1adeb428e2edfd01499f94cd0d22707641ce8e6145b9",
+    "git-pin-clippy.log": "d4b3ab39e00ec51d5a1e4ceafde2e48c1990b64e67e81f96e4e9046477d1566b",
+    "git-pin-tests.log": "b7f9c1992e680ee799a9ddd1576144d4eddc0d13ca1bc815b0a897791166e91d",
+    "git-runtime-dependencies.txt": "f81858354dcf3197cad37c143ad419ce7609bbf125dec176a0b2a4460b330289",
+    "qa-baseline-contract.json": "8281246968cb24d8abf3721142ba9fd8653518ea5e7e2ef5b9916a15970a4ea4",
+    "qa-core-independent.log": "f68b48975aab752ed1fc8699ba8a0b6e2798b72c397fdb03cde36752006e1143",
+    "qa-final-report.txt": "636da8e3302fbc30c2671b36503bc9d84794eb3aef82ab37583a5e1392316f40",
+    "qa-headless_default-tree.txt": "3c9e2a3d7c0add6fd328ad9c30ee7a4f927f66de44ca1302a431dd53071a3ad2",
+    "qa-mcp-independent.log": "0f530935cf7f3a0c0a73dbceee1a0dbc8a5b2a6d01d5fd2cd02373b9a23a4195",
+    "qa-shared_default-tree.txt": "28ad28240711057e51779a4a4f06b6469bba2c85f0255b6684c7de79397ae131",
+    "qa-upstream_default-tree.txt": "e1bf7190a5ee58f74eb2400655f368fe4be6584a3474794e4054b3a16f5d76f4"
+  }
+}

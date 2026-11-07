@@ -18,3 +18,6 @@ mod fixture_tests;
 
 #[cfg(test)]
 mod schema7_tests;
+
+#[cfg(test)]
+mod current_notes_tests;
