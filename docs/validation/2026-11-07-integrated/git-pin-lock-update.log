@@ -1,0 +1,10 @@
+    Updating git repository `https://github.com/Otzaria/otzaria_search_engine`
+    Updating crates.io index
+    Updating git repository `https://github.com/Otzaria/otzaria-semantic-search`
+      Adding otzaria-search-core v7.0.1 (https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#47613567)
+    Removing otzaria-search-core v7.0.1 (https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c)
+      Adding search_engine v7.0.1 (https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#47613567)
+    Removing search_engine v7.0.1 (https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c)
+      Adding tantivy-fst v0.5.0 (https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#47613567)
+    Removing tantivy-fst v0.5.0 (https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c)
+note: pass `--verbose` to see 67 unchanged dependencies behind latest

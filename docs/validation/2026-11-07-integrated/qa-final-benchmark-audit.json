@@ -1,0 +1,35 @@
+{
+  "result": "PASS",
+  "core_revision": "4761356749815d283ede41ef956c64b3dbffe048",
+  "core_tree": "34341d9cffd3348587f509e587593c1f67cf4eec",
+  "artifact_hashes_verified": 13,
+  "summary_values_recomputed": 36,
+  "measured_processes": 6,
+  "requests_each": 1700,
+  "hit_checksum_each": 5700,
+  "warmup_each": 85,
+  "all_binary_and_cargo_fingerprint_edges_verified": true,
+  "historical_files_preserved_byte_for_byte": 30,
+  "golden_contract_sha256": "8281246968cb24d8abf3721142ba9fd8653518ea5e7e2ef5b9916a15970a4ea4",
+  "provenance_sha256": "018d1df4512ce4880cdc9b4b733b8d6f83b1134b1395364f8d709b441150afea",
+  "summary_sha256": "045fbc1c64ef5842408f2326cdc0b64f3c91957469a5af979da52d55b841f417",
+  "medians": {
+    "baseline": {
+      "elapsed_s": 1.474258848,
+      "throughput_requests_per_s": 1153.1217888271408,
+      "latency_p50_ms": 0.792197,
+      "latency_p95_ms": 1.584796,
+      "latency_p99_ms": 2.693742,
+      "peak_rss_kib": 60516
+    },
+    "migrated": {
+      "elapsed_s": 1.159132284,
+      "throughput_requests_per_s": 1466.6143144020998,
+      "latency_p50_ms": 0.638621,
+      "latency_p95_ms": 1.1796490000000002,
+      "latency_p99_ms": 1.974816,
+      "peak_rss_kib": 32572
+    }
+  },
+  "limitations": "Tiny warm serialized dev fixture on shared tmpfs; whole-process VmHWM; three pairs. No production-scale or causal facade-speedup conclusion."
+}

@@ -1,0 +1,188 @@
+   Compiling tantivy-fst v0.5.0 (https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#47613567)
+   Compiling tantivy-sstable v0.7.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+   Compiling tantivy-columnar v0.7.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+   Compiling tantivy v0.26.2 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+   Compiling search_engine v7.0.1 (https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#47613567)
+   Compiling otzaria-search-core v7.0.1 (https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#47613567)
+   Compiling otzaria-mcp v0.2.0 (/workspace/scratch/823dd8bcb941/mcp-migration/mcp)
+    Finished `test` profile [unoptimized] target(s) in 24.65s
+     Running unittests src/lib.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/otzaria_mcp-ffbfd29974e6f8aa)
+
+running 53 tests
+test fixture_tests::commentaries_join_multi_line_comments_and_commentators_group_by_era ... ok
+test fixture_tests::line_anchors_resolve_visible_text ... ok
+test current_notes_tests::current_marker_takes_precedence_over_legacy_column ... ok
+test current_notes_tests::null_body_and_bad_index_follow_source_skip_rules ... ok
+test fixture_tests::both_directions_use_one_offset_over_a_stable_combined_list ... ok
+test current_notes_tests::malformed_current_marker_errors_and_releases_transaction ... ok
+test fixture_tests::range_commentaries_are_deduplicated_before_limit ... ok
+test paths::tests::data_dir_download_layout_is_detected ... ok
+test paths::tests::explicit_index_must_be_a_tantivy_index ... ok
+test refkey::tests::hashes_match_the_library_line_ref_table ... ok
+test fixture_tests::range_link_is_deduplicated_before_link_pagination ... ok
+test refkey::tests::keys_follow_the_app_normalisation ... ok
+test refkey::tests::numerals_and_amud_query_marks ... ok
+test refs::tests::expands_talmud_amud_markers ... ok
+test refs::tests::maqaf_and_commas_become_spaces ... ok
+test refs::tests::names_matching_lists_exact_then_prefix ... ok
+test fixture_tests::range_links_are_found_from_every_covered_line_once ... ok
+test refs::tests::resolves_from_the_per_book_normalized_cache ... ok
+test refs::tests::strips_nikud_and_gershayim ... ok
+test refs::tests::token_prefix_respects_boundaries ... ok
+test fixture_tests::suppressed_sides_are_hidden_and_inverse_is_virtual_source ... ok
+test refs::tests::pipeline_preserves_raw_ranges_and_chapter_verse_colons ... ok
+test refs::tests::resolves_via_line_ref_heref_prefix_toc_and_dibur ... ok
+test schema7_tests::schema7_notes_absent_or_partial_table_keeps_legacy_text ... ok
+test fixture_tests::text_versions_toc_categories_and_info ... ok
+test schema7_tests::schema7_notes_failed_read_releases_snapshot ... ok
+test schema7_tests::schema7_notes_do_not_change_anchor_offsets_after_body ... ok
+test schema7_tests::schema7_notes_only_restore_actual_base_rows_of_an_edition ... ok
+test schema7_tests::schema7_notes_reach_ranges_commentaries_and_link_snippets ... ok
+test search::tests::exact_with_advanced_only_options_runs_advanced ... ok
+test search::tests::mode_and_option_parsing ... ok
+test search::tests::parses_book_id_prefixes ... ok
+test search::tests::per_word_option_keys_follow_the_engine_format ... ok
+test current_notes_tests::compressed_notes_reach_range_and_link_responses ... ok
+test search::tests::results_are_classified_by_source ... ok
+test server::tests::dimension_facet_segments_are_sanitised ... ok
+test schema7_tests::schema7_notes_restore_base_fallback_for_null_edition_content ... ok
+test current_notes_tests::numeric_marker_and_compressed_notes_keep_order_and_visible_offsets ... ok
+test server::tests::rejects_blank_required_text ... ok
+test server::tests::response_metadata_never_locks_sqlite_on_the_runtime ... ok
+test server::tests::search_offset_is_bounded ... ok
+test text::tests::plain_codec_reads_text_and_null ... ok
+test text::tests::snippets_stream_trimmed_text_and_keep_truncate_semantics ... ok
+test text::tests::strips_tags_and_decodes_entities ... ok
+test text::tests::visible_units_match_the_library_char_counter ... ok
+[2026-11-07T20:58:54Z INFO  search_engine::api::search_engine] the index's chunkKey column was written under None, and this build computes ChunkKeyRecipe { line_text_version: 4, key_version: 1, chunking_identity: 2685558872390372738 }: the column counts as absent
+test search::tests::read_only_open_does_not_create_index_metadata ... ok
+test server::tests::legacy_book_versions_keep_titles_and_expose_details_separately ... ok
+test server::tests::legacy_link_endpoints_keep_stored_orientation_on_covered_and_inverse_lines ... ok
+test schema7_tests::schema7_notes_marker_and_block_boundary_parity ... ok
+test text::tests::zstd_dictionary_frames_round_trip ... ok
+test current_notes_tests::malformed_compressed_or_utf8_body_is_reported_not_dropped ... ok
+test schema7_tests::schema7_notes_support_compressed_content_and_note_order ... ok
+test schema7_tests::schema7_notes_batch_more_than_sqlite_variable_limit_without_losing_rows ... ok
+
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running unittests src/main.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/otzaria_mcp-26d14b8c955a0fb6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/admission_control.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/admission_control-2474e2f0a5e8d6d2)
+
+running 14 tests
+test dropped_waiter_releases_queue_capacity ... ok
+test cancel_waiter_releases_queue_capacity_without_executing ... ok
+test explicit_cancel_detaches_started_work_but_keeps_permits ... ok
+test dropped_caller_does_not_release_running_worker_permit ... ok
+test dropped_caller_aborts_tokio_pool_queued_closure ... ok
+test panic_releases_both_permits_and_records_failure ... ok
+test maintenance_waiter_is_woken_by_shutdown ... ok
+test finite_fifo_queue_does_not_create_mutex_waiting_workers ... ok
+test shutdown_cancels_waiters_and_prevents_new_admission ... ok
+test deadline_also_covers_tokio_pool_queue ... ok
+test queue_expiration_never_starts_stale_work ... ok
+test maintenance_has_reserved_fifo_slot_and_no_start_deadline ... ok
+test start_deadline_never_interrupts_a_running_operation ... ok
+test maintenance_waits_for_saturated_blocking_pool_without_expiring ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/current_notes_search.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/current_notes_search-b1cec3f022993595)
+
+running 1 test
+[2026-11-07T20:58:54Z INFO  search_engine::library_indexing] add_library_books: 1 books, 1 indexed, 1 docs in 7.663111ms (enqueue 27.891µs)
+[2026-11-07T20:58:54Z INFO  search_engine::api::search_engine] commit: 22.523158ms (reader reload 479.596µs)
+test get_text_retains_current_footnote_body_found_by_search ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/existing_index.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/existing_index-9f06277cff34ce29)
+
+running 1 test
+test mcp_reads_independently_built_schema10_index_without_changing_it ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/library_reload.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/library_reload-7e7181ea875da433)
+
+running 8 tests
+test empty_wal_and_sqlite_permission_touches_are_not_content_changes ... ok
+test snapshot_mode_does_not_watch_wal_that_immutable_sqlite_ignores ... ok
+test changed_generation_while_waiting_is_discarded_then_current_generation_reopens ... ok
+test replacement_with_same_size_and_mtime_changes_identity ... ok
+[2026-11-07T20:58:54Z INFO  search_engine::api::search_engine] add_text_book 'Example': 1 docs, 19 bytes in 1.765411ms (prepare 1.427143ms, keys 74.711µs, enqueue 25.878µs)
+[2026-11-07T20:58:54Z INFO  search_engine::api::search_engine] commit: 22.652564ms (reader reload 563.12µs)
+test incompatible_or_missing_index_keeps_database_tools_available ... ok
+test concurrent_refreshes_of_one_generation_open_it_once ... ok
+test wal_commit_and_checkpoint_are_observed_without_touching_main_db_first ... ok
+[2026-11-07T20:58:54Z INFO  search_engine::api::search_engine] add_text_book 'Example': 1 docs, 17 bytes in 1.365051ms (prepare 1.068465ms, keys 50.204µs, enqueue 19.999µs)
+[2026-11-07T20:58:54Z INFO  search_engine::api::search_engine] commit: 19.931103ms (reader reload 468.391µs)
+[2026-11-07T20:58:54Z INFO  search_engine::api::search_engine] add_text_book 'Example': 1 docs, 15 bytes in 1.653486ms (prepare 1.367435ms, keys 74.28µs, enqueue 18.687µs)
+[2026-11-07T20:58:54Z INFO  search_engine::api::search_engine] commit: 21.467112ms (reader reload 535.86µs)
+test concurrent_searches_and_atomic_db_index_replacement_publish_fresh_handles ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/mcp_admission_regression.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/mcp_admission_regression-1f13c993355978e6)
+
+running 3 tests
+test invalid_search_parameters_win_over_full_queue ... ok
+test mcp_responses_track_wal_metadata_without_reloading ... ok
+test watcher_refreshes_after_entering_a_full_search_queue ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.03s
+
+     Running tests/real_data.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/real_data-917c2548fd474fb2)
+
+running 9 tests
+test resolve_ref_golden_corpus_v32 ... ok
+test book_info_has_v32_metadata ... ok
+test v32_schema_and_capabilities ... ok
+test lookup_title_resolves_acronyms ... ok
+test full_text_search_maps_hits_to_lines_and_reads_text_from_the_db ... ok
+test get_text_decodes_compressed_lines_and_versions ... ok
+test library_opens_with_the_index_and_reports_it ... ok
+test links_commentaries_and_anchors_follow_the_app_model ... ok
+test categories_and_toc ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/reload_regression.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/reload_regression-e830a5671da1c33f)
+
+running 3 tests
+[2026-11-07T20:59:01Z INFO  search_engine::api::search_engine] add_text_book 'ספר 1': 1 docs, 11 bytes in 9.212064ms (prepare 2.971308ms, keys 2.900093ms, enqueue 21.632µs)
+[2026-11-07T20:59:01Z INFO  search_engine::api::search_engine] add_text_book 'ספר 2': 1 docs, 11 bytes in 12.064237ms (prepare 7.290282ms, keys 4.525698ms, enqueue 63.243µs)
+[2026-11-07T20:59:01Z INFO  search_engine::api::search_engine] add_text_book 'ספר 3': 1 docs, 11 bytes in 2.905201ms (prepare 1.506881ms, keys 1.125799ms, enqueue 27.781µs)
+[2026-11-07T20:59:01Z INFO  search_engine::api::search_engine] commit: 32.318692ms (reader reload 789.043µs)
+test catalogue_and_generation_order_follow_the_app_mapping ... ok
+[2026-11-07T20:59:02Z INFO  search_engine::api::search_engine] add_text_book 'ספר 1': 1 docs, 17 bytes in 5.248885ms (prepare 299.121µs, keys 146.065µs, enqueue 35.773µs)
+[2026-11-07T20:59:02Z INFO  search_engine::api::search_engine] commit: 59.885405ms (reader reload 810.915µs)
+test refresh_same_path_closes_and_reopens_line_source ... ok
+[2026-11-07T20:59:02Z INFO  search_engine::api::search_engine] add_text_book 'ספר 1': 1 docs, 17 bytes in 6.753331ms (prepare 298.83µs, keys 124.383µs, enqueue 41.441µs)
+[2026-11-07T20:59:02Z INFO  search_engine::api::search_engine] commit: 33.353106ms (reader reload 920.927µs)
+test reopen_after_atomic_database_replacement_reads_new_text ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/shared_core_contract.rs (/workspace/scratch/823dd8bcb941/target-mcp/debug/deps/shared_core_contract-f56222cfa566ff1f)
+
+running 1 test
+[2026-11-07T20:59:02Z INFO  search_engine::api::search_engine] add_text_book 'דוגמה ראשונה': 7 docs, 197 bytes in 5.989256ms (prepare 648.886µs, keys 174.998µs, enqueue 35.352µs)
+[2026-11-07T20:59:02Z INFO  search_engine::api::search_engine] add_text_book 'דוגמה שנייה': 5 docs, 146 bytes in 474.83µs (prepare 184.332µs, keys 120.558µs, enqueue 5.528µs)
+[2026-11-07T20:59:02Z INFO  search_engine::api::search_engine] add_text_book 'דוגמה שלישית': 3 docs, 81 bytes in 381.993µs (prepare 184.201µs, keys 95.09µs, enqueue 4.286µs)
+[2026-11-07T20:59:02Z INFO  search_engine::api::search_engine] commit: 51.386593ms (reader reload 971.983µs)
+test preserves_mcp_search_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+   Doc-tests otzaria_mcp
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

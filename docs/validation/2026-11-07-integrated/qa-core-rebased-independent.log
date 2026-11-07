@@ -1,0 +1,77 @@
+Independent QA: direct prebuilt rebased-core test execution
+{
+  "source_commit": "60913c9be8960bae514225aea01c741c24161e3f",
+  "final_documentation_commit": "25d10734a9b834b7ffd17925c1c1d802fda66fe9",
+  "binary": "/workspace/scratch/823dd8bcb941/target-core-rebased/debug/deps/search_engine-2e41eed5f486eb35",
+  "binary_sha256": "0f53b9e00c6e465321959c0bb46b8ee7d5f13a187e6d175a10e6d74c5f9e118e",
+  "cargo_invoked": false,
+  "verified_committed_logs": [
+    "host-contracts",
+    "host-contracts-semantic-integration",
+    "term-scan-contracts",
+    "work-gate-contracts",
+    "cold-primer-concurrency",
+    "facade-clippy",
+    "formatting",
+    "diff-check"
+  ],
+  "preserved_validation_sha256": "bc8e9ef212b62a32e2fd2e73361f62144851008c341f7e135dd7c67da06bc2e5"
+}
+
+$ /workspace/scratch/823dd8bcb941/target-core-rebased/debug/deps/search_engine-2e41eed5f486eb35 term_automaton::tests --nocapture
+
+running 10 tests
+test term_automaton::tests::cache_serves_repeats_and_failures ... ok
+test term_automaton::tests::rejects_what_tantivy_fst_rejects ... ok
+test term_automaton::tests::a_quoted_term_ranks_by_the_branch_of_its_quote_free_spelling ... ok
+test term_automaton::tests::whole_term_semantics ... ok
+test term_automaton::tests::different_patterns_print_differently ... ok
+test term_automaton::tests::matched_branch_is_the_lowest_accepting_branch ... ok
+test term_automaton::tests::capped_extra_automaton_stays_after_regex_branches ... ok
+test term_automaton::tests::capped_union_keeps_quote_transparent_exact_terms ... ok
+test term_automaton::tests::capped_union_keeps_branch_priority_and_segment_frequencies ... ok
+test term_automaton::tests::rayon_owners_parallelize_segments_while_duplicates_stay_on_their_worker ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 902 filtered out; finished in 0.12s
+
+
+$ /workspace/scratch/823dd8bcb941/target-core-rebased/debug/deps/search_engine-2e41eed5f486eb35 highlight_cache::tests --nocapture
+
+running 13 tests
+test highlight_cache::tests::clearing_highlights_releases_idle_term_and_pattern_work_keys ... ok
+test highlight_cache::tests::a_failed_computation_is_not_cached ... ok
+test highlight_cache::tests::cancelled_rayon_contender_stops_before_duplicating_work ... ok
+test highlight_cache::tests::clearing_work_keeps_active_and_waiting_requests_on_the_same_gate ... ok
+test highlight_cache::tests::rayon_contender_does_not_release_or_replace_the_owners_gate ... ok
+test highlight_cache::tests::a_large_term_set_is_returned_without_retaining_it ... ok
+test highlight_cache::tests::clearing_idle_work_releases_the_key_payload ... ok
+test highlight_cache::tests::term_sets_are_computed_once_per_generation_field_pattern_and_cap ... ok
+test highlight_cache::tests::clearing_during_computation_does_not_refill_evicted_payloads ... ok
+test highlight_cache::tests::pattern_computation_does_not_hold_the_cache_lock ... ok
+test highlight_cache::tests::cached_patterns_do_not_retain_the_matcher_after_its_last_consumer ... ok
+test highlight_cache::tests::concurrent_patterns_share_one_matcher ... ok
+test highlight_cache::tests::concurrent_term_requests_compute_once_and_share_the_same_value ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 899 filtered out; finished in 0.04s
+
+
+$ /workspace/scratch/823dd8bcb941/target-core-rebased/debug/deps/search_engine-2e41eed5f486eb35 cold_any_order_search_on_rayon_finishes_while_highlight_primer_owns_term_work --nocapture
+
+running 1 test
+[2026-11-07T20:53:29Z INFO  search_engine::api::search_engine] commit: 26.987744ms (reader reload 634.835µs)
+[2026-11-07T20:53:29Z INFO  search_engine::api::search_engine] commit: 23.272049ms (reader reload 611.271µs)
+[2026-11-07T20:53:29Z INFO  search_engine::api::search_engine] commit: 31.813234ms (reader reload 998.271µs)
+[2026-11-07T20:53:29Z INFO  search_engine::api::search_engine] commit: 23.574726ms (reader reload 912.594µs)
+[2026-11-07T20:53:29Z INFO  search_engine::api::search_engine] commit: 24.847912ms (reader reload 578.913µs)
+[2026-11-07T20:53:29Z INFO  search_engine::api::search_engine] commit: 26.859014ms (reader reload 693.682µs)
+[2026-11-07T20:53:29Z INFO  search_engine::api::search_engine] commit: 22.904407ms (reader reload 706.401µs)
+[2026-11-07T20:53:29Z INFO  search_engine::api::search_engine] commit: 23.884607ms (reader reload 789.644µs)
+[2026-11-07T20:53:29Z INFO  search_engine::api::search_engine] commit: 26.563954ms (reader reload 630.719µs)
+[2026-11-07T20:53:29Z INFO  search_engine::api::search_engine] commit: 30.757523ms (reader reload 696.316µs)
+[2026-11-07T20:53:29Z INFO  search_engine::api::search_engine] commit: 28.314363ms (reader reload 790.455µs)
+[2026-11-07T20:53:29Z INFO  search_engine::api::search_engine] commit: 24.98927ms (reader reload 639.973µs)
+test api::search_engine::search_concurrency_tests::cold_any_order_search_on_rayon_finishes_while_highlight_primer_owns_term_work ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 911 filtered out; finished in 0.39s
+
+

@@ -1,0 +1,12 @@
+[
+  {
+    "name": "search_benchmark",
+    "path": "/workspace/scratch/823dd8bcb941/preserved-baseline-binaries/search_benchmark",
+    "sha256": "1a0b638738f0cfa1b34fa8f65b23625a3b317c1df406af571b69c013e8108bc1"
+  },
+  {
+    "name": "search_contract",
+    "path": "/workspace/scratch/823dd8bcb941/preserved-baseline-binaries/search_contract",
+    "sha256": "b1b5d0bee77b411dd67872ed2f94fdfe72351ff4537bcacbd27d92cc5c1c2916"
+  }
+]

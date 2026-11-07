@@ -7,9 +7,11 @@ the Flutter bridge runtime. The MCP keeps its own protocol, admission and respon
 formatting; Flutter keeps its FRB wrapper. No MCP or Tokio dependency is added to
 Flutter. The engine's annotation proc-macro remains a build-time dependency.
 
-This describes the canonical engine's two adapters. The application currently
-pins the older `2da2309` engine revision (schema 10); no application dependency
-upgrade is assumed by this migration.
+This describes the canonical engine's two adapters. The application's audited
+`dev` at `3168cc9e` pins engine revision
+`b78d36eaffcb2a5fa679d34a52133512ee55c084` in both pubspec files. That revision
+still uses schema 10 and adds a WorkGate backport to the earlier `2da2309` pin;
+no application dependency upgrade is assumed by this migration.
 
 ## Revisions and merge sequence
 
@@ -21,11 +23,14 @@ upgrade is assumed by this migration.
    canonical engine commit, and retain the reviewed lockfile.
 
 The core and FST patch are pinned together to
-`b22aab7c7addd845d69919272074d437408e5cbe` from #84. This is a reachable published
+`4761356749815d283ede41ef956c64b3dbffe048` from #84. This is a reachable published
 commit, not a local checkout or a presumed future merge. Its source tree matches
-the reviewed local core `4b6bd560` exactly. The final follow-up changes Windows
-test coverage and Dart compatibility; production Rust and dependency manifests
-are unchanged from the measured `72a64d0` revision.
+the reviewed local core `25d1073` exactly. This version incorporates current
+`refactor` at `8ef29fd592793fbc9d5af0299fdd7a8607789bac`, including the upstream
+`9f671907` ScanMode follow-up to the cold-search WorkGate fix. That follow-up
+changes production Rust. Validation records keep the earlier `72a64d0`/`b22aab7`
+captures separate from the new pin and do not claim production equivalence to
+those older revisions.
 
 This work was reconstructed on 2026-11-07 from the current MCP main after the
 previous temporary workspace became unavailable. Its prior local migration commit

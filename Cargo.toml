@@ -6,5 +6,5 @@ resolver = "2"
 # Cargo applies patches only at the workspace root. The FST patch and core
 # dependency must use the same reviewed canonical engine revision.
 [patch.crates-io]
-tantivy-fst = { git = "https://github.com/Otzaria/otzaria_search_engine", rev = "b22aab7c7addd845d69919272074d437408e5cbe" }
+tantivy-fst = { git = "https://github.com/Otzaria/otzaria_search_engine", rev = "4761356749815d283ede41ef956c64b3dbffe048" }
 tantivy = { git = "https://github.com/Otzaria/tantivy", rev = "130b2682807d2a609d09ba432ba4d0ccc8faf7ed" }
