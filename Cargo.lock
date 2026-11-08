@@ -1010,7 +1010,7 @@ dependencies = [
 [[package]]
 name = "otzaria-search-core"
 version = "7.0.1"
-source = "git+https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#4761356749815d283ede41ef956c64b3dbffe048"
+source = "git+https://github.com/Otzaria/otzaria_search_engine?rev=4bb3d8e7d11499861ce0655c88841eb23e0f1649#4bb3d8e7d11499861ce0655c88841eb23e0f1649"
 dependencies = [
  "search_engine",
 ]
@@ -1282,7 +1282,7 @@ dependencies = [
 [[package]]
 name = "search_engine"
 version = "7.0.1"
-source = "git+https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#4761356749815d283ede41ef956c64b3dbffe048"
+source = "git+https://github.com/Otzaria/otzaria_search_engine?rev=4bb3d8e7d11499861ce0655c88841eb23e0f1649#4bb3d8e7d11499861ce0655c88841eb23e0f1649"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -1534,7 +1534,7 @@ dependencies = [
 [[package]]
 name = "tantivy-fst"
 version = "0.5.0"
-source = "git+https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#4761356749815d283ede41ef956c64b3dbffe048"
+source = "git+https://github.com/Otzaria/otzaria_search_engine?rev=4bb3d8e7d11499861ce0655c88841eb23e0f1649#4bb3d8e7d11499861ce0655c88841eb23e0f1649"
 dependencies = [
  "byteorder",
  "regex-syntax",
