@@ -1,0 +1,897 @@
+{
+  "document_count": 9,
+  "book_counts": {
+    "id:101": 2,
+    "id:202": 2,
+    "id:303": 1
+  },
+  "pages": [
+    {
+      "case": "exact-catalogue",
+      "response": {
+        "total": 5,
+        "truncated": false,
+        "mode": "exact",
+        "returned": 5,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 0,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» נוח",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 303,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Accessory",
+            "reference": "",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:303"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 3,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:101"
+          }
+        ]
+      }
+    },
+    {
+      "case": "phrase-catalogue",
+      "response": {
+        "total": 2,
+        "truncated": false,
+        "mode": "exact",
+        "returned": 2,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 0,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» «מהיר»",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» «מהיר»",
+            "text_status": "ok",
+            "file_path": "id:101"
+          }
+        ]
+      }
+    },
+    {
+      "case": "fuzzy-catalogue",
+      "response": {
+        "total": 5,
+        "truncated": false,
+        "mode": "fuzzy",
+        "returned": 5,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 0,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» נוח",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 303,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Accessory",
+            "reference": "",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:303"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 3,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:101"
+          }
+        ]
+      }
+    },
+    {
+      "case": "grouped-catalogue",
+      "response": {
+        "total": 5,
+        "truncated": false,
+        "mode": "exact",
+        "returned": 5,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 0,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» נוח",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 303,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Accessory",
+            "reference": "",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:303"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 3,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:101"
+          }
+        ],
+        "group_count": 5
+      }
+    },
+    {
+      "case": "exact-generation",
+      "response": {
+        "total": 5,
+        "truncated": false,
+        "mode": "exact",
+        "returned": 5,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 303,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Accessory",
+            "reference": "",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:303"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 3,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 0,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» נוח",
+            "text_status": "ok",
+            "file_path": "id:202"
+          }
+        ]
+      }
+    },
+    {
+      "case": "phrase-generation",
+      "response": {
+        "total": 2,
+        "truncated": false,
+        "mode": "exact",
+        "returned": 2,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» «מהיר»",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 0,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» «מהיר»",
+            "text_status": "ok",
+            "file_path": "id:202"
+          }
+        ]
+      }
+    },
+    {
+      "case": "fuzzy-generation",
+      "response": {
+        "total": 5,
+        "truncated": false,
+        "mode": "fuzzy",
+        "returned": 5,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 303,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Accessory",
+            "reference": "",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:303"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 3,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 0,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» נוח",
+            "text_status": "ok",
+            "file_path": "id:202"
+          }
+        ]
+      }
+    },
+    {
+      "case": "grouped-generation",
+      "response": {
+        "total": 5,
+        "truncated": false,
+        "mode": "exact",
+        "returned": 5,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 303,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Accessory",
+            "reference": "",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:303"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 3,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 0,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» נוח",
+            "text_status": "ok",
+            "file_path": "id:202"
+          }
+        ],
+        "group_count": 5
+      }
+    },
+    {
+      "case": "exact-relevance",
+      "response": {
+        "total": 5,
+        "truncated": false,
+        "mode": "exact",
+        "returned": 5,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 3,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 0,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» נוח",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 303,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Accessory",
+            "reference": "",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:303"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:101"
+          }
+        ]
+      }
+    },
+    {
+      "case": "phrase-relevance",
+      "response": {
+        "total": 2,
+        "truncated": false,
+        "mode": "exact",
+        "returned": 2,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 0,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» «מהיר»",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» «מהיר»",
+            "text_status": "ok",
+            "file_path": "id:101"
+          }
+        ]
+      }
+    },
+    {
+      "case": "fuzzy-relevance",
+      "response": {
+        "total": 5,
+        "truncated": false,
+        "mode": "fuzzy",
+        "returned": 5,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 3,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 0,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» נוח",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 303,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Accessory",
+            "reference": "",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:303"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:101"
+          }
+        ]
+      }
+    },
+    {
+      "case": "grouped-relevance",
+      "response": {
+        "total": 5,
+        "truncated": false,
+        "mode": "exact",
+        "returned": 5,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 0,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» נוח",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 303,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Accessory",
+            "reference": "",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:303"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 3,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:101"
+          }
+        ],
+        "group_count": 5
+      }
+    },
+    {
+      "case": "pagination",
+      "response": {
+        "total": 5,
+        "truncated": false,
+        "mode": "exact",
+        "returned": 2,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» נוח",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 303,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Accessory",
+            "reference": "",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:303"
+          }
+        ]
+      }
+    },
+    {
+      "case": "facet",
+      "response": {
+        "total": 4,
+        "truncated": false,
+        "mode": "exact",
+        "returned": 4,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 0,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מחשב» נוח",
+            "text_status": "ok",
+            "file_path": "id:202"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» מהיר",
+            "text_status": "ok",
+            "file_path": "id:101"
+          },
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 3,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מחשב» קטן",
+            "text_status": "ok",
+            "file_path": "id:101"
+          }
+        ]
+      }
+    },
+    {
+      "case": "vocalized",
+      "response": {
+        "total": 1,
+        "truncated": false,
+        "mode": "exact",
+        "returned": 1,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 202,
+            "line_index": 1,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device B",
+            "reference": "",
+            "snippet": "«מַחְשֵׁב» נוח",
+            "text_status": "ok",
+            "file_path": "id:202"
+          }
+        ]
+      }
+    },
+    {
+      "case": "advanced-negative",
+      "response": {
+        "total": 1,
+        "truncated": false,
+        "mode": "advanced",
+        "returned": 1,
+        "hits": [
+          {
+            "source": "official",
+            "book_id": 101,
+            "line_index": 2,
+            "page": null,
+            "is_pdf": false,
+            "title": "Device A",
+            "reference": "חומרה",
+            "snippet": "«מסך» כחול",
+            "text_status": "ok",
+            "file_path": "id:101"
+          }
+        ]
+      }
+    }
+  ]
+}

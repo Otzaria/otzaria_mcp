@@ -1,14 +1,14 @@
-//! Full-text search over Otzaria's Tantivy index, via the reused (vendored)
-//! `search_engine` crate — reproducing the app's exact search semantics.
+//! Full-text search through the canonical `otzaria-search-core` Rust adapter.
+//! Flutter and MCP compile the same source; only their host wrappers differ.
 //!
-//! Index contract (schema 7, verified against the app's indexer):
+//! Index contract (schema 10/11, verified against the app's indexer):
 //!   * `file_path` = `id:<bookId>` for official text books (`uid:` = user book, `ext:` /
 //!     `attached:` = external or attached catalogues); for PDFs a file path and `is_pdf`.
 //!   * `segment` = the 0-based position of the line among the book's rows ordered by
 //!     `lineIndex`, which is the seforim.db `line.lineIndex` (dense 0..n-1 in the library).
 //!   * Official books' line text is NOT stored in the index (`TextStorage::LibraryDb`): the
 //!     engine reads each result line back from seforim.db through its process-wide *library
-//!     line source*, which must be configured with the DB path ([`configure_line_source`]).
+//!     line source*, refreshed with the DB path ([`refresh_line_source`]).
 //!     A result whose row no longer matches the indexed text is `stale`.
 //!   * Facets: the category path (`/תנ״ך/תורה/…`) plus dimension facets `/author/<name>`,
 //!     `/era/<era>` and `/base` (OR inside a dimension, AND across dimensions).
@@ -29,8 +29,9 @@ use search_engine::api::search_engine::{
 };
 
 pub struct Search {
-    // SearchEngine is used from one thread at a time (its docs); a Mutex makes the whole
-    // thing Sync so it can live behind an Arc and be used from blocking tasks.
+    // Preserve the adapter's serialization policy while sharing the engine's
+    // caches and process-wide line source. Admission limits workers before this
+    // mutex; removing it would require separate safety and contention analysis.
     engine: Mutex<SearchEngine>,
     pub info: IndexInfo,
 }
@@ -365,6 +366,7 @@ impl Search {
                 req.match_nikud,
                 req.match_taamim,
                 grouping,
+                None,
             ),
             Mode::Fuzzy => engine.search_and_count_fuzzy(
                 req.query.clone(),
@@ -376,6 +378,7 @@ impl Search {
                 req.match_nikud,
                 req.match_taamim,
                 grouping,
+                None,
             ),
             Mode::Advanced => {
                 let a = Advanced::from(req)?;
@@ -401,6 +404,7 @@ impl Search {
                     grouping,
                     a.word_match.0,
                     a.word_match.1,
+                    None,
                     None,
                 )
             }

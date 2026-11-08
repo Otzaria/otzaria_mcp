@@ -1,0 +1,15 @@
+{
+  "head": "249ae4e2aa80734a7e0b1ed08dbf7a98dd3e608b",
+  "tree": "3bdb6192793bd254e1f66d9ee66c1c4697afa1df",
+  "tracked_changes": "",
+  "lock_sha256": "4d0fc774183d7e6c97ad66ef9d346e7777c52004724df8761f11ff7707635b6f",
+  "fixture_sha256": "8152807d5d49fcf0350ec9eee97fc1d357fb6b1bd1b79d36a462e2be8ce1a6b2",
+  "contract_example_sha256": "e50a79e0ce1e3fd199d24e5920519d43985a6f1d8950c233669544a754873718",
+  "contract_binary_sha256": "b1b5d0bee77b411dd67872ed2f94fdfe72351ff4537bcacbd27d92cc5c1c2916",
+  "golden_sha256": "8281246968cb24d8abf3721142ba9fd8653518ea5e7e2ef5b9916a15970a4ea4",
+  "repeat_processes": 3,
+  "all_outputs_byte_identical": true,
+  "target_directory": "target-mcp-baseline",
+  "profile": "dev, debug=0, incremental=false",
+  "scope": "Strict baseline search-contract capture; paired benchmark provenance is in docs/benchmarks/shared-core-2026-11-07/provenance.json."
+}

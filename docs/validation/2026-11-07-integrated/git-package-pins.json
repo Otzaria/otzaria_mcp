@@ -1,0 +1,17 @@
+[
+  {
+    "name": "otzaria-search-core",
+    "source": "git+https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#4761356749815d283ede41ef956c64b3dbffe048",
+    "manifest_path": "/workspace/scratch/823dd8bcb941/toolchains/cargo/git/checkouts/otzaria_search_engine-b11b23ab9c0aa6ad/4761356/rust/core/Cargo.toml"
+  },
+  {
+    "name": "search_engine",
+    "source": "git+https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#4761356749815d283ede41ef956c64b3dbffe048",
+    "manifest_path": "/workspace/scratch/823dd8bcb941/toolchains/cargo/git/checkouts/otzaria_search_engine-b11b23ab9c0aa6ad/4761356/rust/Cargo.toml"
+  },
+  {
+    "name": "tantivy-fst",
+    "source": "git+https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#4761356749815d283ede41ef956c64b3dbffe048",
+    "manifest_path": "/workspace/scratch/823dd8bcb941/toolchains/cargo/git/checkouts/otzaria_search_engine-b11b23ab9c0aa6ad/4761356/rust/vendor/tantivy-fst/Cargo.toml"
+  }
+]

@@ -1,0 +1,82 @@
+{
+  "core_revision": "4761356749815d283ede41ef956c64b3dbffe048",
+  "method": "Match unversioned executable to its hashed Cargo artifact; follow little-endian Cargo dependency fingerprints through MCP and facade to canonical engine; preserve final Git checkout dependency paths and verify HEAD/tree.",
+  "search_benchmark": {
+    "executable": "/workspace/scratch/823dd8bcb941/target-mcp/debug/examples/search_benchmark",
+    "artifact": "/workspace/scratch/823dd8bcb941/target-mcp/debug/examples/search_benchmark-727fdcbb631024bf",
+    "sha256": "ede064ccf116daecc9f48bbbaf92b6920db9752011e31b6a5e0f7daf10a288d0",
+    "size": 40626368,
+    "mtime_ns": 1794085133310212095,
+    "facade_fingerprint_value": 17427056967150004216,
+    "engine_fingerprint_value": 8986080627789168422,
+    "mcp_and_example_use_same_facade": true,
+    "evidence": [
+      {
+        "file": "search_benchmark-fingerprint.json",
+        "sha256": "8b7ae7a2cc09859a871088d9de1483b2ceec2333616744d79d1e7c80e2721537"
+      },
+      {
+        "file": "mcp-library-fingerprint.json",
+        "sha256": "8c4b15b599edf1c0cb765bc7c6daa2f51521400e4a5b8277df7799456f06e3d2"
+      },
+      {
+        "file": "facade-fingerprint.json",
+        "sha256": "f89a694046213c6d4e7c1d61d142095eac6b31da96c187810d4320f84ca460c3"
+      },
+      {
+        "file": "engine-fingerprint.json",
+        "sha256": "d47baca6f39226721447dedf0fffff3f2cd3c99e0c357a28aa4e602203dc02db"
+      },
+      {
+        "file": "facade-dependencies.d",
+        "sha256": "d993b98d03c9b8e2f7b317206bb26ccc1359161b838ab68164ac815c6506ce1c"
+      },
+      {
+        "file": "engine-dependencies.d",
+        "sha256": "575288539077274b680efa76cce8cb2330eaf5a8d335b961f0ef06eb3a496b2c"
+      }
+    ]
+  },
+  "search_contract": {
+    "executable": "/workspace/scratch/823dd8bcb941/target-mcp/debug/examples/search_contract",
+    "artifact": "/workspace/scratch/823dd8bcb941/target-mcp/debug/examples/search_contract-bd93a6ea9ca39e56",
+    "sha256": "e1b28f63eecbc87227464b8efcf5518a18db75079e5303de4dd4762234720e20",
+    "size": 41529120,
+    "mtime_ns": 1794085130258241612,
+    "facade_fingerprint_value": 17427056967150004216,
+    "engine_fingerprint_value": 8986080627789168422,
+    "mcp_and_example_use_same_facade": true,
+    "evidence": [
+      {
+        "file": "search_contract-fingerprint.json",
+        "sha256": "179031bfd752e8bb2ff26877cfa5d7836ec137b67e223b8a86c4c8094625f86b"
+      },
+      {
+        "file": "mcp-library-fingerprint.json",
+        "sha256": "8c4b15b599edf1c0cb765bc7c6daa2f51521400e4a5b8277df7799456f06e3d2"
+      },
+      {
+        "file": "facade-fingerprint.json",
+        "sha256": "f89a694046213c6d4e7c1d61d142095eac6b31da96c187810d4320f84ca460c3"
+      },
+      {
+        "file": "engine-fingerprint.json",
+        "sha256": "d47baca6f39226721447dedf0fffff3f2cd3c99e0c357a28aa4e602203dc02db"
+      },
+      {
+        "file": "facade-dependencies.d",
+        "sha256": "d993b98d03c9b8e2f7b317206bb26ccc1359161b838ab68164ac815c6506ce1c"
+      },
+      {
+        "file": "engine-dependencies.d",
+        "sha256": "575288539077274b680efa76cce8cb2330eaf5a8d335b961f0ef06eb3a496b2c"
+      }
+    ]
+  },
+  "checkout": {
+    "path": "/workspace/scratch/823dd8bcb941/toolchains/cargo/git/checkouts/otzaria_search_engine-b11b23ab9c0aa6ad/4761356",
+    "head": "4761356749815d283ede41ef956c64b3dbffe048",
+    "tree": "34341d9cffd3348587f509e587593c1f67cf4eec",
+    "tracked_status": ""
+  }
+}

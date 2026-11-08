@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use rusqlite::types::Value;
+use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, OptionalExtension};
 
 /// The largest line in the library is ~1.3 MB; a frame that declares more is corrupt.
@@ -77,10 +77,29 @@ impl LineCodec {
                     .as_mut()
                     .context("a compressed (BLOB) line in a database without zstd_dict")?;
                 let bytes = codec.decode(frame)?;
-                Ok(String::from_utf8_lossy(&bytes).into_owned())
+                String::from_utf8(bytes).context("decoded line is not valid UTF-8")
             }
             Value::Integer(i) => Ok(i.to_string()),
             Value::Real(r) => Ok(r.to_string()),
+        }
+    }
+
+    /// Strict decoding for note bodies: malformed bytes must not be silently
+    /// replaced before the common note renderer receives them.
+    pub fn note_body(&mut self, value: ValueRef<'_>) -> Result<String> {
+        match value {
+            ValueRef::Text(bytes) => Ok(std::str::from_utf8(bytes)
+                .context("note body is not valid UTF-8")?
+                .to_owned()),
+            ValueRef::Blob(frame) => {
+                let codec = self
+                    .zstd
+                    .as_mut()
+                    .context("a compressed note in a database without zstd_dict")?;
+                String::from_utf8(codec.decode(frame)?)
+                    .context("decoded note body is not valid UTF-8")
+            }
+            _ => anyhow::bail!("note body is neither TEXT nor BLOB"),
         }
     }
 

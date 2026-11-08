@@ -1,0 +1,30 @@
+Core pin follow-up: production source equivalence
+
+Measured published revision: 72a64d0289833e512edd89811fc4a1d634d79381
+Measured tree: 4fac03b2f27224c361737c4342262c44646228ba
+Final published revision: b22aab7c7addd845d69919272074d437408e5cbe
+Final tree: 236a1753a8c0e9e12bf86a7a253e3ee272a3ed3f
+
+Local exact-tree equivalents:
+8e7fe58f9ab3ec1a7fabb576b574cc3d7f7e4222
+4b6bd560b77d1d2a77a15147f8570203aded65a7
+
+Checked with git diff --exit-code between these local commits over:
+rust/src
+rust/Cargo.toml
+rust/Cargo.lock
+rust/core/src
+rust/core/Cargo.toml
+Result: no differences.
+
+All changed files between the trees:
+M	lib/src/hook/cargo_build.dart
+M	rust/core/tests/read_only.rs
+
+The follow-up changes Rust tests/docs and Flutter hook compatibility only.
+Benchmark captures remain labelled with their actually measured 72a64d0 pin.
+Final MCP locked tests and Clippy independently use the b22aab7 Git source.
+
+Independent QA implementation 3173eeededad79aeced96453aee9cae71cec2741 was
+also compared to final local 4b6bd560 over the same paths: no differences.
+Full trees differ because of later documentation and test changes.

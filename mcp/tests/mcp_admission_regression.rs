@@ -87,7 +87,7 @@ async fn mcp_responses_track_wal_metadata_without_reloading() {
     .await;
     assert_eq!(payload(&first)["schema_version"], 32);
     writer.execute_batch("BEGIN; UPDATE schema_meta SET value='33' WHERE key='db_version'; UPDATE schema_meta SET value='7' WHERE key='db_schema_version'; UPDATE line SET content='new'; COMMIT;").unwrap();
-    assert_eq!(
+    assert_ne!(
         original_fingerprint,
         otzaria_mcp::reload::fingerprint(&Paths {
             db: path,

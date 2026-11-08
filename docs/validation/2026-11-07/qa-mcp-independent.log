@@ -1,0 +1,123 @@
+CASE admission
+BINARY /workspace/scratch/823dd8bcb941/target-mcp/debug/deps/admission_control-116f1ac21b057907
+SHA256 6249a6f984c60445ef54504ea3453747f719d8cf42fdef3543f9e9f9273964bb
+
+running 14 tests
+test cancel_waiter_releases_queue_capacity_without_executing ... ok
+test deadline_also_covers_tokio_pool_queue ... ok
+test dropped_caller_aborts_tokio_pool_queued_closure ... ok
+test dropped_caller_does_not_release_running_worker_permit ... ok
+test dropped_waiter_releases_queue_capacity ... ok
+test explicit_cancel_detaches_started_work_but_keeps_permits ... ok
+test finite_fifo_queue_does_not_create_mutex_waiting_workers ... ok
+test maintenance_has_reserved_fifo_slot_and_no_start_deadline ... ok
+test maintenance_waiter_is_woken_by_shutdown ... ok
+test maintenance_waits_for_saturated_blocking_pool_without_expiring ... ok
+test panic_releases_both_permits_and_records_failure ... ok
+test queue_expiration_never_starts_stale_work ... ok
+test shutdown_cancels_waiters_and_prevents_new_admission ... ok
+test start_deadline_never_interrupts_a_running_operation ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+
+
+
+CASE current-notes-unit
+BINARY /workspace/scratch/823dd8bcb941/target-mcp/debug/deps/otzaria_mcp-77ee1bcbe8ae456b
+SHA256 f25a4c5c1047186efea4f2523409f87bf683b5b070feb4cf2818d6c9c1f998a0
+
+running 6 tests
+test current_notes_tests::compressed_notes_reach_range_and_link_responses ... ok
+test current_notes_tests::current_marker_takes_precedence_over_legacy_column ... ok
+test current_notes_tests::malformed_compressed_or_utf8_body_is_reported_not_dropped ... ok
+test current_notes_tests::malformed_current_marker_errors_and_releases_transaction ... ok
+test current_notes_tests::null_body_and_bad_index_follow_source_skip_rules ... ok
+test current_notes_tests::numeric_marker_and_compressed_notes_keep_order_and_visible_offsets ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 0.11s
+
+
+
+
+CASE current-notes-search
+BINARY /workspace/scratch/823dd8bcb941/target-mcp/debug/deps/current_notes_search-239ca7573fa58573
+SHA256 a72a51a0167e78e78759d70d4624dfb02592ce7c2b5e55756f9e76d02f9110a5
+
+running 1 test
+test get_text_retains_current_footnote_body_found_by_search ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+
+
+CASE existing-schema10
+BINARY /workspace/scratch/823dd8bcb941/target-mcp/debug/deps/existing_index-efcc80ff0c787a6d
+SHA256 f6e2a206a71e2e6a3c33f450254ca2c64ecf3b5d4433804b2b720626d972ad80
+
+running 1 test
+test mcp_reads_independently_built_schema10_index_without_changing_it ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+
+
+CASE library-reload
+BINARY /workspace/scratch/823dd8bcb941/target-mcp/debug/deps/library_reload-969134b1669efb9f
+SHA256 2ce8e250435d28c54552fcf1ac9ddc9914bded56b8f2b9911a3b1b5ca2547e83
+
+running 8 tests
+test changed_generation_while_waiting_is_discarded_then_current_generation_reopens ... ok
+test concurrent_refreshes_of_one_generation_open_it_once ... ok
+test concurrent_searches_and_atomic_db_index_replacement_publish_fresh_handles ... ok
+test empty_wal_and_sqlite_permission_touches_are_not_content_changes ... ok
+test incompatible_or_missing_index_keeps_database_tools_available ... ok
+test replacement_with_same_size_and_mtime_changes_identity ... ok
+test snapshot_mode_does_not_watch_wal_that_immutable_sqlite_ignores ... ok
+test wal_commit_and_checkpoint_are_observed_without_touching_main_db_first ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+
+
+
+CASE mcp-protocol-regressions
+BINARY /workspace/scratch/823dd8bcb941/target-mcp/debug/deps/mcp_admission_regression-c3ac58ebda8d0d25
+SHA256 971ab390483a5ea0ac96336b8dfaba101c483b0689531aa06750e41b28c59cd6
+
+running 3 tests
+test invalid_search_parameters_win_over_full_queue ... ok
+test mcp_responses_track_wal_metadata_without_reloading ... ok
+test watcher_refreshes_after_entering_a_full_search_queue ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.09s
+
+
+
+
+CASE reload-regressions
+BINARY /workspace/scratch/823dd8bcb941/target-mcp/debug/deps/reload_regression-6500311740f02bb1
+SHA256 e1a5ca6aaf855e0ab133b276b99e12979b3d8f83f68949d8d69a5a19659c4ce3
+
+running 3 tests
+test catalogue_and_generation_order_follow_the_app_mapping ... ok
+test refresh_same_path_closes_and_reopens_line_source ... ok
+test reopen_after_atomic_database_replacement_reads_new_text ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+
+
+
+CASE strict-search-contract
+BINARY /workspace/scratch/823dd8bcb941/target-mcp/debug/deps/shared_core_contract-c7338e8bb18d8377
+SHA256 3260172a6e0f6d15459c080bf8c05d98b16cc81afe9b54411a29f4db6cb19bb0
+
+running 1 test
+test preserves_mcp_search_contract ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+

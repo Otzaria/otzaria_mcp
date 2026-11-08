@@ -1,22 +1,10 @@
 [workspace]
 members = ["mcp"]
-# The vendored engine is a member too (a path dependency inside the workspace); plain
-# `cargo build` / `cargo test` / `cargo clippy` at the root act on the MCP crate only.
 default-members = ["mcp"]
 resolver = "2"
 
-# `search_engine` is VENDORED (not a submodule) at vendor/otzaria_search_engine —
-# the otzaria_search_engine rust crate (4.1.0 + merged stable-book-id support,
-# official commit 30e8f1682428d5cc252b3e610f2c9cc06c04b81f, index schema 7).
-# Matching the engine to the index is required: an older engine refuses a
-# newer index (`engine_too_old`) and a newer one may need a rebuild.
-# See vendor/otzaria_search_engine/VENDORED.md.
-
-# The engine's own `[patch.crates-io]` is ignored when it is a dependency, so the two
-# patches it relies on are repeated here, exactly as in its manifest:
-#  * tantivy-fst 0.5.0 with the regex-DFA STATE_LIMIT raised to 8192 (RegexPhraseQuery);
-#  * Otzaria's tantivy fork (0.26.2 + quickwit-oss/tantivy#3059, #3134–#3138, #3189–#3191)
-#    at the pinned rev.
+# Cargo applies patches only at the workspace root. The FST patch and core
+# dependency must use the same reviewed canonical engine revision.
 [patch.crates-io]
-tantivy-fst = { path = "vendor/otzaria_search_engine/rust/vendor/tantivy-fst" }
-tantivy = { git = "https://github.com/Otzaria/tantivy", rev = "8b8832069b871e11fe0fd0da1c4c2de8c270596f" }
+tantivy-fst = { git = "https://github.com/Otzaria/otzaria_search_engine", rev = "4bb3d8e7d11499861ce0655c88841eb23e0f1649" }
+tantivy = { git = "https://github.com/Otzaria/tantivy", rev = "130b2682807d2a609d09ba432ba4d0ccc8faf7ed" }

@@ -1,0 +1,59 @@
+{
+  "date": "2026-11-07",
+  "baseline": {
+    "head": "249ae4e2aa80734a7e0b1ed08dbf7a98dd3e608b",
+    "tree": "3bdb6192793bd254e1f66d9ee66c1c4697afa1df",
+    "tracked_changes_before": "",
+    "tracked_changes_after": "",
+    "lock_sha256_before": "4d0fc774183d7e6c97ad66ef9d346e7777c52004724df8761f11ff7707635b6f",
+    "lock_sha256_after": "4d0fc774183d7e6c97ad66ef9d346e7777c52004724df8761f11ff7707635b6f",
+    "target_directory": "target-mcp-baseline",
+    "fixture_sha256": "8152807d5d49fcf0350ec9eee97fc1d357fb6b1bd1b79d36a462e2be8ce1a6b2",
+    "benchmark_source_sha256": "f93bb0c8be43458500c3c496761d4cebeaf951bc3d38f7118de5ca39cdf6a9e7",
+    "benchmark_binary_sha256": "1a0b638738f0cfa1b34fa8f65b23625a3b317c1df406af571b69c013e8108bc1",
+    "contract_source_sha256": "e50a79e0ce1e3fd199d24e5920519d43985a6f1d8950c233669544a754873718",
+    "contract_binary_sha256": "b1b5d0bee77b411dd67872ed2f94fdfe72351ff4537bcacbd27d92cc5c1c2916"
+  },
+  "migrated": {
+    "base": "249ae4e2aa80734a7e0b1ed08dbf7a98dd3e608b",
+    "core_git_revision": "72a64d0289833e512edd89811fc4a1d634d79381",
+    "target_directory": "target-mcp",
+    "lock_sha256": "4bec81632c6ea7ed5964d53eb7695bb05ee524cafdb7d9bcf561b85c6b984c56",
+    "fixture_sha256": "8152807d5d49fcf0350ec9eee97fc1d357fb6b1bd1b79d36a462e2be8ce1a6b2",
+    "benchmark_source_sha256": "f93bb0c8be43458500c3c496761d4cebeaf951bc3d38f7118de5ca39cdf6a9e7",
+    "benchmark_binary_sha256": "2e7723b38b4c2bf20202fb1a2fd629c9aa1cc40f3948041e2b3c59c3222226a8",
+    "contract_source_sha256": "dfa03a8a3ee4926e7431f9db366b5f73c4c607f3c604ab26bf94bc38c3dbba83",
+    "contract_binary_sha256": "42affeb35ae64bce0540522406c7fe36dd1e3dcd5e5971d59d6f132252ba947c"
+  },
+  "toolchain": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.1\nLLVM version: 23.1.1",
+  "build_profile": "dev, debug=0, incremental=false; CARGO_BUILD_JOBS=3",
+  "process_order": [
+    "baseline-1",
+    "migrated-1",
+    "migrated-2",
+    "baseline-2",
+    "baseline-3",
+    "migrated-3"
+  ],
+  "measured_requests_per_process": 1700,
+  "warmup_requests_per_process": 85,
+  "total_hit_checksum_per_process": 5700,
+  "cpu_conditions": "No other agent compilation or benchmark was running during these six processes; shared host is not an isolated performance lab.",
+  "rss_scope": "Linux VmHWM for the entire process, including fixture indexing and warmup, not search-only memory.",
+  "limitations": "Three process pairs, tiny synthetic fixture, warm dev build, uncontended serialized search. No estimate of production search speed, full-library memory, or saturation queues.",
+  "golden_sha256": "8281246968cb24d8abf3721142ba9fd8653518ea5e7e2ef5b9916a15970a4ea4",
+  "artifacts": {
+    "baseline-1.json": "2d1faf356f19923241c68d437b3678005427167b00650a06dfd75d4a8482946c",
+    "baseline-1.log": "59f853ce1db5eb26d1193f331463daecc97b123cccb2a495f29cbb2a61cc5ea3",
+    "baseline-2.json": "922e6a98822f63c85e81956c09e4f3b5a4e71004eabef49e1e102f8d0fd05413",
+    "baseline-2.log": "ce17e9e34e33834a9ab3917f74f603365d0ed4d562488c05ddbdc2140cb1815c",
+    "baseline-3.json": "3058abb82eeede81312bf8c68b249eb6caaf04ea722d6d3a570db6dbc2f14dbb",
+    "baseline-3.log": "c3f6d2470f6c3eef1b0d08a2c89f633d8ec2f0cb31e9e97249e968c10665cb65",
+    "migrated-1.json": "fc93145d535b966b35bb7f9aca643e47d821521ec4a2f027d81b60681c63ae22",
+    "migrated-1.log": "f965d301894879d725cb0078dd1db287d535f04bac2d06c530fafd6593744c25",
+    "migrated-2.json": "281275f445caeac232199784e7ca85c52ef7810ede9f9fabcaa4baafeb442bc3",
+    "migrated-2.log": "d2da5d76e5e59647a33fbd48fd9b16e4f1b09b5609255379f0cd1185c51b9b41",
+    "migrated-3.json": "522c5f06db91a0288a6c825fa4ab6ea2d4d72640e3ee51e847ce603211268fe7",
+    "migrated-3.log": "05fc7a5c8dd40a6b9ee219eeb01b795b2334593e7ccb296827abe54e1772c193"
+  }
+}

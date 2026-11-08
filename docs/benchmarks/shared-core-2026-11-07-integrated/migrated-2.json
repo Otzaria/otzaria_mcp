@@ -1,0 +1,14 @@
+{
+  "build_profile": "dev",
+  "elapsed_s": 1.152227469,
+  "fixture": "17 deterministic scenarios / 15 indexed lines / sparse stable IDs",
+  "latency_p50_ms": 0.636298,
+  "latency_p95_ms": 1.1542919999999999,
+  "latency_p99_ms": 1.8323669999999999,
+  "peak_rss_kib": 32204,
+  "queue": "uncontended, serialized search; use admission_bench for queue behavior",
+  "requests": 1700,
+  "rss_scope": "whole process high-water mark, including fixture indexing and warmup",
+  "throughput_requests_per_s": 1475.4031176460348,
+  "total_hit_checksum": 5700
+}

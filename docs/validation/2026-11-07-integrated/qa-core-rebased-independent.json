@@ -1,0 +1,62 @@
+{
+  "source_commit": "60913c9be8960bae514225aea01c741c24161e3f",
+  "final_documentation_commit": "25d10734a9b834b7ffd17925c1c1d802fda66fe9",
+  "binary": "/workspace/scratch/823dd8bcb941/target-core-rebased/debug/deps/search_engine-2e41eed5f486eb35",
+  "binary_sha256": "0f53b9e00c6e465321959c0bb46b8ee7d5f13a187e6d175a10e6d74c5f9e118e",
+  "cargo_invoked": false,
+  "verified_committed_logs": [
+    "host-contracts",
+    "host-contracts-semantic-integration",
+    "term-scan-contracts",
+    "work-gate-contracts",
+    "cold-primer-concurrency",
+    "facade-clippy",
+    "formatting",
+    "diff-check"
+  ],
+  "preserved_validation_sha256": "bc8e9ef212b62a32e2fd2e73361f62144851008c341f7e135dd7c67da06bc2e5",
+  "checks": [
+    {
+      "filter": "term_automaton::tests",
+      "exit_code": 0,
+      "elapsed_s": 0.127179,
+      "counts": [
+        [
+          "ok",
+          "10",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "filter": "highlight_cache::tests",
+      "exit_code": 0,
+      "elapsed_s": 0.040574,
+      "counts": [
+        [
+          "ok",
+          "13",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "filter": "cold_any_order_search_on_rayon_finishes_while_highlight_primer_owns_term_work",
+      "exit_code": 0,
+      "elapsed_s": 0.397609,
+      "counts": [
+        [
+          "ok",
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    }
+  ],
+  "log": "/workspace/scratch/823dd8bcb941/recovery/qa-core-rebased-independent.log",
+  "log_sha256": "0797308885c952690db5e9cf3ccd12319014077c02caf2da2e4d74bd1e105f4c",
+  "total_passed": 24
+}

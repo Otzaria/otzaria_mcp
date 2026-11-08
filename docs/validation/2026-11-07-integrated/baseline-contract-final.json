@@ -1,0 +1,1029 @@
+{
+  "advanced_any_word": {
+    "book_counts": {
+      "id:42": 1,
+      "id:7": 1
+    },
+    "facet_counts": [
+      {
+        "count": 1,
+        "path": "/samples/a"
+      },
+      {
+        "count": 1,
+        "path": "/samples/b"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 4,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "שלום «בהיר» למרחוק מאוד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 7,
+          "file_path": "id:7",
+          "is_pdf": false,
+          "line_index": 2,
+          "page": null,
+          "reference": "כותרת אחרת",
+          "snippet": "דרך «ארוכה»",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שנייה"
+        }
+      ],
+      "mode": "advanced",
+      "returned": 2,
+      "total": 2,
+      "truncated": false
+    }
+  },
+  "advanced_distance": {
+    "book_counts": {
+      "id:42": 1,
+      "id:7": 1,
+      "id:93": 1
+    },
+    "facet_counts": [
+      {
+        "count": 2,
+        "path": "/samples/a"
+      },
+      {
+        "count": 1,
+        "path": "/samples/b"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 93,
+          "file_path": "id:93",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת שלישית",
+          "snippet": "«שלום» שלום «קובץ»",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שלישית"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 2,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» שלום שלום שלום «קובץ»",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 7,
+          "file_path": "id:7",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת אחרת",
+          "snippet": "«שלום» «קובץ» נוסף למבחן ארוך במיוחד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שנייה"
+        }
+      ],
+      "mode": "advanced",
+      "returned": 3,
+      "total": 3,
+      "truncated": false
+    }
+  },
+  "advanced_negative": {
+    "book_counts": {
+      "id:42": 2,
+      "id:7": 1,
+      "id:93": 1
+    },
+    "facet_counts": [
+      {
+        "count": 3,
+        "path": "/samples/a"
+      },
+      {
+        "count": 1,
+        "path": "/samples/b"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 93,
+          "file_path": "id:93",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת שלישית",
+          "snippet": "«שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שלישית"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 2,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» «שלום» «שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 4,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» בהיר למרחוק מאוד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 7,
+          "file_path": "id:7",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת אחרת",
+          "snippet": "«שלום» קובץ נוסף למבחן ארוך במיוחד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שנייה"
+        }
+      ],
+      "mode": "advanced",
+      "returned": 4,
+      "total": 4,
+      "truncated": false
+    }
+  },
+  "advanced_prefixes": {
+    "book_counts": {
+      "id:42": 1,
+      "id:7": 2
+    },
+    "facet_counts": [
+      {
+        "count": 1,
+        "path": "/samples/a"
+      },
+      {
+        "count": 2,
+        "path": "/samples/b"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 3,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "אבן «דרך»",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 7,
+          "file_path": "id:7",
+          "is_pdf": false,
+          "line_index": 2,
+          "page": null,
+          "reference": "כותרת אחרת",
+          "snippet": "«דרך» ארוכה",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שנייה"
+        },
+        {
+          "book_id": 7,
+          "file_path": "id:7",
+          "is_pdf": false,
+          "line_index": 4,
+          "page": null,
+          "reference": "כותרת אחרת",
+          "snippet": "«בדרך» קצרה",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שנייה"
+        }
+      ],
+      "mode": "advanced",
+      "returned": 3,
+      "total": 3,
+      "truncated": false
+    }
+  },
+  "cross_line": {
+    "book_counts": {
+      "id:42": 1
+    },
+    "facet_counts": [
+      {
+        "count": 1,
+        "path": "/samples/a"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 42,
+          "continues_to_next_line": true,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 5,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "סוף «חלון» / «חדש» בחיפוש",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        }
+      ],
+      "mode": "exact",
+      "returned": 1,
+      "total": 1,
+      "truncated": false
+    }
+  },
+  "exact_catalogue": {
+    "book_counts": {
+      "id:42": 3,
+      "id:7": 1,
+      "id:93": 1
+    },
+    "facet_counts": [
+      {
+        "count": 4,
+        "path": "/samples/a"
+      },
+      {
+        "count": 1,
+        "path": "/samples/b"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 93,
+          "file_path": "id:93",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת שלישית",
+          "snippet": "«שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שלישית"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» עולם",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 2,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» «שלום» «שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 4,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» בהיר למרחוק מאוד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 7,
+          "file_path": "id:7",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת אחרת",
+          "snippet": "«שלום» קובץ נוסף למבחן ארוך במיוחד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שנייה"
+        }
+      ],
+      "mode": "exact",
+      "returned": 5,
+      "total": 5,
+      "truncated": false
+    }
+  },
+  "exact_generation": {
+    "book_counts": {
+      "id:42": 3,
+      "id:7": 1,
+      "id:93": 1
+    },
+    "facet_counts": [
+      {
+        "count": 4,
+        "path": "/samples/a"
+      },
+      {
+        "count": 1,
+        "path": "/samples/b"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 7,
+          "file_path": "id:7",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת אחרת",
+          "snippet": "«שלום» קובץ נוסף למבחן ארוך במיוחד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שנייה"
+        },
+        {
+          "book_id": 93,
+          "file_path": "id:93",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת שלישית",
+          "snippet": "«שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שלישית"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» עולם",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 2,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» «שלום» «שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 4,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» בהיר למרחוק מאוד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        }
+      ],
+      "mode": "exact",
+      "returned": 5,
+      "total": 5,
+      "truncated": false
+    }
+  },
+  "exact_nikud": {
+    "book_counts": {
+      "id:42": 1
+    },
+    "facet_counts": [
+      {
+        "count": 1,
+        "path": "/samples/a"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 4,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שָׁלוֹם» בָּהִיר למרחוק מאוד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        }
+      ],
+      "mode": "exact",
+      "returned": 1,
+      "total": 1,
+      "truncated": false
+    }
+  },
+  "exact_page": {
+    "book_counts": {
+      "id:42": 3,
+      "id:7": 1,
+      "id:93": 1
+    },
+    "facet_counts": [
+      {
+        "count": 4,
+        "path": "/samples/a"
+      },
+      {
+        "count": 1,
+        "path": "/samples/b"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» עולם",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 2,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» «שלום» «שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        }
+      ],
+      "mode": "exact",
+      "returned": 2,
+      "total": 5,
+      "truncated": false
+    }
+  },
+  "exact_relevance": {
+    "book_counts": {
+      "id:42": 3,
+      "id:7": 1,
+      "id:93": 1
+    },
+    "facet_counts": [
+      {
+        "count": 4,
+        "path": "/samples/a"
+      },
+      {
+        "count": 1,
+        "path": "/samples/b"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» עולם",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 93,
+          "file_path": "id:93",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת שלישית",
+          "snippet": "«שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שלישית"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 4,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» בהיר למרחוק מאוד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 2,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» «שלום» «שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 7,
+          "file_path": "id:7",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת אחרת",
+          "snippet": "«שלום» קובץ נוסף למבחן ארוך במיוחד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שנייה"
+        }
+      ],
+      "mode": "exact",
+      "returned": 5,
+      "total": 5,
+      "truncated": false
+    }
+  },
+  "facet_filter": {
+    "book_counts": {
+      "id:42": 3,
+      "id:93": 1
+    },
+    "facet_counts": [
+      {
+        "count": 4,
+        "path": "/samples/a"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 93,
+          "file_path": "id:93",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת שלישית",
+          "snippet": "«שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שלישית"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» עולם",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 2,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» «שלום» «שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 4,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» בהיר למרחוק מאוד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        }
+      ],
+      "mode": "exact",
+      "returned": 4,
+      "total": 4,
+      "truncated": false
+    }
+  },
+  "fuzzy_exact": {
+    "book_counts": {
+      "id:42": 4,
+      "id:7": 1,
+      "id:93": 1
+    },
+    "facet_counts": [
+      {
+        "count": 5,
+        "path": "/samples/a"
+      },
+      {
+        "count": 1,
+        "path": "/samples/b"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 93,
+          "file_path": "id:93",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת שלישית",
+          "snippet": "«שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שלישית"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» «עולם»",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 2,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» «שלום» «שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 4,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» בהיר למרחוק מאוד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 5,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "סוף «חלון»",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 7,
+          "file_path": "id:7",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת אחרת",
+          "snippet": "«שלום» קובץ נוסף למבחן ארוך במיוחד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שנייה"
+        }
+      ],
+      "mode": "fuzzy",
+      "returned": 6,
+      "total": 6,
+      "truncated": false
+    }
+  },
+  "fuzzy_typo": {
+    "book_counts": {
+      "id:42": 3,
+      "id:7": 1,
+      "id:93": 1
+    },
+    "facet_counts": [
+      {
+        "count": 4,
+        "path": "/samples/a"
+      },
+      {
+        "count": 1,
+        "path": "/samples/b"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 93,
+          "file_path": "id:93",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת שלישית",
+          "snippet": "«שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שלישית"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» עולם",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 2,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» «שלום» «שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 4,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» בהיר למרחוק מאוד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 7,
+          "file_path": "id:7",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת אחרת",
+          "snippet": "«שלום» קובץ נוסף למבחן ארוך במיוחד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שנייה"
+        }
+      ],
+      "mode": "fuzzy",
+      "returned": 5,
+      "total": 5,
+      "truncated": false
+    }
+  },
+  "grouped_identical": {
+    "book_counts": {
+      "id:7": 1,
+      "id:93": 1
+    },
+    "facet_counts": [
+      {
+        "count": 1,
+        "path": "/samples/a"
+      },
+      {
+        "count": 1,
+        "path": "/samples/b"
+      }
+    ],
+    "response": {
+      "group_count": 2,
+      "hits": [
+        {
+          "book_id": 93,
+          "file_path": "id:93",
+          "is_pdf": false,
+          "line_index": 2,
+          "page": null,
+          "reference": "כותרת שלישית",
+          "snippet": "«בדיקה» «חוזרת»",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שלישית"
+        },
+        {
+          "book_id": 7,
+          "file_path": "id:7",
+          "is_pdf": false,
+          "line_index": 3,
+          "page": null,
+          "reference": "כותרת אחרת",
+          "snippet": "«בדיקה» «חוזרת»",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שנייה"
+        }
+      ],
+      "mode": "exact",
+      "returned": 2,
+      "total": 2,
+      "truncated": false
+    }
+  },
+  "grouped_section": {
+    "book_counts": {
+      "id:42": 3,
+      "id:7": 1,
+      "id:93": 1
+    },
+    "facet_counts": [
+      {
+        "count": 4,
+        "path": "/samples/a"
+      },
+      {
+        "count": 1,
+        "path": "/samples/b"
+      }
+    ],
+    "response": {
+      "group_count": 3,
+      "hits": [
+        {
+          "book_id": 93,
+          "file_path": "id:93",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת שלישית",
+          "snippet": "«שלום» «שלום» קובץ",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שלישית"
+        },
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 1,
+          "merged": [
+            {
+              "book_id": 42,
+              "line_index": 2,
+              "reference": "כותרת ראשונה",
+              "title": "דוגמה ראשונה"
+            },
+            {
+              "book_id": 42,
+              "line_index": 4,
+              "reference": "כותרת ראשונה",
+              "title": "דוגמה ראשונה"
+            }
+          ],
+          "merged_count": 3,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» עולם",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        },
+        {
+          "book_id": 7,
+          "file_path": "id:7",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת אחרת",
+          "snippet": "«שלום» קובץ נוסף למבחן ארוך במיוחד",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה שנייה"
+        }
+      ],
+      "mode": "exact",
+      "returned": 3,
+      "total": 5,
+      "truncated": false
+    }
+  },
+  "no_hits": {
+    "book_counts": {},
+    "facet_counts": [],
+    "response": {
+      "hits": [],
+      "mode": "exact",
+      "returned": 0,
+      "total": 0,
+      "truncated": false
+    }
+  },
+  "phrase": {
+    "book_counts": {
+      "id:42": 1
+    },
+    "facet_counts": [
+      {
+        "count": 1,
+        "path": "/samples/a"
+      }
+    ],
+    "response": {
+      "hits": [
+        {
+          "book_id": 42,
+          "file_path": "id:42",
+          "is_pdf": false,
+          "line_index": 1,
+          "page": null,
+          "reference": "כותרת ראשונה",
+          "snippet": "«שלום» «עולם»",
+          "source": "official",
+          "text_status": "ok",
+          "title": "דוגמה ראשונה"
+        }
+      ],
+      "mode": "exact",
+      "returned": 1,
+      "total": 1,
+      "truncated": false
+    }
+  }
+}

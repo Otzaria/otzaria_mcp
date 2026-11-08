@@ -1,0 +1,85 @@
+CASE core-read-only
+BINARY /workspace/scratch/823dd8bcb941/target/debug/deps/read_only-eb90706eb818600e
+SHA256 446de019fc38a7113a25ccc1284216d56fa987f9ba68806e154dd6a60dcaf5e7
+
+running 7 tests
+test concurrent_searches_and_external_order_changes_preserve_stable_ids ... ok
+test every_lexical_mutation_is_rejected_before_work_or_lock_acquisition ... ok
+test explicit_reader_refresh_observes_a_commit_and_invalidates_cached_counts ... ok
+test missing_or_incompatible_indexes_are_refused_without_creation_or_upgrade ... ok
+test opening_preserves_ids_order_snippets_and_every_index_file ... ok
+test read_only_handles_refuse_sidecar_mutation_even_without_an_enabled_backend ... ok
+test schema_11_read_only_search_retains_note_provenance_and_highlights ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+
+
+
+
+CASE core-existing-index
+BINARY /workspace/scratch/823dd8bcb941/target/debug/deps/existing_index-df8a5fd971a826b6
+SHA256 b2f09535942862dd8d62617e3b8392e0d206e4772c8c355c41908cbfd1201899
+
+running 2 tests
+test dropping_the_reader_allows_a_directory_replacement_and_reopen ... ok
+test reads_an_index_built_by_the_unmodified_canonical_7_0_1_engine ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+
+
+
+CASE core-writer-lifecycle
+BINARY /workspace/scratch/823dd8bcb941/target/debug/deps/writer_lifecycle-b7eb88ea83c6169f
+SHA256 a104e7928b95d6fa0caa60611b4a8e9f54ae6fb103ca6e29f1cc85a253009f25
+
+running 1 test
+test writer_close_and_read_only_are_independent_permanent_guards ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+
+
+
+CASE core-semantic-read-only
+BINARY /workspace/scratch/823dd8bcb941/target/debug/deps/read_only-0966621e68a04622
+SHA256 c197282f6474de724724d1973e293c46249d2e4a94dfeedb07d564b9d4b62789
+
+running 1 test
+test read_only_handles_refuse_sidecar_mutation_even_without_an_enabled_backend ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.07s
+
+
+
+
+CASE rayon-deadlock
+BINARY /workspace/scratch/823dd8bcb941/target/debug/deps/search_engine-2e41eed5f486eb35
+SHA256 b3ab0ffe903b613b53e4e7473ebc468484bf458a8b80c862f0a7eb33bc3e0537
+
+running 1 test
+test api::search_engine::search_concurrency_tests::cold_any_order_search_on_rayon_finishes_while_highlight_primer_owns_term_work ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 908 filtered out; finished in 0.26s
+
+
+
+
+CASE explicit-line-source-refresh
+BINARY /workspace/scratch/823dd8bcb941/target/debug/deps/search_engine-2e41eed5f486eb35
+SHA256 b3ab0ffe903b613b53e4e7473ebc468484bf458a8b80c862f0a7eb33bc3e0537
+
+running 8 tests
+test api::search_engine::tests::semantic_status_is_explicit_before_configuration ... ok
+test api::search_engine::tests::word_match_all_explicit_matches_default_behavior ... ok
+test display_highlight::tests::literal_pattern::optional_quotes_do_not_relax_explicit_quotes ... ok
+test indexing_buffers::tests::explicit_spool_directory_is_used_and_files_are_removed_on_drop ... ok
+test line_source::tests::explicit_refresh_rejects_empty_path_without_disturbing_the_source ... ok
+test line_source::tests::explicit_same_path_refresh_invalidates_scan_only_connections ... ok
+test note_spans::tests::only_explicit_complete_notes_and_markers_are_annotated ... ok
+test user_regex::tests::patterns_are_classified_by_explicit_whitespace ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 901 filtered out; finished in 0.70s
+
+
+[2026-11-07T18:03:16Z ERROR tantivy::reader] Error while loading searcher after commit was detected. LockFailure(IoError(Os { code: 2, kind: NotFound, message: "No such file or directory" }), None)

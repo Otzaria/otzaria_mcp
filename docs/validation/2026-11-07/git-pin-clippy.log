@@ -1,0 +1,8 @@
+    Checking tantivy-fst v0.5.0 (https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c)
+    Checking tantivy-sstable v0.7.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+    Checking tantivy-columnar v0.7.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+    Checking tantivy v0.26.2 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+    Checking search_engine v7.0.1 (https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c)
+    Checking otzaria-search-core v7.0.1 (https://github.com/Otzaria/otzaria_search_engine?rev=b22aab7c7addd845d69919272074d437408e5cbe#b22aab7c)
+    Checking otzaria-mcp v0.2.0 (/workspace/scratch/823dd8bcb941/mcp-migration/mcp)
+    Finished `dev` profile [unoptimized] target(s) in 8.97s

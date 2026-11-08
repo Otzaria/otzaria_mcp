@@ -79,11 +79,12 @@
 
 ### עדכון ספרייה חם (ביקורת #6)
 אוצריא יכולה להחליף את ה-DB והאינדקס בזמן שה-MCP רץ. השרת:
-- **fingerprint של snapshot** = שילוב mtime+גודל של שלושת הקבצים: `seforim.db`,
-  `index/meta.json`, `index/otzaria_index_meta.json` (מנטרים את **שניהם** — קיימים בפועל).
-  `schema_meta.db_version` לבדו לא מספיק — הוא גרסת-סכימה, לא זהות-תוכן.
-- בזיהוי שינוי: **debounce** (להמתין להתייצבות), בדיקת-תאימות של האינדקס, ואז **החלפת
-  DB+index כזוג תקין** מאחורי `RwLock` — לעולם לא לחבר DB חדש לאינדקס ישן. בלי להגיש state ישן.
+- **fingerprint של snapshot** = זהות, גודל וחותמות זמן של `seforim.db`, WAL גלוי,
+  `index/meta.json`, `index/otzaria_index_meta.json` וקובץ סדר הספרים.
+  `schema_meta.db_version` לבדו לא מספיק לזיהוי שינוי תוכן.
+- בזיהוי שינוי: המתנה להתייצבות, admission של חיפוש, בדיקת תאימות ופתיחה בעובד
+  חסימה. טביעת הקבצים נבדקת לפני ואחרי הפתיחה ואז הידיות מוחלפות מאחורי `RwLock`.
+  זו אינה עסקה בין המסד לאינדקס: טקסט שאינו תואם לאינדקס נשאר מסומן `stale`.
 
 ---
 
@@ -106,29 +107,20 @@
   `full_text_search`/`resolve_ref` מחזירים `line_index` תואם ל-`get_text`.
 - HTML: `content` הוא HTML גולמי; דגל `strip_html` (ברירת-מחדל: מנוקה) + snippet מנוקה.
 - שגיאות: מבנה אחיד (`code`,`message`) — book/line לא נמצאו, אינדקס לא תואם, query ריק.
-- כל תשובה כוללת `data_version` = **fingerprint של ה-snapshot** (hash של mtime+גודל של
-  `seforim.db`+`meta.json`+`otzaria_index_meta.json`), בנוסף ל-`schema_version` (=15) בנפרד.
+- כל תשובה כוללת `data_version` = טביעת קובצי ה־snapshot (סימן לשינוי, לא מזהה עסקה),
+  בנוסף ל־`schema_version` שנקרא מתוך מסד הנתונים בעובד החסימה.
 
 ---
 
 ## מבנה הריפו
-```
-otzaria_mcp/
-  Cargo.toml            # workspace root; [patch.crates-io]
-                        #   tantivy-fst = { path = "vendor/otzaria_search_engine/rust/vendor/tantivy-fst" }
-  .gitmodules           # vendor/otzaria_search_engine → github.com/Otzaria/otzaria_search_engine (commit מוצמד)
-  vendor/otzaria_search_engine/   # submodule (משתמשים ב-rust/)
-  mcp/
-    Cargo.toml          # rmcp, tokio, rusqlite(bundled), serde, serde_json, anyhow;
-                        #   search_engine = { path = "../vendor/otzaria_search_engine/rust" }
-    src/  main.rs · paths.rs · db.rs · refs.rs · search.rs · server.rs · reload.rs
-    tests/              # ראה "בדיקות"
-  fixtures/             # seforim.db זעיר + index זעיר לבדיקות
-  run-stdio.sh · README.md (עברית) · claude_desktop_config.json (דוגמה)
-```
-ה-`[patch.crates-io]` בשורש הכרחי (patch של תלות מתעלמים ממנו): tantivy-fst הוונדור מעלה
-`STATE_LIMIT` של DFA ל-8192, ש-RegexPhraseQuery מסתמך עליו. fallback אם ההצמדה מסתבכת:
-vendoring של קוד ה-crate + `vendor/tantivy-fst` פנימה.
+
+`mcp` הוא מתאם הפרוטוקול ותלוי ב־`otzaria-search-core` מהמאגר הקנוני,
+עם קומיט Git מדויק ו־lockfile. עץ המנוע המועתק הוסר. אותו מקור Rust נבנה
+עם מתאם FRB עבור Flutter, וללא runtime של FRB עבור השרת.
+
+ה־`[patch.crates-io]` בשורש נדרש כי Cargo מתעלם מ־patch בתלות.
+`tantivy-fst` מוצמד לאותו קומיט של הליבה, ו־Tantivy ל־fork המדויק שלה.
+ראו [מדריך המעבר, התאימות וסדר המיזוג](docs/SHARED_CORE_MIGRATION.md).
 
 ---
 
@@ -166,4 +158,5 @@ vendoring של קוד ה-crate + `vendor/tantivy-fst` פנימה.
 3. הגשר: לקחת hit, להריץ `get_text(bookId, offset=lineIndex, limit=1)` → הטקסט תואם ל-hit.
 4. `resolve_ref "בראשית א א"` → bookId+lineIndex; `get_text` שם מחזיר את הפסוק.
 5. `get_links` לשורת ספר-בסיס (למשל בראשית) → קישורים בסוגים נכונים; `get_book_info 1` → מטא מלא.
-6. עדכון-חם: להחליף DB/index תוך כדי ריצה → `data_version` מתעדכן, אין תוצאות ישנות.
+6. עדכון-חם: להחליף DB/index תוך כדי ריצה → `data_version` מתעדכן; תוצאות מטקסט
+   שאינו תואם לאינדקס מסומנות `stale` וללא הדגשה מטעה.

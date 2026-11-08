@@ -1,0 +1,126 @@
+{
+  "date": "2026-11-07",
+  "started_utc": "2026-11-07T21:11:19.553334+00:00",
+  "completed_utc": "2026-11-07T21:11:28.766717+00:00",
+  "baseline": {
+    "head": "249ae4e2aa80734a7e0b1ed08dbf7a98dd3e608b",
+    "tree": "3bdb6192793bd254e1f66d9ee66c1c4697afa1df",
+    "tracked_changes_before": "",
+    "tracked_changes_after": "",
+    "lock_sha256_before": "4d0fc774183d7e6c97ad66ef9d346e7777c52004724df8761f11ff7707635b6f",
+    "lock_sha256_after": "4d0fc774183d7e6c97ad66ef9d346e7777c52004724df8761f11ff7707635b6f",
+    "fixture_sha256": "8152807d5d49fcf0350ec9eee97fc1d357fb6b1bd1b79d36a462e2be8ce1a6b2",
+    "benchmark_source_sha256": "f93bb0c8be43458500c3c496761d4cebeaf951bc3d38f7118de5ca39cdf6a9e7",
+    "benchmark_binary_sha256": "1a0b638738f0cfa1b34fa8f65b23625a3b317c1df406af571b69c013e8108bc1",
+    "contract_binary_sha256": "b1b5d0bee77b411dd67872ed2f94fdfe72351ff4537bcacbd27d92cc5c1c2916",
+    "binary_origin": "Original isolated target-mcp-baseline binaries preserved byte-for-byte before cache removal; hashes equal the earlier benchmark provenance. No rebuild or tracked source/lock modification."
+  },
+  "migrated": {
+    "core_git_revision": "4761356749815d283ede41ef956c64b3dbffe048",
+    "core_tree": "34341d9cffd3348587f509e587593c1f67cf4eec",
+    "source_parent": "28a7a5597e62591d1ad22554b9b8296fdc328d03",
+    "changes_from_parent": "Only paired core/FST pin and the three Cargo.lock source entries affect the build; documentation/evidence changes are separate.",
+    "target_directory": "target-mcp",
+    "lock_sha256": "bad10100d61a1000cc3ffc554eda3973326d6822c7914ca5e6d206f2eef28424",
+    "fixture_sha256": "8152807d5d49fcf0350ec9eee97fc1d357fb6b1bd1b79d36a462e2be8ce1a6b2",
+    "benchmark_source_sha256": "f93bb0c8be43458500c3c496761d4cebeaf951bc3d38f7118de5ca39cdf6a9e7",
+    "benchmark_binary_sha256": "ede064ccf116daecc9f48bbbaf92b6920db9752011e31b6a5e0f7daf10a288d0",
+    "contract_binary_sha256": "e1b28f63eecbc87227464b8efcf5518a18db75079e5303de4dd4762234720e20",
+    "artifact_mapping": "../../validation/2026-11-07-integrated/example-artifacts.json",
+    "binary_origin": "Examples compiled by final-pin cargo test --locked -p otzaria-mcp; hashed artifacts and Cargo dependency-fingerprint chain resolve to clean4761356 checkout."
+  },
+  "build_profile": "dev/test examples, opt-level0, debug0, incrementalfalse; original build jobs3; rustc1.99.1",
+  "process_order": [
+    "baseline-1",
+    "migrated-1",
+    "migrated-2",
+    "baseline-2",
+    "baseline-3",
+    "migrated-3"
+  ],
+  "measured_requests_per_process": 1700,
+  "warmup_requests_per_process": 85,
+  "total_hit_checksum_per_process": 5700,
+  "environment": {
+    "TMPDIR_for_both_variants": "/dev/shm/otzaria-mcp-final-823dd8bcb941/tmp",
+    "temporary_filesystem": "tmpfs mounted at /dev/shm",
+    "reason": "Root filesystem ran out of space after final tests; both variants use the same tmpfs for fresh fixtures. This separate capture is not pooled with earlier disk-backed runs.",
+    "no_local_agent_compilation_during_measurements": true,
+    "process_checks": [
+      {
+        "at": "before contracts",
+        "active_rust_build_processes": []
+      },
+      {
+        "at": "before baseline-1",
+        "active_rust_build_processes": []
+      },
+      {
+        "at": "after baseline-1",
+        "active_rust_build_processes": []
+      },
+      {
+        "at": "before migrated-1",
+        "active_rust_build_processes": []
+      },
+      {
+        "at": "after migrated-1",
+        "active_rust_build_processes": []
+      },
+      {
+        "at": "before migrated-2",
+        "active_rust_build_processes": []
+      },
+      {
+        "at": "after migrated-2",
+        "active_rust_build_processes": []
+      },
+      {
+        "at": "before baseline-2",
+        "active_rust_build_processes": []
+      },
+      {
+        "at": "after baseline-2",
+        "active_rust_build_processes": []
+      },
+      {
+        "at": "before baseline-3",
+        "active_rust_build_processes": []
+      },
+      {
+        "at": "after baseline-3",
+        "active_rust_build_processes": []
+      },
+      {
+        "at": "before migrated-3",
+        "active_rust_build_processes": []
+      },
+      {
+        "at": "after migrated-3",
+        "active_rust_build_processes": []
+      }
+    ]
+  },
+  "rss_scope": "Linux VmHWM for the whole process, including fixture indexing and warmup; not search-only memory.",
+  "limitations": "Three pairs on a shared host, tiny15-line fixture, warm serialized/uncontended dev searches on tmpfs. No causal facade-speedup, real-library, release-build or queue-saturation claim.",
+  "contract_sha256": {
+    "baseline": "8281246968cb24d8abf3721142ba9fd8653518ea5e7e2ef5b9916a15970a4ea4",
+    "migrated": "8281246968cb24d8abf3721142ba9fd8653518ea5e7e2ef5b9916a15970a4ea4"
+  },
+  "golden_sha256": "8281246968cb24d8abf3721142ba9fd8653518ea5e7e2ef5b9916a15970a4ea4",
+  "artifacts": {
+    "baseline-1.json": "475e5e095e96517e8852fa3d89c228d46ddb0b3197d62156b7a8c78d3ab25e66",
+    "baseline-1.log": "4dff1410360c19419f5872c867cb0660fa474688ac607145206bd4f7cc2f9d77",
+    "baseline-2.json": "94c1d8964f2c71b0d1273090255bf97ea59c4a3199474c17ab17c9b166701ceb",
+    "baseline-2.log": "6d4a7ca2f73df5aded82087b8574b72f6bb2747fe2f5dd8a6c46d3a2a69f1471",
+    "baseline-3.json": "96d82c446ae5235c6225ee6dbe24ee35a2362898eaccb65ed235e136b87262c7",
+    "baseline-3.log": "e6c44628b4cf10f8aa0afee1cb888744ebb73f3bc0b23d1b46908beded185136",
+    "migrated-1.json": "75274356cc31c3fd5d7916c116b6d0f6c43abe77177f9007535e5233023dad09",
+    "migrated-1.log": "4b95b4fe410c6c9e5e9414887b08080a22c9d7a670cd9b5055a75380e82fa64c",
+    "migrated-2.json": "1ce6303014f4ad64854f378090483384d466757b1fec8de39e5efbbc2fbe993f",
+    "migrated-2.log": "7b9fd39166803eb99b9d201f991dc6a34eb56a7446c2613a0d2d9df1f2921b2a",
+    "migrated-3.json": "797203a76f6a82deef06c5c4f6863e57577e80e4abe07c71e37b7ff87e128ef3",
+    "migrated-3.log": "8661cd537b9cbe96d20bcea9d226d55bbb031e22a8ed4ceb1931428eb5e637ad",
+    "summary.json": "045fbc1c64ef5842408f2326cdc0b64f3c91957469a5af979da52d55b841f417"
+  }
+}

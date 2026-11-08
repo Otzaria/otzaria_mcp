@@ -1,0 +1,265 @@
+otzaria-search-core v7.0.1 (/workspace/scratch/823dd8bcb941/engine/rust/core)
+search_engine v7.0.1 (/workspace/scratch/823dd8bcb941/engine/rust)
+anyhow v1.0.104
+crc32fast v1.5.0
+cfg-if v1.0.4
+env_logger v0.11.11
+anstream v1.0.0
+anstyle v1.0.14
+anstyle-parse v1.0.0
+utf8parse v0.2.2
+anstyle-query v1.1.5
+colorchoice v1.0.5
+is_terminal_polyfill v1.70.2
+utf8parse v0.2.2
+anstyle v1.0.14
+env_filter v2.0.0
+log v0.4.33
+regex v1.13.1
+aho-corasick v1.1.4
+memchr v2.8.3
+memchr v2.8.3
+regex-automata v0.4.16
+aho-corasick v1.1.4 (*)
+memchr v2.8.3
+regex-syntax v0.8.11
+regex-syntax v0.8.11
+jiff v0.2.35
+jiff-core v0.1.0
+log v0.4.33
+flutter_rust_bridge_macros v2.13.0 (proc-macro)
+hex v0.4.3
+md-5 v0.10.6
+cfg-if v1.0.4
+digest v0.10.7
+block-buffer v0.10.4
+generic-array v0.14.7
+typenum v1.20.1
+crypto-common v0.1.7
+generic-array v0.14.7 (*)
+typenum v1.20.1
+proc-macro2 v1.0.107
+unicode-ident v1.0.24
+quote v1.0.47
+proc-macro2 v1.0.107 (*)
+syn v2.0.119
+proc-macro2 v1.0.107 (*)
+quote v1.0.47 (*)
+unicode-ident v1.0.24
+htmlescape v0.3.1
+log v0.4.33
+lru v0.12.5
+hashbrown v0.15.5
+allocator-api2 v0.2.21
+equivalent v1.0.2
+foldhash v0.1.5
+once_cell v1.21.4
+otzaria-semantic-search v0.1.0 (https://github.com/Otzaria/otzaria-semantic-search?rev=a79901ff1a34bc9d57b994b905de7ec9ad69bb7a#a79901ff)
+crc32fast v1.5.0 (*)
+log v0.4.33
+memmap2 v0.9.11
+libc v0.2.189
+serde v1.0.229
+serde_core v1.0.229
+serde_derive v1.0.229 (proc-macro)
+proc-macro2 v1.0.107 (*)
+quote v1.0.47 (*)
+syn v3.0.3
+proc-macro2 v1.0.107 (*)
+quote v1.0.47 (*)
+unicode-ident v1.0.24
+serde_json v1.0.151
+itoa v1.0.18
+memchr v2.8.3
+serde_core v1.0.229
+zmij v1.0.23
+sha2 v0.10.9
+cfg-if v1.0.4
+cpufeatures v0.2.17
+digest v0.10.7 (*)
+thiserror v2.0.19
+thiserror-impl v2.0.19 (proc-macro)
+proc-macro2 v1.0.107 (*)
+quote v1.0.47 (*)
+syn v3.0.3 (*)
+rayon v1.12.0
+either v1.17.0
+rayon-core v1.13.0
+crossbeam-deque v0.8.7
+crossbeam-epoch v0.9.20
+crossbeam-utils v0.8.22
+crossbeam-utils v0.8.22
+crossbeam-utils v0.8.22
+regex v1.13.1 (*)
+regex-automata v0.4.16 (*)
+regex-syntax v0.8.11
+rusqlite v0.32.1
+bitflags v2.13.1
+fallible-iterator v0.3.0
+fallible-streaming-iterator v0.1.9
+hashlink v0.9.1
+hashbrown v0.14.5
+ahash v0.8.12
+cfg-if v1.0.4
+once_cell v1.21.4
+zerocopy v0.8.55
+libsqlite3-sys v0.30.1
+smallvec v1.15.2
+serde v1.0.229 (*)
+serde_json v1.0.151 (*)
+sha2 v0.10.9 (*)
+tantivy v0.26.2 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+aho-corasick v1.1.4 (*)
+arc-swap v1.9.2
+rustversion v1.0.23 (proc-macro)
+base64 v0.22.1
+bitpacking v0.9.3
+crunchy v0.2.4
+bon v3.9.3
+bon-macros v3.9.3 (proc-macro)
+darling v0.23.0
+darling_core v0.23.0
+ident_case v1.0.1
+proc-macro2 v1.0.107 (*)
+quote v1.0.47 (*)
+strsim v0.11.1
+syn v2.0.119 (*)
+darling_macro v0.23.0 (proc-macro)
+darling_core v0.23.0 (*)
+quote v1.0.47 (*)
+syn v2.0.119 (*)
+ident_case v1.0.1
+prettyplease v0.2.37
+proc-macro2 v1.0.107 (*)
+syn v2.0.119 (*)
+proc-macro2 v1.0.107 (*)
+quote v1.0.47 (*)
+rustversion v1.0.23 (proc-macro)
+syn v2.0.119 (*)
+rustversion v1.0.23 (proc-macro)
+byteorder v1.5.0
+census v0.4.2
+crc32fast v1.5.0 (*)
+crossbeam-channel v0.5.16
+crossbeam-utils v0.8.22
+datasketches v0.2.0
+downcast-rs v2.0.2
+fastdivide v0.4.2
+fnv v1.0.7
+fs4 v0.13.1
+rustix v1.1.4
+bitflags v2.13.1
+linux-raw-sys v0.12.1
+htmlescape v0.3.1
+itertools v0.14.0
+either v1.17.0
+levenshtein_automata v0.2.1
+log v0.4.33
+lru v0.16.4
+hashbrown v0.16.1
+allocator-api2 v0.2.21
+equivalent v1.0.2
+foldhash v0.2.0
+lz4_flex v0.13.1
+measure_time v0.9.0
+log v0.4.33
+memmap2 v0.9.11 (*)
+once_cell v1.21.4
+oneshot v0.1.13
+rayon v1.12.0 (*)
+regex v1.13.1 (*)
+rustc-hash v2.1.3
+serde v1.0.229 (*)
+serde_json v1.0.151 (*)
+sketches-ddsketch v0.4.0
+serde v1.0.229 (*)
+smallvec v1.15.2
+tantivy-bitpacker v0.10.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+bitpacking v0.9.3 (*)
+tantivy-columnar v0.7.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+downcast-rs v2.0.2
+fastdivide v0.4.2
+itertools v0.14.0 (*)
+serde v1.0.229 (*)
+tantivy-bitpacker v0.10.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682) (*)
+tantivy-common v0.11.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+async-trait v0.1.91 (proc-macro)
+proc-macro2 v1.0.107 (*)
+quote v1.0.47 (*)
+syn v3.0.3 (*)
+byteorder v1.5.0
+ownedbytes v0.9.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+stable_deref_trait v1.2.1
+serde v1.0.229 (*)
+time v0.3.54
+deranged v0.5.8
+serde_core v1.0.229
+num-conv v0.2.2
+powerfmt v0.2.0
+serde_core v1.0.229
+time-core v0.1.9
+tantivy-sstable v0.7.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+futures-util v0.3.33
+futures-core v0.3.33
+futures-macro v0.3.33 (proc-macro)
+proc-macro2 v1.0.107 (*)
+quote v1.0.47 (*)
+syn v2.0.119 (*)
+futures-task v0.3.33
+pin-project-lite v0.2.17
+slab v0.4.12
+itertools v0.14.0 (*)
+tantivy-bitpacker v0.10.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682) (*)
+tantivy-common v0.11.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682) (*)
+tantivy-fst v0.5.0 (/workspace/scratch/823dd8bcb941/engine/rust/vendor/tantivy-fst)
+byteorder v1.5.0
+regex-syntax v0.8.11
+utf8-ranges v1.0.5
+zstd v0.13.3
+zstd-safe v7.2.4
+zstd-sys v2.0.16+zstd.1.5.7
+tantivy-stacker v0.7.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+murmurhash32 v0.3.1
+tantivy-common v0.11.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682) (*)
+tantivy-common v0.11.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682) (*)
+tantivy-fst v0.5.0 (/workspace/scratch/823dd8bcb941/engine/rust/vendor/tantivy-fst) (*)
+tantivy-query-grammar v0.26.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+fnv v1.0.7
+nom v7.1.3
+memchr v2.8.3
+minimal-lexical v0.2.1
+ordered-float v5.3.0
+num-traits v0.2.19
+serde v1.0.229 (*)
+serde_json v1.0.151 (*)
+tantivy-stacker v0.7.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682) (*)
+tantivy-tokenizer-api v0.7.0 (https://github.com/Otzaria/tantivy?rev=130b2682807d2a609d09ba432ba4d0ccc8faf7ed#130b2682)
+serde v1.0.229 (*)
+tempfile v3.27.0
+fastrand v2.5.0
+getrandom v0.4.3
+cfg-if v1.0.4
+libc v0.2.189
+once_cell v1.21.4
+rustix v1.1.4 (*)
+thiserror v2.0.19 (*)
+time v0.3.54 (*)
+typetag v0.2.23
+erased-serde v0.4.10
+serde_core v1.0.229
+typeid v1.0.3
+inventory v0.3.24
+once_cell v1.21.4
+serde v1.0.229 (*)
+typetag-impl v0.2.23 (proc-macro)
+proc-macro2 v1.0.107 (*)
+quote v1.0.47 (*)
+syn v3.0.3 (*)
+uuid v1.24.0
+getrandom v0.4.3 (*)
+serde_core v1.0.229
+zstd v0.13.3 (*)
+tantivy-fst v0.5.0 (/workspace/scratch/823dd8bcb941/engine/rust/vendor/tantivy-fst) (*)
+tempfile v3.27.0 (*)
+unicode-segmentation v1.13.3
+zstd v0.13.3 (*)

@@ -1,0 +1,132 @@
+{
+  "date": "2026-11-07",
+  "base": "249ae4e2aa80734a7e0b1ed08dbf7a98dd3e608b",
+  "mcp_source_parent": "28a7a5597e62591d1ad22554b9b8296fdc328d03",
+  "core_git_revision": "4761356749815d283ede41ef956c64b3dbffe048",
+  "core_tree": "34341d9cffd3348587f509e587593c1f67cf4eec",
+  "git_packages": [
+    {
+      "name": "otzaria-search-core",
+      "source": "git+https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#4761356749815d283ede41ef956c64b3dbffe048",
+      "manifest_path": "/workspace/scratch/823dd8bcb941/toolchains/cargo/git/checkouts/otzaria_search_engine-b11b23ab9c0aa6ad/4761356/rust/core/Cargo.toml"
+    },
+    {
+      "name": "search_engine",
+      "source": "git+https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#4761356749815d283ede41ef956c64b3dbffe048",
+      "manifest_path": "/workspace/scratch/823dd8bcb941/toolchains/cargo/git/checkouts/otzaria_search_engine-b11b23ab9c0aa6ad/4761356/rust/Cargo.toml"
+    },
+    {
+      "name": "tantivy-fst",
+      "source": "git+https://github.com/Otzaria/otzaria_search_engine?rev=4761356749815d283ede41ef956c64b3dbffe048#4761356749815d283ede41ef956c64b3dbffe048",
+      "manifest_path": "/workspace/scratch/823dd8bcb941/toolchains/cargo/git/checkouts/otzaria_search_engine-b11b23ab9c0aa6ad/4761356/rust/vendor/tantivy-fst/Cargo.toml"
+    }
+  ],
+  "substantive_tests_passed": 84,
+  "external_data_functions_early_returned": 9,
+  "commands": [
+    {
+      "command": "cargo test --locked -p otzaria-mcp",
+      "exit_code": 0,
+      "log": "git-pin-tests.log",
+      "target": "target-mcp",
+      "profile": "test/dev, debug0, incrementalfalse, jobs3"
+    },
+    {
+      "command": "cargo clippy --locked --offline -p otzaria-mcp --all-targets --no-deps -- -D warnings",
+      "exit_code": 0,
+      "log": "git-pin-clippy.log",
+      "target": "/dev/shm/otzaria-mcp-final-823dd8bcb941/clippy-target",
+      "profile": "fresh check-only target, debug0, incrementalfalse, jobs2"
+    },
+    {
+      "command": "cargo fmt -p otzaria-mcp --check",
+      "exit_code": 0,
+      "log": "git-pin-fmt.log"
+    },
+    {
+      "command": "cargo tree --locked --offline -p otzaria-mcp --edges normal --prefix none",
+      "exit_code": 0,
+      "log": "git-runtime-dependencies.txt"
+    },
+    {
+      "command": "cargo metadata --locked --offline --format-version 1",
+      "exit_code": 0,
+      "extracted_package_pins": "git-package-pins.json",
+      "warning": "Cargo could not save global last-use bookkeeping because the root filesystem was full; dependency resolution completed successfully."
+    }
+  ],
+  "final_contract_comparison": "Both final binary outputs exactly match the original17-scenario golden bytes; no normalization.",
+  "core_independent_qa": {
+    "tests_passed": 24,
+    "log": "qa-core-rebased-independent.log",
+    "source_and_binary_proof": "qa-core-rebased-independent.json"
+  },
+  "mcp_source_delta": "Only both core/FST manifest pins and three Cargo.lock source entries changed; adapter/test/fixture/example source is identical to parent28a7.",
+  "environment_limit": "Root filesystem filled after successful tests. Final Clippy target, evidence, commit checkout and common benchmark TMPDIR use /dev/shm; old source/evidence and baseline binary hashes were preserved.",
+  "benchmark_provenance": "../../benchmarks/shared-core-2026-11-07-integrated/provenance.json",
+  "source_sha256": {
+    "Cargo.toml": "59c0d269aca28f0cbce86edebb09a3c1bacf18ab6676a0955d7f38d47df42ea3",
+    "Cargo.lock": "bad10100d61a1000cc3ffc554eda3973326d6822c7914ca5e6d206f2eef28424",
+    "mcp/Cargo.toml": "0ca6243be9a512629b6177c60a4b9bd237c56074a5f1d2123a974a50f78fe9e6",
+    "mcp/src/admission.rs": "58611c6cc4c16acfc5d48bb81bc315391c25cd7226d4b2961d58f593e30cb7ad",
+    "mcp/src/current_notes_tests.rs": "029e1e6236aa7322923c58ae711415bcc5ead40a5881897f74bb7e2091355087",
+    "mcp/src/db.rs": "ea385c0268908ad5bb5a7f8a20fdd8f6cc896be599a89c42f6b0c369c5f4464d",
+    "mcp/src/fixture_tests.rs": "59f4c375e47e29ba390098bfca4e3b5d019cacacc8d304b4917598cf7f58ef23",
+    "mcp/src/lib.rs": "636aec62c2e85bc2ec2cf586a464c0209775062b01fbe4a45cc5459c4463661e",
+    "mcp/src/links.rs": "1899a24c7c59ba447f7eb330c6f8fda30bf2f343cd28cb4ea6c5036c48fe69b8",
+    "mcp/src/main.rs": "2c348974b35f35899e35df1eaece069048544c5559eb3002dbda452d8dd4f137",
+    "mcp/src/paths.rs": "35b4bd7a6e056ddae123f768c76586efc2c643bef395acf737dbbd47d72b0cee",
+    "mcp/src/refkey.rs": "a26efca6a7a77aeec25c316decf83b1fbcebcee06975347c349ccc4d594afe98",
+    "mcp/src/refs.rs": "68bd45baca5ad76edbe022939c1b48e81e710075588c8a4570f014d0e0efc8da",
+    "mcp/src/reload.rs": "3dbe1008c89061a8e1fe678bcce76b1596f29cb6ba292edd9793bc47b0233f91",
+    "mcp/src/schema7_tests.rs": "66f0a8d0cb537e55c558d2ad769122f56a7bebd95bfcf1c6c32f7657910a39f8",
+    "mcp/src/search.rs": "8a629d8d62b7df3c41320ad8eae3ba19ce5211092b3af5d6d8a01b78460829ad",
+    "mcp/src/server.rs": "8a652405e7ad79c882a424eeea46a61dfcf82ecb08552db5dc9a65729b6eae70",
+    "mcp/src/text.rs": "2a7ef19dc04e6face9315da88904bca5ac3d5f9ec3237ec6aaaf274a195a935a",
+    "mcp/tests/admission_control.rs": "2df3db549db228d1cbae16dd62d6b326ab1dcc117311ab247be98cf1517d693c",
+    "mcp/tests/current_notes_search.rs": "e15547b53381a34e1edbeb91f1647dcfac41b74d20ccd7e25cc47a40276558c6",
+    "mcp/tests/existing_index.rs": "1e515b87fe9a994fcd40e1318d65affc4aac4fbef437a6161129d9e47e9a364a",
+    "mcp/tests/library_reload.rs": "928b4d399ef96c6b7de8ca960d2d3f35d0c189cf2a4c23797f8c478379da179f",
+    "mcp/tests/mcp_admission_regression.rs": "85fda4ac37360c434ec8db3c41438fa48c79bf17cb67299a8f11f3995d393aef",
+    "mcp/tests/real_data.rs": "ad6c13c8423a39f7eeb22ca76c3251b9784334c8433ab67ba2a56bbc9b67dfe2",
+    "mcp/tests/reload_regression.rs": "b04fc7e090e09df70b4dd1718632a37ab54d2ebf07b4f0284279c163cde331d0",
+    "mcp/tests/shared_core_contract.rs": "06f29acdb0d506a07a50d9fb756e2cb1f64ad762b8d388b349545a0df2c36cf9",
+    "mcp/tests/support/search_contract.rs": "8152807d5d49fcf0350ec9eee97fc1d357fb6b1bd1b79d36a462e2be8ce1a6b2",
+    "mcp/examples/admission_bench.rs": "88b2b45148688a23e167c363e4cc416a9492d53cc352ed68d0a1f803d6fb9d5e",
+    "mcp/examples/search_benchmark.rs": "f93bb0c8be43458500c3c496761d4cebeaf951bc3d38f7118de5ca39cdf6a9e7",
+    "mcp/examples/search_contract.rs": "dfa03a8a3ee4926e7431f9db366b5f73c4c607f3c604ab26bf94bc38c3dbba83"
+  },
+  "evidence_sha256": {
+    "baseline-contract-final.json": "8281246968cb24d8abf3721142ba9fd8653518ea5e7e2ef5b9916a15970a4ea4",
+    "baseline-contract-final.log": "3db75eeea8606160b33c2a21013b539cd0b89219a1fc4b4d17c01bd7f4bc5cd7",
+    "engine-dependencies.d": "575288539077274b680efa76cce8cb2330eaf5a8d335b961f0ef06eb3a496b2c",
+    "engine-fingerprint.json": "d47baca6f39226721447dedf0fffff3f2cd3c99e0c357a28aa4e602203dc02db",
+    "engine-fingerprint.value": "2c8660e463a65a80b11bbfdd9c248d2ed082f38f55007ccc5aae89e9feb0e82d",
+    "example-artifacts.json": "719278934d23051c9ec0ee57260a13ad9eec9a0a0c1dd04d6ab31c33f500c092",
+    "facade-dependencies.d": "d993b98d03c9b8e2f7b317206bb26ccc1359161b838ab68164ac815c6506ce1c",
+    "facade-fingerprint.json": "f89a694046213c6d4e7c1d61d142095eac6b31da96c187810d4320f84ca460c3",
+    "facade-fingerprint.value": "376800bcdc10597f6296a6ff6d80502698162a09a944b1ee2250dcd4533a4c24",
+    "git-package-pins.json": "12d7a35adb4c6dc836cb99fcff7df17ed589aa6a44023817442c18649f8d42f4",
+    "git-pin-clippy.log": "7c45ed8843bbabef87add7115d01d9247f309dfe7ccea50ffbc80b4a62849c9d",
+    "git-pin-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "git-pin-lock-update.log": "55f1b8f9085b8929cb85923d104aabe9645b21813f10599b3dcd6eea58a45993",
+    "git-pin-tests.log": "b0087f0cccccf3fcbd2cf0dd655e6e7ef6a0a69047f05186ca0816d2626c83b2",
+    "git-runtime-dependencies.txt": "214df2f6b9c454be20e189e5d1ceeaee10d9c9e1ba65b36343315055b9af4303",
+    "mcp-library-fingerprint.json": "8c4b15b599edf1c0cb765bc7c6daa2f51521400e4a5b8277df7799456f06e3d2",
+    "mcp-library-fingerprint.value": "2cb615ecb7b182d37b4a065c7416c9d745fce3e62543a2278f28183845ac1d70",
+    "migrated-contract-final.json": "8281246968cb24d8abf3721142ba9fd8653518ea5e7e2ef5b9916a15970a4ea4",
+    "migrated-contract-final.log": "666b4022b7a2b15e674d08ca047932e7a625c49d96bca158de324abc572bec28",
+    "preserved-baseline-binaries.json": "41d52d35b73771d96ccf86e63dc2dde8a4b735658b6b3fbbb5d251ef4d1a0664",
+    "qa-core-rebased-independent.json": "5235b7e33f2f68b45e1941ca7481242d798b7300ac915c236776ddb22b141ee1",
+    "qa-core-rebased-independent.log": "0797308885c952690db5e9cf3ccd12319014077c02caf2da2e4d74bd1e105f4c",
+    "search_benchmark-fingerprint.json": "8b7ae7a2cc09859a871088d9de1483b2ceec2333616744d79d1e7c80e2721537",
+    "search_contract-fingerprint.json": "179031bfd752e8bb2ff26877cfa5d7836ec137b67e223b8a86c4c8094625f86b",
+    "qa-final-benchmark-audit.json": "145febd352d390f586fec9c522a891986db46ace180f6dfa79abe49ac3c4c62b"
+  },
+  "benchmark_independent_qa": {
+    "result": "PASS",
+    "report": "qa-final-benchmark-audit.json",
+    "artifact_hashes_verified": 13,
+    "summary_statistics_verified": 36
+  }
+}

@@ -1,0 +1,4 @@
+[2026-11-07T21:11:27Z INFO  search_engine::api::search_engine] add_text_book 'דוגמה ראשונה': 7 docs, 197 bytes in 1.440413ms (prepare 340.792µs, keys 287.184µs, enqueue 38.536µs)
+[2026-11-07T21:11:27Z INFO  search_engine::api::search_engine] add_text_book 'דוגמה שנייה': 5 docs, 146 bytes in 598.723µs (prepare 249.408µs, keys 226.013µs, enqueue 5.308µs)
+[2026-11-07T21:11:27Z INFO  search_engine::api::search_engine] add_text_book 'דוגמה שלישית': 3 docs, 81 bytes in 2.393028ms (prepare 2.145643ms, keys 113.507µs, enqueue 6.049µs)
+[2026-11-07T21:11:27Z INFO  search_engine::api::search_engine] commit: 16.018125ms (reader reload 521.519µs)
