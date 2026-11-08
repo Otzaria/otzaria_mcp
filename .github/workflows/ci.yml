@@ -46,6 +46,19 @@ jobs:
         # unset (CI has no library), so only the unit/fixture tests run here.
         run: cargo test --locked -p otzaria-mcp
 
+  # Test the MCP adapter and snapshot lifecycle on Windows, not only build it.
+  # The engine's Windows contracts run in its own CI; these tests cover the host
+  # wiring, UTF-8/SQLite paths, admission and portable close/reopen behavior.
+  test-windows:
+    name: MCP functional tests (windows-2022)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run MCP unit and fixture tests on Windows
+        run: cargo test --locked -p otzaria-mcp
+
   # ── Cross-platform release binaries ─────────────────────────────────────────
   build:
     name: build (${{ matrix.name }})
