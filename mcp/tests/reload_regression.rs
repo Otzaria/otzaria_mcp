@@ -142,6 +142,44 @@ fn refresh_same_path_closes_and_reopens_line_source() {
     assert!(line_source_status().open);
 }
 
+/// The engine's line-source connection is closed once searches go idle (and at once while
+/// the app is updating the database), and the next search reopens it.
+#[test]
+fn idle_sweep_releases_the_line_source_and_search_reopens_it() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("seforim.db");
+    make_db(&db, "שלום עולם");
+    let index_dir = tmp.path().join("index");
+    make_index(&db, &index_dir);
+
+    let search = Search::open(&index_dir, None, &db, None).unwrap();
+    let request = SearchRequest::new("שלום", Mode::Exact);
+    assert!(search.search(&request).unwrap().hits[0]
+        .snippet
+        .contains("עולם"));
+    assert!(line_source_status().open);
+
+    // used just now: kept
+    otzaria_mcp::idle::sweep(std::time::Duration::from_secs(60));
+    assert!(line_source_status().open);
+    // the app's update marker: released whatever the idle time
+    let marker = otzaria_mcp::idle::update_marker(&db);
+    std::fs::write(&marker, b"").unwrap();
+    otzaria_mcp::idle::sweep(std::time::Duration::from_secs(60));
+    assert!(!line_source_status().open);
+    std::fs::remove_file(&marker).unwrap();
+
+    let again = search.search(&request).unwrap();
+    assert_eq!(again.hits[0].text_status, "ok", "{again:?}");
+    assert!(line_source_status().open);
+    // idle: released
+    otzaria_mcp::idle::sweep(std::time::Duration::ZERO);
+    assert!(!line_source_status().open);
+    // nothing ran since: nothing to do
+    assert_eq!(otzaria_mcp::idle::sweep(std::time::Duration::ZERO), 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn reopen_after_atomic_database_replacement_reads_new_text() {
