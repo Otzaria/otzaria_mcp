@@ -12,16 +12,27 @@
 //! 3. **Line, heRef prefix**: otherwise the normalized address is matched against the book's
 //!    normalized `line.heRef`s (exact, else the first line it is a token-prefix of — this is
 //!    what resolves a daf/chapter-level reference like "ברכות ב." to its first line).
-//! 4. **TOC / alternate TOC** heading text ("בראשית נח", "פרשת לך לך").
+//! 4. **TOC / alternate TOC** heading text ("בראשית נח", "פרשת לך לך"), then the app's
+//!    token-by-token tree search (`crate::toc_search`). Every fitting heading is returned:
+//!    a multi-part book (ב"ח, טור) yields one candidate per part unless a part is named —
+//!    in the address ("ב"ח יו"ד קא") or by the alias itself ("טור יו"ד") — which then
+//!    restricts every step to that part.
 //! 5. **Dibbur hamatchil** (`line_dh`) — the address as the opening words of a comment.
 //! 6. Last resort: substring match on raw `line.heRef`.
+//!
+//! Citation forms: when steps 2-3 find nothing for the address
+//! as typed, they are retried with a cleaned address: unit markers dropped (`סי'`, `סע'`,
+//! `ס"ק`), marker-prefixed numbers reduced (`פ"ב ה"א` → `ב א`, `סק"ב` → `ב`), a Shulchan
+//! Aruch part name dropped after a nosei kelim (`מג"א או"ח שח ב`), and leading words of the
+//! book's own title dropped (`קצות החושן כח א`, where only `קצות` is an alias). A trailing
+//! `ד"ה <words>` then picks that dibbur's line inside the location found ("dibur_in_ref").
 //!
 //! Normalization strips nikud/te'amim and gershayim, turns Talmud amud markers `.`→" א"
 //! and `:`→" ב", and drops commas/maqaf — applied identically to the query and to names.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
@@ -29,6 +40,7 @@ use serde::Serialize;
 
 use crate::db::Caps;
 use crate::refkey;
+use crate::toc_search::{BookToc, TocCache};
 
 /// Normalize a reference/name for matching. Applied to book names, acronyms,
 /// `line.heRef`, and the user query alike.
@@ -91,6 +103,8 @@ pub struct RefIndex {
     book_meta: HashMap<i64, (bool, i64)>,
     /// Lazily built normalized heRef index for each requested book.
     line_cache: Mutex<HashMap<i64, BTreeMap<String, CachedLine>>>,
+    /// Lazily loaded TOC trees (the app's hierarchical TOC search).
+    toc: TocCache,
 }
 
 #[derive(Clone)]
@@ -158,6 +172,7 @@ impl RefIndex {
             book_title,
             book_meta,
             line_cache: Mutex::new(HashMap::new()),
+            toc: TocCache::default(),
         }
     }
 
@@ -188,6 +203,21 @@ impl RefIndex {
             }
         }
         out
+    }
+
+    /// Line indexes of every line whose normalized heRef equals or token-extends `canonical`.
+    fn lines_under(&self, conn: &Connection, book_id: i64, canonical: &str) -> Result<Vec<i64>> {
+        self.matching_line(conn, book_id, canonical)?; // fills the cache
+        let cache = self.line_cache.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(lines) = cache.get(&book_id) else {
+            return Ok(vec![]);
+        };
+        Ok(lines
+            .range(canonical.to_string()..)
+            .take_while(|(he_ref, _)| he_ref.starts_with(canonical))
+            .filter(|(he_ref, _)| starts_with_tokens(he_ref, canonical))
+            .map(|(_, line)| line.line_index)
+            .collect())
     }
 
     fn matching_line(
@@ -237,22 +267,31 @@ pub struct RefCandidate {
     pub book_title: String,
     pub line_index: i64,
     pub he_ref: Option<String>,
+    /// For a TOC match: the heading's path ("אורח חיים > סימן קא") — heading lines often
+    /// have no heRef, and in a multi-part book the path tells the parts apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toc_path: Option<String>,
     pub snippet: String,
     /// How the line was found: "exact" (canonical key / heRef equal to the query),
     /// "partial" (key with named parts omitted), "prefix" (first line under the
-    /// reference, e.g. a daf or chapter), "toc" (a TOC / alternate-TOC heading),
+    /// reference, e.g. a daf or chapter), "dibur_in_ref" (the `ד"ה` line inside the
+    /// location), "toc" (a TOC / alternate-TOC heading), "toc_partial" (the deepest
+    /// heading the rest of the address could not descend below),
     /// "dibur_hamatchil" (opening words of a comment), or "fallback" (heRef substring).
+    /// A reference that exists in several parts of one book ("ב\"ח קא": אורח חיים, יורה
+    /// דעה, אבן העזר, חושן משפט) yields one candidate per part.
     pub match_kind: &'static str,
 }
 
 fn kind_rank(kind: &str) -> u8 {
     match kind {
-        "exact" => 0,
+        "exact" | "dibur_in_ref" => 0,
         "partial" => 1,
         "prefix" => 2,
         "toc" => 3,
-        "dibur_hamatchil" => 4,
-        _ => 5,
+        "toc_partial" => 4,
+        "dibur_hamatchil" => 5,
+        _ => 6,
     }
 }
 
@@ -265,7 +304,9 @@ pub fn resolve(
     query: &str,
     limit: i64,
 ) -> Result<Vec<RefCandidate>> {
-    let expanded = refkey::expand_query_amud_marks(query.trim());
+    let (ref_part, dibbur) = split_dibbur(query.trim());
+    let expanded = refkey::expand_query_amud_marks(&ref_part);
+    let raw: Vec<&str> = expanded.split_whitespace().collect();
     let q_tokens: Vec<String> = normalize_ref(&expanded)
         .split_whitespace()
         .map(str::to_string)
@@ -288,48 +329,185 @@ pub fn resolve(
     }
 
     if book_ids.is_empty() {
-        return fallback_heref_like(conn, query, limit);
+        return fallback_heref_like(conn, &ref_part, limit);
     }
     // Base texts first, then catalogue order: the strongest candidates are tried first.
     book_ids.sort_by_key(|id| (!index.is_base(*id), index.order(*id), *id));
 
     let normalized_book = q_tokens[..consumed].join(" ");
-    let raw_address = raw_address_after_book(query.trim(), &normalized_book)
+    // The address as typed (range dashes, chapter:verse colons kept for refkey), with
+    // the dibbur hamatchil already split off.
+    let raw_address = raw_address_after_book(&ref_part, &normalized_book)
         .map(str::to_string)
         .unwrap_or_else(|| q_tokens[consumed..].join(" "));
-    let expanded_address = refkey::expand_query_amud_marks(&raw_address);
-    let address = normalize_ref(&expanded_address);
-    let key = refkey::build_ref_key(&raw_address);
+    let address = normalize_ref(&refkey::expand_query_amud_marks(&raw_address));
+    // The address with citation markers cleaned up, tried only when the typed one fails.
+    let cleaned = raw_rest(&raw, consumed)
+        .map(|rest| normalize_ref(&clean_address(&rest).join(" ")))
+        .unwrap_or_else(|| address.clone());
+    let cleaned = drop_leading(&cleaned, |t| PART_NAMES.contains(&t));
+    // The address for the TOC search: unit markers dropped, part names KEPT ("יו"ד קא").
+    let toc_tokens: Vec<String> = raw_rest(&raw, consumed)
+        .map(|rest| normalize_ref(&clean_address(&rest).join(" ")))
+        .unwrap_or_else(|| address.clone())
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let name_tokens: Vec<String> = q_tokens[..consumed].to_vec();
     let mut out: Vec<RefCandidate> = Vec::new();
 
     for bid in book_ids.iter().copied().take(60) {
         let title = index.title(bid);
-        // heRefs rarely spell locator words ("פרק", "עמוד" from ע"א …): retry the
-        // heRef match with the canonical key's tokens when they differ.
-        let key_address = key.clone().filter(|k| *k != address);
-        let found = if let Some(c) = by_line_ref(conn, caps, bid, key.as_deref())? {
-            Some(c)
-        } else if let Some(c) = by_heref(conn, index, bid, &address)? {
-            Some(c)
-        } else if let Some(c) = match &key_address {
-            Some(k) => by_heref(conn, index, bid, k)?,
-            None => None,
-        } {
-            Some(c)
-        } else if !address.is_empty() {
-            match by_toc(conn, caps, bid, &raw_address)? {
-                Some(c) => Some(c),
-                None => by_dibur(conn, caps, bid, &address)?,
-            }
+        let book_href = index.book_heref.get(&bid).cloned().unwrap_or_default();
+        let own_words: Vec<String> = normalize_ref(&format!("{title} {book_href}"))
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let without_title = drop_leading(&cleaned, |t| own_words.iter().any(|w| w == t));
+
+        // A part of the book named by the alias itself ("טור יו"ד" → "יו"ד"), or by the
+        // first word of the address ("ב"ח יו"ד קא"), spelled out as the heRefs spell it.
+        let section = acronym_section_tokens(&name_tokens, &own_words);
+        let lead_part = toc_tokens.first().filter(|t| may_name_a_part(t)).cloned();
+        let toc: Option<Arc<BookToc>> = if !section.is_empty() || lead_part.is_some() {
+            index.toc.get(conn, bid).ok()
         } else {
             None
         };
-        if let Some((line_index, he_ref, kind)) = found {
+        let mut part_words: Option<Vec<String>> = None;
+        let mut spelled: Vec<String> = Vec::new();
+        if let Some(toc) = &toc {
+            if let Some(sp) = toc.spell_part(&section) {
+                spelled.push(join_nonempty(&sp.join(" "), &cleaned));
+                part_words = Some(sp);
+            } else if let Some(first) = &lead_part {
+                if let Some(sp) = toc.spell_part(std::slice::from_ref(first)) {
+                    spelled.push(join_nonempty(&sp.join(" "), &toc_tokens[1..].join(" ")));
+                    part_words = Some(sp);
+                }
+            }
+        }
+
+        // (address to match heRefs with, text the canonical key is built from): the typed
+        // address keys off its raw form, so ranges and contextual ע"א/ע"ב survive. A
+        // spelled-out part comes first: the key with the part beats the one without it.
+        let mut variants: Vec<(&str, &str)> = Vec::new();
+        for v in &spelled {
+            variants.push((v.as_str(), v.as_str()));
+        }
+        if !variants.iter().any(|(a, _)| *a == address) {
+            variants.push((address.as_str(), raw_address.as_str()));
+        }
+        for v in [cleaned.as_str(), without_title.as_str()] {
+            // A cleanup that leaves nothing would just point at the book's start.
+            if !variants.iter().any(|(a, _)| *a == v) && (!v.is_empty() || address.is_empty()) {
+                variants.push((v, v));
+            }
+        }
+
+        let mut found: Vec<(i64, Option<String>, &'static str)> = Vec::new();
+        let mut used = address.as_str();
+        for (vi, (v, key_source)) in variants.iter().enumerate() {
+            let key = refkey::build_ref_key(key_source);
+            if let Some(h) = by_line_ref(conn, caps, bid, key.as_deref())? {
+                // a part was named: a hit in another part is not this reference
+                if part_words.as_ref().is_none_or(|p| in_part(&h.1, p)) {
+                    found.push(h);
+                    used = v;
+                    break;
+                }
+            }
+            // The key with the part's name omitted ("טור שט ג"): one candidate per part
+            // (a single number names a heading, not a line: "ב"ח קא" goes to the TOC).
+            if let Some(k) = key
+                .as_deref()
+                .filter(|k| vi >= spelled.len() && refkey::ref_key_tokens(k).len() >= 2)
+            {
+                let mut hits = by_partial_line_ref(conn, caps, bid, k)?;
+                if let Some(p) = &part_words {
+                    hits.retain(|h| in_part(&h.1, p));
+                }
+                if !hits.is_empty() {
+                    found = hits;
+                    used = v;
+                    break;
+                }
+            }
+            // heRefs rarely spell locator words ("פרק", "עמוד" from ע"א …): retry the
+            // heRef match with the canonical key's tokens when they differ.
+            let key_address = key.clone().filter(|k| k != v);
+            let hit = match by_heref(conn, index, bid, v)? {
+                Some(c) => Some(c),
+                None => match &key_address {
+                    Some(k) => by_heref(conn, index, bid, k)?,
+                    None => None,
+                },
+            };
+            if let Some(h) = hit {
+                if part_words.as_ref().is_none_or(|p| in_part(&h.1, p)) {
+                    found.push(h);
+                    used = v;
+                    break;
+                }
+            }
+        }
+        if found.is_empty() && !address.is_empty() {
+            let (hits, complete) = by_toc_tree(
+                conn,
+                caps,
+                index,
+                bid,
+                toc.clone(),
+                &section,
+                part_words.as_deref(),
+                &toc_tokens,
+                &raw_address,
+            )?;
+            // a heading reached by part of the address only yields to a dibbur hamatchil
+            if complete && !hits.is_empty() {
+                found = hits;
+            } else if let Some(c) = by_dibur(conn, caps, bid, &address)? {
+                found.push(c);
+            } else {
+                found = hits;
+            }
+        }
+        if let Some(dh) = &dibbur {
+            for f in found.iter_mut() {
+                let d = match f.2 {
+                    "dibur_hamatchil" => None,
+                    // a heading: the dibbur anywhere in its section ("ב"ח קא ד"ה …")
+                    "toc" | "toc_partial" => {
+                        let toc = index.toc.get(conn, bid)?;
+                        let hi = toc.section_end(f.0).unwrap_or(i64::MAX);
+                        dibur_in_lines(conn, caps, bid, f.0, hi, dh)?
+                    }
+                    _ => dibur_in_ref(conn, caps, index, bid, used, f.0, dh)?,
+                };
+                if let Some(d) = d {
+                    *f = d;
+                }
+            }
+            // where the dibbur was found, the locations without it are not the reference
+            if found.iter().any(|f| f.2 == "dibur_in_ref") {
+                found.retain(|f| f.2 == "dibur_in_ref");
+            }
+        }
+        let toc = if found.iter().any(|f| f.2.starts_with("toc")) {
+            index.toc.get(conn, bid).ok()
+        } else {
+            None
+        };
+        for (line_index, he_ref, kind) in found {
             out.push(RefCandidate {
                 book_id: bid,
-                book_title: title,
+                book_title: title.clone(),
                 line_index,
                 he_ref,
+                toc_path: toc
+                    .as_ref()
+                    .filter(|_| kind.starts_with("toc"))
+                    .and_then(|t| t.heading_path(line_index)),
                 snippet: String::new(),
                 match_kind: kind,
             });
@@ -337,7 +515,7 @@ pub fn resolve(
     }
 
     if out.is_empty() {
-        return fallback_heref_like(conn, query, limit);
+        return fallback_heref_like(conn, &ref_part, limit);
     }
 
     // Rank: best match kind first; base texts before commentaries; then catalogue order.
@@ -347,41 +525,77 @@ pub fn resolve(
             !index.is_base(c.book_id),
             index.order(c.book_id),
             c.book_id,
+            c.line_index,
         )
     });
     out.truncate(limit.max(1) as usize);
     Ok(out)
 }
 
-type Found = Option<(i64, Option<String>, &'static str)>;
+/// (line index, heRef, match kind).
+type Hit = (i64, Option<String>, &'static str);
+type Found = Option<Hit>;
 
-/// Canonical key → `line_ref` (full key, then the partial key).
+/// Canonical key → `line_ref` (the full key).
 fn by_line_ref(conn: &Connection, caps: &Caps, book_id: i64, key: Option<&str>) -> Result<Found> {
     let Some(key) = key else { return Ok(None) };
     if !caps.line_ref {
         return Ok(None);
     }
-    for (k, kind) in [
-        (key.to_string(), "exact"),
-        (
-            format!("{} {key}", refkey::PARTIAL_REF_KEY_MARKER),
-            "partial",
-        ),
-    ] {
-        let row: Option<(i64, Option<String>)> = conn
-            .query_row(
-                "SELECT lr.lineIndex, l.heRef FROM line_ref lr \
-                   JOIN line l ON l.bookId = lr.bookId AND l.lineIndex = lr.lineIndex \
-                  WHERE lr.bookId = ?1 AND lr.refKeyHash = ?2 ORDER BY lr.lineIndex LIMIT 1",
-                rusqlite::params![book_id, refkey::ref_key_hash(&k)],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        if let Some((li, he_ref)) = row {
-            return Ok(Some((li, he_ref, kind)));
+    let row: Option<(i64, Option<String>)> = conn
+        .query_row(
+            "SELECT lr.lineIndex, l.heRef FROM line_ref lr \
+               JOIN line l ON l.bookId = lr.bookId AND l.lineIndex = lr.lineIndex \
+              WHERE lr.bookId = ?1 AND lr.refKeyHash = ?2 ORDER BY lr.lineIndex LIMIT 1",
+            rusqlite::params![book_id, refkey::ref_key_hash(key)],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(li, he_ref)| (li, he_ref, "exact")))
+}
+
+/// The partial key (named parts of the heRef omitted): every part of the book in which the
+/// reference exists, one line each — the app's `resolvePartialRefKeyInBooks` (the part is
+/// the heRef before the key's tokens; first line per part).
+fn by_partial_line_ref(
+    conn: &Connection,
+    caps: &Caps,
+    book_id: i64,
+    key: &str,
+) -> Result<Vec<(i64, Option<String>, &'static str)>> {
+    if !caps.line_ref {
+        return Ok(vec![]);
+    }
+    let partial = format!("{} {key}", refkey::PARTIAL_REF_KEY_MARKER);
+    let mut stmt = conn.prepare(
+        "SELECT lr.lineIndex, l.heRef FROM line_ref lr \
+           JOIN line l ON l.bookId = lr.bookId AND l.lineIndex = lr.lineIndex \
+          WHERE lr.bookId = ?1 AND lr.refKeyHash = ?2 ORDER BY lr.lineIndex",
+    )?;
+    let key_tokens = refkey::ref_key_tokens(key);
+    let mut seen_parts = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in stmt.query_map(
+        rusqlite::params![book_id, refkey::ref_key_hash(&partial)],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
+    )? {
+        let (li, he_ref) = row?;
+        let Some(h) = &he_ref else { continue };
+        let tokens = refkey::ref_key_tokens(h);
+        // the omitted part is what precedes the key in the heRef; a heRef not ending
+        // with the key (a range's start, say) counts as one unnamed part
+        let part = if tokens.len() >= key_tokens.len()
+            && tokens[tokens.len() - key_tokens.len()..] == key_tokens[..]
+        {
+            tokens[..tokens.len() - key_tokens.len()].join(" ")
+        } else {
+            String::new()
+        };
+        if seen_parts.insert(part) {
+            out.push((li, he_ref, "partial"));
         }
     }
-    Ok(None)
+    Ok(out)
 }
 
 /// Normalized heRef: exact, else the first line the address is a token-prefix of.
@@ -403,11 +617,17 @@ fn by_heref(conn: &Connection, index: &RefIndex, book_id: i64, address: &str) ->
     Ok(Some((line.line_index, Some(line.he_ref), kind)))
 }
 
-/// A TOC or alternate-TOC heading whose normalized text equals the address (locator
-/// words such as "פרק"/"סימן" ignored on both sides, as in the canonical key).
-fn by_toc(conn: &Connection, caps: &Caps, book_id: i64, address: &str) -> Result<Found> {
+/// Every TOC or alternate-TOC heading whose normalized text equals the address (locator
+/// words such as "פרק"/"סימן" ignored on both sides, as in the canonical key) — one per
+/// part when a multi-part book repeats the heading.
+fn by_toc_key(
+    conn: &Connection,
+    caps: &Caps,
+    book_id: i64,
+    address: &str,
+) -> Result<Vec<(i64, Option<String>, &'static str)>> {
     let Some(want) = refkey::build_ref_key(address) else {
-        return Ok(None);
+        return Ok(vec![]);
     };
     let strip_parasha = |k: &str| k.strip_prefix("פרשת ").unwrap_or(k).to_string();
     let want = strip_parasha(&want);
@@ -424,7 +644,7 @@ fn by_toc(conn: &Connection, caps: &Caps, book_id: i64, address: &str) -> Result
         );
     }
     let mut stmt = conn.prepare(&sql)?;
-    let mut best: Found = None;
+    let mut hits: BTreeMap<i64, Option<String>> = BTreeMap::new();
     for row in stmt.query_map([book_id], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -436,11 +656,111 @@ fn by_toc(conn: &Connection, caps: &Caps, book_id: i64, address: &str) -> Result
         let Some(k) = refkey::build_ref_key(&crate::text::strip_html_tags(&text)) else {
             continue;
         };
-        if strip_parasha(&k) == want && best.as_ref().is_none_or(|b| li < b.0) {
-            best = Some((li, he_ref, "toc"));
+        if strip_parasha(&k) == want {
+            hits.entry(li).or_insert(he_ref);
         }
     }
-    Ok(best)
+    Ok(hits.into_iter().map(|(li, h)| (li, h, "toc")).collect())
+}
+
+/// TOC lookup, as the app does it: the book's part named by the alias first
+/// ("טור יו"ד" + "קא"), then a heading equal to the address, then the token-by-token tree
+/// search (part abbreviations, transpositions, flat fallback). Returns every heading that
+/// fits, and whether the whole address was matched (else they are "toc_partial").
+#[allow(clippy::too_many_arguments)]
+fn by_toc_tree(
+    conn: &Connection,
+    caps: &Caps,
+    index: &RefIndex,
+    book_id: i64,
+    toc: Option<Arc<BookToc>>,
+    section: &[String],
+    part_words: Option<&[String]>,
+    toc_tokens: &[String],
+    raw_address: &str,
+) -> Result<(Vec<Hit>, bool)> {
+    let toc = match toc {
+        Some(t) => t,
+        None => index.toc.get(conn, book_id)?,
+    };
+    let collect = |hits: &[usize], complete: bool| -> Vec<(i64, Option<String>, &'static str)> {
+        let kind = if complete { "toc" } else { "toc_partial" };
+        let mut seen = std::collections::HashSet::new();
+        hits.iter()
+            .map(|&i| &toc.nodes[i])
+            .filter(|n| seen.insert(n.line_index))
+            .map(|n| (n.line_index, n.he_ref.clone(), kind))
+            .collect()
+    };
+    if !section.is_empty() {
+        let tokens: Vec<String> = section.iter().chain(toc_tokens).cloned().collect();
+        let (hits, complete) = toc.search(&tokens);
+        if complete && !hits.is_empty() {
+            return Ok((collect(&hits, true), true));
+        }
+    }
+    let mut by_key = by_toc_key(conn, caps, book_id, raw_address)?;
+    if let Some(p) = part_words {
+        by_key.retain(|h| in_part(&h.1, p));
+    }
+    if !by_key.is_empty() {
+        return Ok((by_key, true));
+    }
+    let (mut hits, complete) = toc.search(toc_tokens);
+    if let Some(p) = part_words {
+        hits.retain(|&i| in_part(&toc.nodes[i].he_ref, p));
+    }
+    Ok((collect(&hits, complete), complete))
+}
+
+/// The heRef lies in the named part ("ב\"ח, יורה דעה, קא" in ["יורה", "דעה"]).
+fn in_part(he_ref: &Option<String>, part: &[String]) -> bool {
+    let Some(h) = he_ref else { return false };
+    let h = format!(" {} ", normalize_ref(h));
+    h.contains(&format!(" {} ", part.join(" ")))
+}
+
+/// The tail of the book name (as typed) that is not part of the book's title — an
+/// alias carrying the part ("טור יו\"ד" → ["יוד"]). The app's `_acronymSectionTokens`.
+/// Empty when the whole name is foreign to the title (a plain acronym) — then a last word
+/// that looks like a part abbreviation ("ערוה\"ש יו\"ד") is the part.
+fn acronym_section_tokens(name: &[String], own_words: &[String]) -> Vec<String> {
+    let in_title = |t: &str| {
+        own_words.iter().any(|w| {
+            w == t
+                || t.strip_prefix(['ה', 'ו']).is_some_and(|s| s == w)
+                || w.strip_prefix(['ה', 'ו']).is_some_and(|s| s == t)
+        })
+    };
+    let mut i = name.len();
+    while i > 0 && !in_title(&name[i - 1]) {
+        i -= 1;
+    }
+    if i > 0 {
+        return name[i..].to_vec();
+    }
+    match name.last() {
+        Some(last) if name.len() >= 2 && may_name_a_part(last) => vec![last.clone()],
+        _ => vec![],
+    }
+}
+
+/// A token that may abbreviate a part's name ("יוד", "אוח", "אהע", "חומ"): 3–4 letters,
+/// not a number, not a locator word.
+fn may_name_a_part(t: &str) -> bool {
+    let n = t.chars().count();
+    (3..=4).contains(&n)
+        && t.chars().all(|c| ('\u{05D0}'..='\u{05EA}').contains(&c))
+        && !refkey::is_hebrew_numeral(t)
+        && !MARKER_WORDS.contains(&t)
+}
+
+fn join_nonempty(a: &str, b: &str) -> String {
+    match (a.is_empty(), b.is_empty()) {
+        (_, true) => a.to_string(),
+        (true, false) => b.to_string(),
+        _ => format!("{a} {b}"),
+    }
 }
 
 /// The address as the opening words of a comment (`line_dh.dhText`, normalized without
@@ -462,6 +782,165 @@ fn by_dibur(conn: &Connection, caps: &Caps, book_id: i64, address: &str) -> Resu
     Ok(row.map(|(li, he_ref)| (li, he_ref, "dibur_hamatchil")))
 }
 
+/// The first `ד"ה <words>` line in `lo..=hi` (a heading's section).
+fn dibur_in_lines(
+    conn: &Connection,
+    caps: &Caps,
+    book_id: i64,
+    lo: i64,
+    hi: i64,
+    dibbur: &str,
+) -> Result<Found> {
+    if !caps.line_dh || dibbur.chars().count() < 2 {
+        return Ok(None);
+    }
+    let row: Option<(i64, Option<String>)> = conn
+        .query_row(
+            "SELECT d.lineIndex, l.heRef FROM line_dh d \
+               JOIN line l ON l.bookId = d.bookId AND l.lineIndex = d.lineIndex \
+              WHERE d.bookId = ?1 AND d.lineIndex BETWEEN ?2 AND ?3 \
+                AND d.dhText >= ?4 AND d.dhText < ?4 || char(1114111) \
+              ORDER BY d.lineIndex LIMIT 1",
+            rusqlite::params![book_id, lo, hi, dibbur],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(li, he_ref)| (li, he_ref, "dibur_in_ref")))
+}
+
+/// The `ד"ה <words>` line inside the location found for `address` (the lines whose heRef
+/// the address is a prefix of; the found line itself when it has none below it).
+fn dibur_in_ref(
+    conn: &Connection,
+    caps: &Caps,
+    index: &RefIndex,
+    book_id: i64,
+    address: &str,
+    found_line: i64,
+    dibbur: &str,
+) -> Result<Found> {
+    if !caps.line_dh || dibbur.chars().count() < 2 {
+        return Ok(None);
+    }
+    let book_href = index.book_heref.get(&book_id).cloned().unwrap_or_default();
+    let mut canonical = normalize_ref(&book_href);
+    if !address.is_empty() {
+        canonical.push(' ');
+        canonical.push_str(address);
+    }
+    let mut lines = index.lines_under(conn, book_id, &canonical)?;
+    if lines.is_empty() {
+        lines.push(found_line);
+    }
+    let lo = lines.iter().copied().min().unwrap_or(found_line);
+    let hi = lines.iter().copied().max().unwrap_or(found_line);
+    let mut stmt = conn.prepare(
+        "SELECT d.lineIndex, l.heRef FROM line_dh d \
+           JOIN line l ON l.bookId = d.bookId AND l.lineIndex = d.lineIndex \
+          WHERE d.bookId = ?1 AND d.lineIndex BETWEEN ?2 AND ?3 \
+            AND d.dhText >= ?4 AND d.dhText < ?4 || char(1114111) \
+          ORDER BY d.lineIndex",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![book_id, lo, hi, dibbur], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    for row in rows {
+        let (li, he_ref) = row?;
+        if lines.contains(&li) {
+            return Ok(Some((li, he_ref, "dibur_in_ref")));
+        }
+    }
+    Ok(None)
+}
+
+/// Words that only say what kind of number follows, after normalization (the canonical
+/// key already drops some of them). None is a well-formed Hebrew numeral.
+const MARKER_WORDS: &[&str] = &[
+    "פרק", "הלכה", "סימן", "סי", "סעיף", "סע", "סק", "דף", "עמוד", "משנה", "אות",
+];
+
+/// Shulchan Aruch / Tur part names, written after a nosei kelim that covers one part.
+const PART_NAMES: &[&str] = &[
+    "אורח", "חיים", "אוח", "יורה", "דעה", "יוד", "אבן", "העזר", "אהע", "חושן", "משפט", "חומ",
+];
+
+/// Split off a trailing dibbur hamatchil: `... ד"ה ופורסין` → (`...`, Some(normalized words)).
+fn split_dibbur(query: &str) -> (String, Option<String>) {
+    let raw: Vec<&str> = query.split_whitespace().collect();
+    match raw
+        .iter()
+        .position(|t| matches!(normalize_ref(t).as_str(), "דה" | "בדה"))
+    {
+        Some(i) => {
+            let dh = normalize_ref(&raw[i + 1..].join(" "));
+            (raw[..i].join(" "), (!dh.is_empty()).then_some(dh))
+        }
+        None => (query.to_string(), None),
+    }
+}
+
+/// The raw tokens after the first `consumed` normalized tokens, when that boundary falls
+/// between raw tokens.
+fn raw_rest<'a>(raw: &[&'a str], consumed: usize) -> Option<Vec<&'a str>> {
+    let mut n = 0;
+    for (i, t) in raw.iter().enumerate() {
+        if n == consumed {
+            return Some(raw[i..].to_vec());
+        }
+        n += normalize_ref(t).split_whitespace().count();
+        if n > consumed {
+            return None;
+        }
+    }
+    (n == consumed).then(Vec::new)
+}
+
+/// Rewrite an address the way a heRef spells it: unit markers dropped, marker-prefixed
+/// numbers (`פ"ב`, `ה"א`, `מ"ג`, `סק"ב`, `פכ"ה`) reduced to the number.
+fn clean_address(raw: &[&str]) -> Vec<String> {
+    raw.iter()
+        .filter(|tok| {
+            let bare = normalize_ref(tok);
+            !bare.is_empty() && !MARKER_WORDS.contains(&bare.as_str())
+        })
+        .map(|tok| strip_marker_prefix(tok).unwrap_or_else(|| tok.to_string()))
+        .collect()
+}
+
+/// `פ"ב` → `ב`, `ה"א` → `א`, `מ"ג` → `ג`, `סק"ב` → `ב`, `פ"ק` → `א`, `פכ"ה` → `כ"ה`,
+/// `הי"ב` → `י"ב`; `None` when the token has no such prefix.
+fn strip_marker_prefix(tok: &str) -> Option<String> {
+    let q = tok.find(['"', '\u{05F4}', '\'', '\u{05F3}'])?;
+    let head = &tok[..q];
+    let quote_len = tok[q..].chars().next()?.len_utf8();
+    let tail = &tok[q + quote_len..];
+    if ["פ", "ה", "מ", "סק", "ס"].contains(&head) && !tail.is_empty() {
+        let n = normalize_ref(tail);
+        if n == "ק" {
+            return Some("א".to_string());
+        }
+        return refkey::is_hebrew_numeral(&n).then(|| tail.to_string());
+    }
+    let mut chars = head.chars();
+    let first = chars.next()?;
+    if (first == 'פ' || first == 'ה') && chars.next().is_some() {
+        let rest = &tok[first.len_utf8()..];
+        return refkey::is_hebrew_numeral(&normalize_ref(rest)).then(|| rest.to_string());
+    }
+    None
+}
+
+/// Drop the leading tokens of a normalized string while `drop` holds and the token is not
+/// a number.
+fn drop_leading(s: &str, drop: impl Fn(&str) -> bool) -> String {
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    let skip = toks
+        .iter()
+        .take_while(|t| drop(t) && !refkey::is_hebrew_numeral(t))
+        .count();
+    toks[skip..].join(" ")
+}
+
 /// Last resort: substring match on raw `line.heRef`.
 fn fallback_heref_like(conn: &Connection, query: &str, limit: i64) -> Result<Vec<RefCandidate>> {
     let q = query.trim();
@@ -481,6 +960,7 @@ fn fallback_heref_like(conn: &Connection, query: &str, limit: i64) -> Result<Vec
             book_title: r.get(1)?,
             line_index: r.get(2)?,
             he_ref: r.get(3)?,
+            toc_path: None,
             snippet: String::new(),
             match_kind: "fallback",
         })
@@ -667,6 +1147,132 @@ mod tests {
         }
     }
 
+    /// A book printed as one tree over several parts — ב"ח (and טור, aliased "טור יו"ד"):
+    /// "סימן קא" in both אורח חיים and יורה דעה.
+    fn multipart_fixture() -> Connection {
+        let conn = fixture();
+        let mut line_id = 100;
+        let mut toc_id = 100;
+        for (book, title, alias) in [(50, "ב\"ח", None), (60, "טור", Some("טור יו\"ד"))]
+        {
+            conn.execute(
+                "INSERT INTO book VALUES (?1, ?2, ?2, 0, 10)",
+                rusqlite::params![book, title],
+            )
+            .unwrap();
+            if let Some(a) = alias {
+                conn.execute(
+                    "INSERT INTO book_acronym VALUES (?1, ?2)",
+                    rusqlite::params![book, a],
+                )
+                .unwrap();
+            }
+            for (part, base) in [("אורח חיים", 10), ("יורה דעה", 20)] {
+                let part_toc = toc_id;
+                for (offset, (siman, seif)) in
+                    [("קא", "א"), ("קא", "ב"), ("קב", "א")].iter().enumerate()
+                {
+                    let li = base + offset as i64;
+                    let he_ref = format!("{title}, {part}, {siman}, {seif}");
+                    conn.execute(
+                        "INSERT INTO line VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![line_id, book, li, he_ref],
+                    )
+                    .unwrap();
+                    for key in [
+                        format!("{part} {siman} {seif}"),
+                        format!("~ {siman} {seif}"),
+                    ] {
+                        conn.execute(
+                            "INSERT INTO line_ref VALUES (?1, ?2, ?3)",
+                            rusqlite::params![book, crate::refkey::ref_key_hash(&key), li],
+                        )
+                        .unwrap();
+                    }
+                    if offset == 0 {
+                        conn.execute(
+                            "INSERT INTO tocText VALUES (?1, ?2)",
+                            rusqlite::params![toc_id, part],
+                        )
+                        .unwrap();
+                        conn.execute(
+                            "INSERT INTO tocEntry VALUES (?1, ?2, NULL, ?1, 1, ?3, 1)",
+                            rusqlite::params![toc_id, book, line_id],
+                        )
+                        .unwrap();
+                        toc_id += 1;
+                    }
+                    if *seif == "א" {
+                        conn.execute(
+                            "INSERT INTO tocText VALUES (?1, ?2)",
+                            rusqlite::params![toc_id, format!("סימן {siman}")],
+                        )
+                        .unwrap();
+                        conn.execute(
+                            "INSERT INTO tocEntry VALUES (?1, ?2, ?3, ?1, 2, ?4, 0)",
+                            rusqlite::params![toc_id, book, part_toc, line_id],
+                        )
+                        .unwrap();
+                        toc_id += 1;
+                    }
+                    line_id += 1;
+                }
+            }
+        }
+        conn
+    }
+
+    fn found(c: &[super::RefCandidate]) -> Vec<(i64, i64, &'static str)> {
+        c.iter()
+            .map(|c| (c.book_id, c.line_index, c.match_kind))
+            .collect()
+    }
+
+    #[test]
+    fn multipart_books_offer_every_part_unless_one_is_named() {
+        let conn = multipart_fixture();
+        let index = RefIndex::build(&conn);
+        let r = |q: &str| found(&super::resolve(&conn, &caps(), &index, q, 10).unwrap());
+
+        // a siman alone: the heading in every part (the app's 4 results for "ב"ח קא")
+        assert_eq!(r("ב\"ח קא"), vec![(50, 10, "toc"), (50, 20, "toc")]);
+        assert_eq!(r("ב\"ח סי' קא"), vec![(50, 10, "toc"), (50, 20, "toc")]);
+        // the part named by its abbreviation, in the address or in the alias
+        assert_eq!(r("ב\"ח יו\"ד קא"), vec![(50, 20, "prefix")]);
+        assert_eq!(r("ב\"ח יורה דעה קא"), vec![(50, 20, "prefix")]);
+        assert_eq!(r("טור יו\"ד קא"), vec![(60, 20, "prefix")]);
+        // siman + seif: the partial key, one line per part …
+        assert_eq!(
+            r("ב\"ח קא ב"),
+            vec![(50, 11, "partial"), (50, 21, "partial")]
+        );
+        // … or exactly the named part's line
+        assert_eq!(r("ב\"ח יו\"ד קא ב"), vec![(50, 21, "exact")]);
+        assert_eq!(r("ב\"ח או\"ח סי' קא סע' ב"), vec![(50, 11, "exact")]);
+        assert_eq!(r("טור יו\"ד קב א"), vec![(60, 22, "exact")]);
+
+        // the heading's path tells the parts apart
+        let c = super::resolve(&conn, &caps(), &index, "ב\"ח קא", 10).unwrap();
+        let paths: Vec<_> = c.iter().map(|c| c.toc_path.as_deref()).collect();
+        assert_eq!(
+            paths,
+            vec![Some("אורח חיים > סימן קא"), Some("יורה דעה > סימן קא")]
+        );
+
+        // ד"ה after a siman: the part whose section has that dibbur
+        conn.execute("INSERT INTO line_dh VALUES (50, 'ומש', 21, 'ומ\"ש')", [])
+            .unwrap();
+        assert_eq!(r("ב\"ח קא ד\"ה ומ\"ש"), vec![(50, 21, "dibur_in_ref")]);
+        // … not past the section's end (סימן קב)
+        assert_eq!(
+            r("ב\"ח קב ד\"ה ומ\"ש")
+                .iter()
+                .filter(|c| c.2 == "dibur_in_ref")
+                .count(),
+            0
+        );
+    }
+
     #[test]
     fn resolves_from_the_per_book_normalized_cache() {
         let conn = fixture();
@@ -690,5 +1296,92 @@ mod tests {
                 .any(|(n, _, exact)| !exact && n.starts_with("ברכות"))
                 || m.len() == 1
         );
+    }
+
+    /// heRefs and `line_ref` rows in the shapes of the live v32 library.
+    fn citation_library() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE book (id INTEGER PRIMARY KEY, title TEXT NOT NULL, heRef TEXT, isBaseBook INTEGER NOT NULL, orderIndex INTEGER NOT NULL);
+             CREATE TABLE book_acronym (bookId INTEGER NOT NULL, term TEXT NOT NULL);
+             CREATE TABLE line (id INTEGER PRIMARY KEY, bookId INTEGER NOT NULL, lineIndex INTEGER NOT NULL, heRef TEXT);
+             CREATE TABLE line_ref (bookId INTEGER NOT NULL, refKeyHash INTEGER NOT NULL, lineIndex INTEGER NOT NULL);
+             CREATE TABLE line_dh (bookId INTEGER NOT NULL, dhText TEXT NOT NULL, lineIndex INTEGER NOT NULL, dhDisplay TEXT NOT NULL);
+             CREATE TABLE tocText (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
+             CREATE TABLE tocEntry (id INTEGER PRIMARY KEY, bookId INTEGER NOT NULL, parentId INTEGER, textId INTEGER NOT NULL, level INTEGER NOT NULL, lineId INTEGER, hasChildren INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO book VALUES
+               (103, 'שבת', 'שבת', 1, 1),
+               (144, 'תלמוד ירושלמי שביעית', 'תלמוד ירושלמי שביעית', 1, 2),
+               (1907, 'תוספות על שבת', 'תוספות על שבת', 0, 3),
+               (3839, 'מגן אברהם', 'מגן אברהם', 0, 4),
+               (3862, 'קצות החושן על שולחן ערוך חושן משפט', 'קצות החושן על שולחן ערוך חושן משפט', 0, 5);
+             INSERT INTO book_acronym VALUES
+               (144, 'ירושלמי שביעית'), (1907, 'תוס'' שבת'), (1907, 'תוספות שבת'),
+               (3839, 'מג\"א'), (3862, 'קצות'), (3862, 'קצות החושן חו\"מ');
+             INSERT INTO line VALUES
+               (1, 103, 500, 'שבת, מג:, א'),
+               (2, 103, 900, 'שבת, פב., א'),
+               (3, 144, 40, 'תלמוד ירושלמי שביעית, ב, א, א'),
+               (4, 1907, 540, 'תוספות על שבת, מג:, א, א'),
+               (5, 1907, 541, 'תוספות על שבת, מג:, ב, א'),
+               (8, 1907, 560, 'תוספות על שבת, מד., א, א'),
+               (6, 3839, 3267, 'מגן אברהם,  שח, ב'),
+               (7, 3862, 171, 'קצות החושן על שולחן ערוך חושן משפט, כח, א, א');
+             INSERT INTO line_dh VALUES
+               (1907, 'דחשיב עלייהו', 540, 'דחשיב עלייהו'),
+               (1907, 'בעודן עליו', 541, 'בעודן עליו'),
+               (1907, 'בעודן עליו', 560, 'בעודן עליו');",
+        )
+        .unwrap();
+        for (bid, li, addr) in [
+            (103, 500, "מג:, א"),
+            (103, 900, "פב., א"),
+            (144, 40, "ב, א, א"),
+            (1907, 540, "מג:, א, א"),
+            (1907, 541, "מג:, ב, א"),
+            (1907, 560, "מד., א, א"),
+            (3839, 3267, "שח, ב"),
+            (3862, 171, "כח, א, א"),
+        ] {
+            let key = crate::refkey::build_ref_key(addr).unwrap();
+            conn.execute(
+                "INSERT INTO line_ref VALUES (?1, ?2, ?3)",
+                rusqlite::params![bid, crate::refkey::ref_key_hash(&key), li],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn resolves_citation_forms_by_cleaned_address() {
+        let conn = citation_library();
+        let index = RefIndex::build(&conn);
+        let first = |q: &str| {
+            let c = super::resolve(&conn, &caps(), &index, q, 3).unwrap();
+            assert!(!c.is_empty(), "no candidate for {q:?}");
+            (c[0].book_id, c[0].line_index)
+        };
+        assert_eq!(first("ירושלמי שביעית פ\"ב ה\"א"), (144, 40));
+        assert_eq!(first("מגן אברהם אורח חיים שח ב"), (3839, 3267));
+        assert_eq!(first("מג\"א או\"ח סי' שח ס\"ק ב"), (3839, 3267));
+        assert_eq!(first("קצות החושן כח א"), (3862, 171));
+        assert_eq!(first("שבת דף מג ע\"ב"), (103, 500));
+        // The address as typed still wins: daf 82, not perek 2.
+        assert_eq!(first("שבת פ\"ב"), (103, 900));
+    }
+
+    #[test]
+    fn dibbur_is_found_inside_the_location() {
+        let conn = citation_library();
+        let index = RefIndex::build(&conn);
+        let c = super::resolve(&conn, &caps(), &index, "תוס' שבת מג: ד\"ה בעודן", 3).unwrap();
+        assert_eq!((c[0].line_index, c[0].match_kind), (541, "dibur_in_ref"));
+        // The same dibbur on the next daf is not taken for this one.
+        let c = super::resolve(&conn, &caps(), &index, "תוס' שבת מד. ד\"ה בעודן", 3).unwrap();
+        assert_eq!((c[0].line_index, c[0].match_kind), (560, "dibur_in_ref"));
+        // An unknown dibbur leaves the location itself.
+        let c = super::resolve(&conn, &caps(), &index, "תוס' שבת מג: ד\"ה ופורסין", 3).unwrap();
+        assert_eq!((c[0].line_index, c[0].match_kind), (540, "prefix"));
     }
 }
