@@ -221,6 +221,7 @@ fn reopen_after_atomic_database_replacement_reads_new_text() {
         lexical_db: None,
         dictionaries_dir: None,
         snapshot: false,
+        secondary: Default::default(),
     })
     .unwrap();
     let text = db.get_text(1, 0, 1, false, None).unwrap().unwrap();

@@ -347,6 +347,22 @@ impl Db {
         Db::build(conn, Some(source))
     }
 
+    /// A secondary database (personal books, an attached library): read-only, and
+    /// `immutable=1` when asked (the app opens WAL databases in read-only folders so).
+    /// A WAL database whose `-shm` cannot be created (a read-only folder, a sync client's
+    /// lock) is opened `immutable` instead: its last checkpointed state.
+    pub fn open_secondary(path: &Path, immutable: bool) -> Result<Db> {
+        Db::open_file(path, immutable)
+            .or_else(|e| {
+                if immutable {
+                    Err(e)
+                } else {
+                    Db::open_file(path, true).map_err(|_| e)
+                }
+            })
+            .with_context(|| format!("opening {}", path.display()))
+    }
+
     /// Wrap an already-open connection (also used by tests with in-memory fixtures). It is
     /// never closed before the `Db` is dropped: there is no file to open it again from.
     pub fn from_connection(conn: Connection) -> Result<Db> {
@@ -775,19 +791,34 @@ impl Db {
     // ── resolve_ref ──────────────────────────────────────────────────────────
     /// Resolve a human reference string to candidate (book_id, line_index) locations.
     pub fn resolve_ref(&self, query: &str, limit: i64) -> Result<Vec<RefCandidate>> {
+        self.resolve_ref_with(query, limit, refs::ResolveOptions::default())
+    }
+
+    /// [`Db::resolve_ref`] with the search's widening chosen (secondary databases skip
+    /// the full-scan heRef fallback).
+    pub fn resolve_ref_with(
+        &self,
+        query: &str,
+        limit: i64,
+        opts: refs::ResolveOptions,
+    ) -> Result<Vec<RefCandidate>> {
         let index = self.ref_index.get_or_init(|| {
             let inner = self.lock();
             RefIndex::build(&inner.conn)
         });
         let mut inner = self.lock();
-        let mut cands = refs::resolve(&inner.conn, &self.caps, index, query, limit)?;
+        let mut cands = refs::resolve_with(&inner.conn, &self.caps, index, query, limit, opts)?;
         // Fill snippets with the decoded text of each candidate line.
         for c in cands.iter_mut() {
+            c.set_source(&crate::secondary::Source::Library);
             if c.snippet.is_empty() {
-                let lines =
-                    self.lines_in_range(&mut inner, c.book_id, c.line_index, c.line_index)?;
-                if let Some((_, _, _, html)) = lines.first() {
-                    c.snippet = text::snippet(html, 160);
+                // a secondary database may hold no text (personal books live in files)
+                if let Ok(lines) =
+                    self.lines_in_range(&mut inner, c.book_id, c.line_index, c.line_index)
+                {
+                    if let Some((_, _, _, html)) = lines.first() {
+                        c.snippet = text::snippet(html, 160);
+                    }
                 }
             }
         }
@@ -802,6 +833,83 @@ impl Db {
         category_id: Option<i64>,
         limit: i64,
     ) -> Result<Vec<BookHit>> {
+        // The same query over the library and over a personal-books or attached database,
+        // which carry a subset of the library's book columns and tables.
+        let (book_cols, tables) = {
+            let inner = self.lock();
+            let mut cols = HashSet::new();
+            let mut stmt = inner.conn.prepare("PRAGMA table_info(book)")?;
+            for c in stmt.query_map([], |r| r.get::<_, String>(1))? {
+                cols.insert(c?);
+            }
+            let mut tables = HashSet::new();
+            let mut stmt = inner
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+            for t in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                tables.insert(t?);
+            }
+            (cols, tables)
+        };
+        let col = |name: &str| -> String {
+            if book_cols.contains(name) {
+                format!("b.{name}")
+            } else {
+                "NULL".to_string()
+            }
+        };
+        let (he_ref, short, file_type, file_path) = (
+            col("heRef"),
+            col("heShortDesc"),
+            col("fileType"),
+            col("filePath"),
+        );
+        let is_base = if book_cols.contains("isBaseBook") {
+            "b.isBaseBook"
+        } else {
+            "0"
+        };
+        let order = if book_cols.contains("orderIndex") {
+            "b.orderIndex"
+        } else {
+            "b.id"
+        };
+        let lines = if book_cols.contains("totalLines") {
+            "b.totalLines"
+        } else {
+            "0"
+        };
+        let acronyms = tables.contains("book_acronym");
+        let acr_eq = if acronyms {
+            "WHEN EXISTS (SELECT 1 FROM book_acronym x WHERE x.bookId = b.id AND x.term = ?1) THEN 1"
+        } else {
+            ""
+        };
+        let acr_like = if acronyms {
+            "WHEN EXISTS (SELECT 1 FROM book_acronym x WHERE x.bookId = b.id AND x.term LIKE ?2 ESCAPE '\\') THEN 4"
+        } else {
+            ""
+        };
+        let acr_where = if acronyms {
+            "OR EXISTS (SELECT 1 FROM book_acronym x WHERE x.bookId = b.id AND x.term LIKE ?2 ESCAPE '\\')"
+        } else {
+            ""
+        };
+        let authors = if tables.contains("book_author") && tables.contains("author") {
+            "(SELECT group_concat(a.name, ', ') FROM book_author ba JOIN author a ON ba.authorId = a.id \
+              WHERE ba.bookId = b.id)"
+        } else {
+            "NULL"
+        };
+        let (cat_id, cat_title, cat_join) = if tables.contains("category") {
+            (
+                "c.id",
+                "c.title",
+                "LEFT JOIN category c ON b.categoryId = c.id",
+            )
+        } else {
+            ("NULL", "NULL", "")
+        };
         let like = format!("%{}%", escape_like(query));
         let prefix = format!("{}%", escape_like(query));
         let category_filter = match (category_id, self.caps.category_closure) {
@@ -812,23 +920,21 @@ impl Db {
             (None, _) => " AND ?4 IS NULL",
         };
         let sql = format!(
-            "SELECT b.id, b.title, b.heRef, c.id, c.title, b.totalLines, b.isBaseBook, b.heShortDesc,
-                    (SELECT group_concat(a.name, ', ')
-                       FROM book_author ba JOIN author a ON ba.authorId = a.id
-                      WHERE ba.bookId = b.id) AS authors,
-                    CASE WHEN b.title = ?1 OR b.heRef = ?1 THEN 0
-                         WHEN EXISTS (SELECT 1 FROM book_acronym x WHERE x.bookId = b.id AND x.term = ?1) THEN 1
+            "SELECT b.id, b.title, {he_ref}, {cat_id}, {cat_title}, {lines}, {is_base}, {short},
+                    {authors} AS authors,
+                    CASE WHEN b.title = ?1 OR {he_ref} = ?1 THEN 0
+                         {acr_eq}
                          WHEN b.title LIKE ?3 ESCAPE '\\' THEN 2
                          WHEN b.title LIKE ?2 ESCAPE '\\' THEN 3
-                         WHEN EXISTS (SELECT 1 FROM book_acronym x WHERE x.bookId = b.id AND x.term LIKE ?2 ESCAPE '\\') THEN 4
-                         ELSE 5 END AS rank
+                         {acr_like}
+                         ELSE 5 END AS rank,
+                    {file_type}, {file_path}
                FROM book b
-               JOIN category c ON b.categoryId = c.id
-              WHERE (b.title LIKE ?2 ESCAPE '\\' OR b.heRef LIKE ?2 ESCAPE '\\'
-                     OR b.heShortDesc LIKE ?2 ESCAPE '\\'
-                     OR EXISTS (SELECT 1 FROM book_acronym x WHERE x.bookId = b.id AND x.term LIKE ?2 ESCAPE '\\'))
+               {cat_join}
+              WHERE (b.title LIKE ?2 ESCAPE '\\' OR {he_ref} LIKE ?2 ESCAPE '\\'
+                     OR {short} LIKE ?2 ESCAPE '\\' {acr_where})
                     {category_filter}
-              ORDER BY rank, b.isBaseBook DESC, b.orderIndex, b.title
+              ORDER BY rank, {is_base} DESC, {order}, b.title
               LIMIT ?5"
         );
         let inner = self.lock();
@@ -838,27 +944,40 @@ impl Db {
                 rusqlite::params![query, like, prefix, category_id, limit],
                 |r| {
                     let short: Option<String> = r.get(7)?;
+                    let file_type: Option<String> = r.get(10)?;
                     Ok(BookHit {
                         book_id: r.get(0)?,
                         title: r.get(1)?,
                         he_ref: r.get(2)?,
-                        category_id: r.get(3)?,
-                        category: r.get(4)?,
-                        total_lines: r.get(5)?,
-                        is_base_book: r.get::<_, i64>(6)? != 0,
+                        category_id: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        category: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        total_lines: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                        is_base_book: r.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
                         short_desc: short.map(|s| text::truncate_text(&s, 160)),
                         authors: r.get(8)?,
                         era: None,
+                        match_rank: r.get(9)?,
+                        is_pdf: file_type.as_deref() == Some("pdf"),
+                        file_type,
+                        file_path: r.get(11)?,
+                        source: crate::secondary::Source::Library,
+                        library: None,
+                        book_uid: String::new(),
+                        link: String::new(),
                     })
                 },
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         drop(inner);
+        let eras = self.caps.book_generation;
         Ok(rows
             .into_iter()
             .map(|mut b| {
-                b.era = Some(self.era_of(b.book_id));
+                if eras {
+                    b.era = Some(self.era_of(b.book_id));
+                }
+                b.set_source(&crate::secondary::Source::Library);
                 b
             })
             .collect())
@@ -1570,6 +1689,44 @@ pub struct BookHit {
     pub is_base_book: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub short_desc: Option<String>,
+    /// 0 title or heRef equal, 1 acronym equal, 2 title prefix, 3 title contains,
+    /// 4 acronym contains, 5 heRef / description contains.
+    pub match_rank: i64,
+    /// "library", "user" (a personal book) or "attached" (an attached database); book
+    /// ids are only unique within one source, and only library books can be read with
+    /// get_text / get_book_toc / get_links.
+    pub source: crate::secondary::Source,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library: Option<String>,
+    /// The app's catalogue key: `id:<n>`, `uid:<n>` (personal), `db:<slug>:<n>`.
+    pub book_uid: String,
+    /// Deep link that opens the book in the Otzaria app.
+    pub link: String,
+    pub is_pdf: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
+    /// A personal book's file on disk (its text lives there, not in the database).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+}
+
+impl BookHit {
+    /// Tag the hit with the source it was found in.
+    pub fn set_source(&mut self, source: &crate::secondary::Source) {
+        self.book_uid = source.book_uid(self.book_id);
+        self.library = source.slug().map(str::to_string);
+        let q = source
+            .link_param()
+            .map(|p| format!("source={p}&"))
+            .unwrap_or_default();
+        self.link = format!(
+            "otzaria://open/{}/{}?{}index=0",
+            if self.is_pdf { "pdf" } else { "book" },
+            self.book_id,
+            q
+        );
+        self.source = source.clone();
+    }
 }
 
 #[derive(Debug, Serialize)]

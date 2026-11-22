@@ -24,6 +24,8 @@
 //! `<data root>/dictionaries`.
 
 use anyhow::{bail, Result};
+
+use crate::secondary::SecondaryConfig;
 use std::path::PathBuf;
 
 /// Overrides collected from CLI flags and env vars, before resolution.
@@ -37,6 +39,14 @@ pub struct PathArgs {
     /// `--snapshot`: open the DB with `immutable=1` (closed snapshot, ignores WAL).
     /// Off by default so live WAL writes by the app are read consistently.
     pub snapshot: bool,
+    /// The app's data folder (`app_preferences.hive`, `databases/user_books.db`).
+    pub app_data_dir: Option<PathBuf>,
+    /// Personal books database (`user_books.db`).
+    pub user_books_db: Option<PathBuf>,
+    /// Attached databases as `slug=path` (replaces the app's own list).
+    pub attached: Vec<(String, PathBuf)>,
+    /// `--no-secondary`: serve the library only.
+    pub no_secondary: bool,
 }
 
 /// Resolved, existence-checked paths the server runs against.
@@ -48,6 +58,8 @@ pub struct Paths {
     /// Folder holding `dictionary.json` / `Acronyms.json` (advanced-search lexicons).
     pub dictionaries_dir: Option<PathBuf>,
     pub snapshot: bool,
+    /// Where personal books and attached databases are found (see `secondary`).
+    pub secondary: SecondaryConfig,
 }
 
 impl PathArgs {
@@ -63,6 +75,21 @@ impl PathArgs {
         self.dictionaries_dir = self
             .dictionaries_dir
             .or_else(|| env_path("OTZARIA_DICTIONARIES_DIR"));
+        self.app_data_dir = self
+            .app_data_dir
+            .or_else(|| env_path("OTZARIA_APP_DATA_DIR"));
+        self.user_books_db = self
+            .user_books_db
+            .or_else(|| env_path("OTZARIA_USER_BOOKS_DB"));
+        if self.attached.is_empty() {
+            if let Ok(v) = std::env::var("OTZARIA_ATTACHED") {
+                for pair in v.split(';').filter(|p| !p.trim().is_empty()) {
+                    if let Some(a) = parse_attached_arg(pair) {
+                        self.attached.push(a);
+                    }
+                }
+            }
+        }
         self
     }
 
@@ -161,14 +188,34 @@ impl PathArgs {
                 .find(|p| p.join("dictionary.json").is_file() || p.join("Acronyms.json").is_file())
         });
 
+        let app_data_dir = if self.no_secondary {
+            None
+        } else {
+            crate::secondary::app_data_dir(self.app_data_dir, &db, &roots)
+        };
+        let secondary = SecondaryConfig {
+            disabled: self.no_secondary,
+            app_data_dir,
+            user_books_db: self.user_books_db,
+            attached: self.attached,
+        };
+
         Ok(Paths {
             db,
             index,
             lexical_db,
             dictionaries_dir,
             snapshot: self.snapshot,
+            secondary,
         })
     }
+}
+
+/// `slug=path` → (slug, path).
+pub fn parse_attached_arg(arg: &str) -> Option<(String, PathBuf)> {
+    let (slug, path) = arg.split_once('=')?;
+    let (slug, path) = (slug.trim(), path.trim());
+    (!slug.is_empty() && !path.is_empty()).then(|| (slug.to_string(), PathBuf::from(path)))
 }
 
 fn first_file(candidates: &[PathBuf]) -> Option<PathBuf> {

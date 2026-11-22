@@ -19,6 +19,7 @@ use crate::admission::Gate;
 use crate::db::Db;
 use crate::paths::Paths;
 use crate::search::Search;
+use crate::secondary::SecondarySet;
 
 /// Open DB + index handles tagged with the files observed while they were built.
 pub struct Snapshot {
@@ -36,6 +37,9 @@ pub struct Snapshot {
 pub struct Library {
     paths: Paths,
     inner: RwLock<Arc<Snapshot>>,
+    /// Personal books and attached databases (see `secondary`), followed separately:
+    /// a change there never reopens the library.
+    secondary: RwLock<Arc<SecondarySet>>,
     reads: Gate,
     searches: Gate,
 }
@@ -43,12 +47,19 @@ pub struct Library {
 impl Library {
     pub fn open(paths: Paths) -> Result<Arc<Library>> {
         let snapshot = Self::build(&paths)?;
+        let secondary = SecondarySet::build(&paths.secondary);
         Ok(Arc::new(Library {
             paths,
             inner: RwLock::new(Arc::new(snapshot)),
+            secondary: RwLock::new(Arc::new(secondary)),
             reads: Gate::default(),
             searches: Gate::default(),
         }))
+    }
+
+    /// The secondary databases of the moment (cheap Arc clone).
+    pub fn secondary(&self) -> Arc<SecondarySet> {
+        Arc::clone(&self.secondary.read().unwrap())
     }
 
     /// Cheap (Arc clone) handle to the current snapshot.
@@ -132,6 +143,7 @@ impl Library {
         const DEBOUNCE: Duration = Duration::from_secs(2);
         loop {
             tokio::time::sleep(POLL).await;
+            self.refresh_secondary();
             let current_fp = self.current().fingerprint.clone();
             let fp = fingerprint(&self.paths);
             if fp == current_fp {
@@ -154,6 +166,22 @@ impl Library {
                 Err(e) => eprintln!("otzaria-mcp: reload failed, keeping current snapshot: {e:#}"),
             }
         }
+    }
+}
+
+impl Library {
+    /// Swap in a new secondary set when its databases or the app's list of them changed.
+    fn refresh_secondary(&self) {
+        let fp = self.paths.secondary.fingerprint();
+        if fp == self.secondary().fingerprint {
+            return;
+        }
+        let set = SecondarySet::build(&self.paths.secondary);
+        eprintln!(
+            "otzaria-mcp: personal / attached databases changed → {} source(s)",
+            set.dbs.len()
+        );
+        *self.secondary.write().unwrap() = Arc::new(set);
     }
 }
 
@@ -201,6 +229,30 @@ pub fn fingerprint(paths: &Paths) -> String {
         hash_file(&idx.join("otzaria_index_meta.json"), false, &mut hasher);
         hash_file(&idx.join("otzaria_book_order.json"), false, &mut hasher);
     }
+    format!("{:016x}", hasher.finish())
+}
+
+/// Hash the path, size and mtime of each file (missing files hash by path alone).
+pub fn hash_paths(files: &[PathBuf]) -> String {
+    let mut hasher = DefaultHasher::new();
+    for path in files {
+        path.to_string_lossy().hash(&mut hasher);
+        if let Ok(meta) = std::fs::metadata(path) {
+            meta.len().hash(&mut hasher);
+            if let Ok(modified) = meta.modified() {
+                if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    dur.as_nanos().hash(&mut hasher);
+                }
+            }
+        }
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+/// Hash a list of strings (a fingerprint of a list that has no file of its own).
+pub fn hash_strings(items: &[String]) -> String {
+    let mut hasher = DefaultHasher::new();
+    items.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 

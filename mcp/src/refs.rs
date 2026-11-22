@@ -31,7 +31,7 @@
 //! and `:`→" ב", and drops commas/maqaf — applied identically to the query and to names.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -40,6 +40,7 @@ use serde::Serialize;
 
 use crate::db::Caps;
 use crate::refkey;
+use crate::secondary::Source;
 use crate::toc_search::{BookToc, TocCache};
 
 /// Normalize a reference/name for matching. Applied to book names, acronyms,
@@ -101,10 +102,26 @@ pub struct RefIndex {
     book_title: HashMap<i64, String>,
     /// bookId → (is_base_book, orderIndex) for ranking candidates.
     book_meta: HashMap<i64, (bool, i64)>,
+    /// Books that are PDFs (`book.fileType = 'pdf'`; personal books).
+    book_pdf: HashSet<i64>,
+    /// bookId → its `book_acronym` terms (for the app's book detection).
+    book_acronyms: HashMap<i64, Vec<String>>,
+    /// The app's title / acronym matcher, built on first use.
+    titles: std::sync::OnceLock<crate::detect::TitleIndex>,
     /// Lazily built normalized heRef index for each requested book.
     line_cache: Mutex<HashMap<i64, BTreeMap<String, CachedLine>>>,
     /// Lazily loaded TOC trees (the app's hierarchical TOC search).
     toc: TocCache,
+}
+
+fn book_columns(conn: &Connection) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare("PRAGMA table_info(book)") else {
+        return vec![];
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(1)) else {
+        return vec![];
+    };
+    rows.flatten().collect()
 }
 
 #[derive(Clone)]
@@ -131,20 +148,40 @@ impl RefIndex {
         let mut book_title = HashMap::new();
         let mut book_meta = HashMap::new();
 
-        if let Ok(mut stmt) =
-            conn.prepare("SELECT id, title, heRef, isBaseBook, orderIndex FROM book")
-        {
+        // Secondary databases (personal books, attached libraries) carry a subset of
+        // the library's book columns: no heRef, sometimes no isBaseBook.
+        let cols = book_columns(conn);
+        let col = |name: &str, fallback: &str| {
+            if cols.iter().any(|c| c == name) {
+                name.to_string()
+            } else {
+                fallback.to_string()
+            }
+        };
+        let sql = format!(
+            "SELECT id, title, {}, {}, CAST(COALESCE({}, 0) AS INTEGER), {} FROM book",
+            col("heRef", "NULL"),
+            col("isBaseBook", "0"),
+            col("orderIndex", "0"),
+            col("fileType", "NULL"),
+        );
+        let mut book_pdf = HashSet::new();
+        if let Ok(mut stmt) = conn.prepare(&sql) {
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?,
-                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<i64>>(3)?.unwrap_or(0),
                     r.get::<_, i64>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             });
             if let Ok(rows) = rows {
-                for (id, title, heref, is_base, order) in rows.flatten() {
+                for (id, title, heref, is_base, order, file_type) in rows.flatten() {
+                    if file_type.as_deref() == Some("pdf") {
+                        book_pdf.insert(id);
+                    }
                     let href = heref.clone().unwrap_or_else(|| title.clone());
                     add_name(&mut name_to_books, &title, id);
                     if let Some(h) = &heref {
@@ -157,11 +194,13 @@ impl RefIndex {
             }
         }
 
+        let mut book_acronyms: HashMap<i64, Vec<String>> = HashMap::new();
         if let Ok(mut stmt) = conn.prepare("SELECT bookId, term FROM book_acronym") {
             let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)));
             if let Ok(rows) = rows {
                 for (id, term) in rows.flatten() {
                     add_name(&mut name_to_books, &term, id);
+                    book_acronyms.entry(id).or_default().push(term);
                 }
             }
         }
@@ -171,6 +210,9 @@ impl RefIndex {
             book_heref,
             book_title,
             book_meta,
+            book_pdf,
+            book_acronyms,
+            titles: std::sync::OnceLock::new(),
             line_cache: Mutex::new(HashMap::new()),
             toc: TocCache::default(),
         }
@@ -178,6 +220,45 @@ impl RefIndex {
 
     pub fn title(&self, id: i64) -> String {
         self.book_title.get(&id).cloned().unwrap_or_default()
+    }
+
+    fn titles(&self) -> &crate::detect::TitleIndex {
+        self.titles.get_or_init(|| {
+            crate::detect::TitleIndex::build(
+                self.book_title
+                    .iter()
+                    .map(|(id, t)| (*id, t.as_str(), self.order(*id))),
+                &self.book_acronyms,
+            )
+        })
+    }
+
+    /// How well the book's title — or the best of its acronyms — accounts for the query
+    /// (see [`RefCandidate::name_score`]), and its words the query left out.
+    pub fn name_score(&self, id: i64, query: &[String]) -> (u32, u32) {
+        use crate::detect::{match_score, normalize_find_ref};
+        let words = |s: &str| -> Vec<String> {
+            normalize_find_ref(s)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        let mut best = (0u32, u32::MAX);
+        let names = std::iter::once(self.title(id))
+            .chain(self.book_acronyms.get(&id).into_iter().flatten().cloned());
+        for name in names {
+            let w = words(&name);
+            let (sc, used) = match_score(&w, query);
+            let cand = (sc as u32, (w.len() - used) as u32);
+            if cand.0 > best.0 || (cand.0 == best.0 && cand.1 < best.1) {
+                best = cand;
+            }
+        }
+        (best.0, if best.1 == u32::MAX { 0 } else { best.1 })
+    }
+
+    pub fn is_pdf(&self, id: i64) -> bool {
+        self.book_pdf.contains(&id)
     }
 
     pub fn is_base(&self, id: i64) -> bool {
@@ -281,9 +362,67 @@ pub struct RefCandidate {
     /// A reference that exists in several parts of one book ("ב\"ח קא": אורח חיים, יורה
     /// דעה, אבן העזר, חושן משפט) yields one candidate per part.
     pub match_kind: &'static str,
+    /// The location as the app's find-ref words it: the line's heRef, a heading's path
+    /// after the book title ("נודע ביהודה מהדורא תנינא אורח חיים תשובה לא"), or the title.
+    pub reference: String,
+    /// The location is a line (a verse, a seif, a comment), not a heading or a book.
+    pub is_source_line: bool,
+    /// The book is a PDF (personal books only; open it with otzaria://open/pdf/…).
+    pub is_pdf: bool,
+    /// How the book was found: 0 by a name leading the query, else the app's title /
+    /// acronym match rank + 1 (see `detect::BookHit::rank`). Ranks candidates.
+    #[serde(skip)]
+    pub book_rank: u8,
+    /// How well the book's title accounts for the query's words (2 a word, 1 a
+    /// misspelt one): the book a reference names ("בביאור הלכה רלב" → ביאור הלכה, not
+    /// ביאור הגר"א).
+    pub name_score: u32,
+    /// The same over the whole `reference` (title and heading path): which location.
+    pub ref_score: u32,
+    /// Candidates ordered best first; those sharing a rank are equally good, so more
+    /// than one place at rank 0 means the reference is ambiguous.
+    pub rank: u32,
+    /// Title words the query did not account for (fewer = more exactly named).
+    #[serde(skip)]
+    pub title_extra: u32,
+    /// `name_score` / `title_extra` already set (from the title or an acronym).
+    #[serde(skip)]
+    pub scored: bool,
+    /// Which part of Otzaria the book is in: "library", "user" (a personal book) or
+    /// "attached" (an attached database). Book ids are only unique within one source.
+    pub source: Source,
+    /// The attached database's slug.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library: Option<String>,
+    /// The app's catalogue key: `id:<n>`, `uid:<n>` (personal), `db:<slug>:<n>`.
+    pub book_uid: String,
+    /// Deep link that opens the location in the Otzaria app.
+    pub link: String,
 }
 
-fn kind_rank(kind: &str) -> u8 {
+impl RefCandidate {
+    /// Tag the candidate with the source it was resolved in.
+    pub fn set_source(&mut self, source: &Source) {
+        self.book_uid = source.book_uid(self.book_id);
+        self.library = source.slug().map(str::to_string);
+        let mut q = String::new();
+        if let Some(p) = source.link_param() {
+            q.push_str("source=");
+            q.push_str(&p);
+            q.push('&');
+        }
+        self.link = format!(
+            "otzaria://open/{}/{}?{}index={}",
+            if self.is_pdf { "pdf" } else { "book" },
+            self.book_id,
+            q,
+            self.line_index
+        );
+        self.source = source.clone();
+    }
+}
+
+pub fn kind_rank(kind: &str) -> u8 {
     match kind {
         "exact" | "dibur_in_ref" => 0,
         "partial" => 1,
@@ -291,7 +430,8 @@ fn kind_rank(kind: &str) -> u8 {
         "toc" => 3,
         "toc_partial" => 4,
         "dibur_hamatchil" => 5,
-        _ => 6,
+        "book" => 6,
+        _ => 7,
     }
 }
 
@@ -303,6 +443,37 @@ pub fn resolve(
     index: &RefIndex,
     query: &str,
     limit: i64,
+) -> Result<Vec<RefCandidate>> {
+    resolve_with(conn, caps, index, query, limit, ResolveOptions::default())
+}
+
+/// How [`resolve_with`] may widen the search.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolveOptions {
+    /// Substring match on raw `line.heRef` when nothing else resolves (a full scan of
+    /// `line`: fine for the library, skipped for secondary databases).
+    pub heref_fallback: bool,
+    /// The app's book detection (title prefix / contains, acronym prefix, ה"א before an
+    /// acronym) when no book NAME leads the query or the named books yield nothing.
+    pub app_detection: bool,
+}
+
+impl Default for ResolveOptions {
+    fn default() -> Self {
+        ResolveOptions {
+            heref_fallback: true,
+            app_detection: true,
+        }
+    }
+}
+
+pub fn resolve_with(
+    conn: &Connection,
+    caps: &Caps,
+    index: &RefIndex,
+    query: &str,
+    limit: i64,
+    opts: ResolveOptions,
 ) -> Result<Vec<RefCandidate>> {
     let (ref_part, dibbur) = split_dibbur(query.trim());
     let expanded = refkey::expand_query_amud_marks(&ref_part);
@@ -328,131 +499,227 @@ pub fn resolve(
         }
     }
 
-    if book_ids.is_empty() {
-        return fallback_heref_like(conn, &ref_part, limit);
-    }
     // Base texts first, then catalogue order: the strongest candidates are tried first.
     book_ids.sort_by_key(|id| (!index.is_base(*id), index.order(*id), *id));
 
-    let normalized_book = q_tokens[..consumed].join(" ");
-    // The address as typed (range dashes, chapter:verse colons kept for refkey), with
-    // the dibbur hamatchil already split off.
-    let raw_address = raw_address_after_book(&ref_part, &normalized_book)
-        .map(str::to_string)
-        .unwrap_or_else(|| q_tokens[consumed..].join(" "));
-    let address = normalize_ref(&refkey::expand_query_amud_marks(&raw_address));
-    // The address with citation markers cleaned up, tried only when the typed one fails.
-    let cleaned = raw_rest(&raw, consumed)
-        .map(|rest| normalize_ref(&clean_address(&rest).join(" ")))
-        .unwrap_or_else(|| address.clone());
-    let cleaned = drop_leading(&cleaned, |t| PART_NAMES.contains(&t));
-    // The address for the TOC search: unit markers dropped, part names KEPT ("יו"ד קא").
-    let toc_tokens: Vec<String> = raw_rest(&raw, consumed)
-        .map(|rest| normalize_ref(&clean_address(&rest).join(" ")))
-        .unwrap_or_else(|| address.clone())
-        .split_whitespace()
-        .map(str::to_string)
-        .collect();
-    let name_tokens: Vec<String> = q_tokens[..consumed].to_vec();
     let mut out: Vec<RefCandidate> = Vec::new();
-
-    for bid in book_ids.iter().copied().take(60) {
-        let title = index.title(bid);
-        let book_href = index.book_heref.get(&bid).cloned().unwrap_or_default();
-        let own_words: Vec<String> = normalize_ref(&format!("{title} {book_href}"))
+    if !book_ids.is_empty() {
+        let normalized_book = q_tokens[..consumed].join(" ");
+        // The address as typed (range dashes, chapter:verse colons kept for refkey), with
+        // the dibbur hamatchil already split off.
+        let raw_address = raw_address_after_book(&ref_part, &normalized_book)
+            .map(str::to_string)
+            .unwrap_or_else(|| q_tokens[consumed..].join(" "));
+        let address = normalize_ref(&refkey::expand_query_amud_marks(&raw_address));
+        // The address with citation markers cleaned up, tried only when the typed one fails.
+        let cleaned = raw_rest(&raw, consumed)
+            .map(|rest| normalize_ref(&clean_address(&rest).join(" ")))
+            .unwrap_or_else(|| address.clone());
+        let cleaned = drop_leading(&cleaned, |t| PART_NAMES.contains(&t));
+        // The address for the TOC search: unit markers dropped, part names KEPT ("יו"ד קא").
+        let toc_tokens: Vec<String> = raw_rest(&raw, consumed)
+            .map(|rest| normalize_ref(&clean_address(&rest).join(" ")))
+            .unwrap_or_else(|| address.clone())
             .split_whitespace()
             .map(str::to_string)
             .collect();
-        let without_title = drop_leading(&cleaned, |t| own_words.iter().any(|w| w == t));
-
-        // A part of the book named by the alias itself ("טור יו"ד" → "יו"ד"), or by the
-        // first word of the address ("ב"ח יו"ד קא"), spelled out as the heRefs spell it.
-        let section = acronym_section_tokens(&name_tokens, &own_words);
-        let lead_part = toc_tokens.first().filter(|t| may_name_a_part(t)).cloned();
-        let toc: Option<Arc<BookToc>> = if !section.is_empty() || lead_part.is_some() {
-            index.toc.get(conn, bid).ok()
-        } else {
-            None
+        let q = AddrQuery {
+            name_tokens: q_tokens[..consumed].to_vec(),
+            raw_address,
+            address,
+            cleaned,
+            toc_tokens,
+            query_tokens: crate::detect::normalize_find_ref(&expanded)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
         };
-        let mut part_words: Option<Vec<String>> = None;
-        let mut spelled: Vec<String> = Vec::new();
-        if let Some(toc) = &toc {
-            if let Some(sp) = toc.spell_part(&section) {
-                spelled.push(join_nonempty(&sp.join(" "), &cleaned));
+        for bid in book_ids.iter().copied().take(60) {
+            out.extend(resolve_in_book(conn, caps, index, bid, &q, &dibbur)?);
+        }
+    }
+
+    if out.is_empty() && opts.app_detection {
+        out = detected_books(conn, caps, index, &ref_part, &dibbur)?;
+    }
+
+    if out.is_empty() {
+        return if opts.heref_fallback {
+            fallback_heref_like(conn, &ref_part, limit)
+        } else {
+            Ok(vec![])
+        };
+    }
+
+    let mut out = rank_candidates(query, out);
+    out.truncate(limit.max(1) as usize);
+    Ok(out)
+}
+
+/// What the per-book resolution needs of the query, after the book name.
+struct AddrQuery {
+    /// The book-name tokens as typed (an alias may carry a part: "טור יו\"ד").
+    name_tokens: Vec<String>,
+    /// The address as typed (ranges and colons kept for refkey).
+    raw_address: String,
+    address: String,
+    cleaned: String,
+    toc_tokens: Vec<String>,
+    /// The whole query, normalized as the app does (for scoring the book's name).
+    query_tokens: Vec<String>,
+}
+
+/// Every candidate location of the address in one book.
+fn resolve_in_book(
+    conn: &Connection,
+    caps: &Caps,
+    index: &RefIndex,
+    bid: i64,
+    q: &AddrQuery,
+    dibbur: &Option<String>,
+) -> Result<Vec<RefCandidate>> {
+    let (name_tokens, raw_address, address, cleaned, toc_tokens) = (
+        &q.name_tokens,
+        &q.raw_address,
+        &q.address,
+        &q.cleaned,
+        &q.toc_tokens,
+    );
+    let mut out: Vec<RefCandidate> = Vec::new();
+    let title = index.title(bid);
+    let book_href = index.book_heref.get(&bid).cloned().unwrap_or_default();
+    let own_words: Vec<String> = normalize_ref(&format!("{title} {book_href}"))
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let without_title = drop_leading(cleaned, |t| own_words.iter().any(|w| w == t));
+
+    // A part of the book named by the alias itself ("טור יו"ד" → "יו"ד"), or by the
+    // first word of the address ("ב"ח יו"ד קא"), spelled out as the heRefs spell it.
+    let section = acronym_section_tokens(name_tokens, &own_words);
+    let lead_part = toc_tokens.first().filter(|t| may_name_a_part(t)).cloned();
+    let toc: Option<Arc<BookToc>> = if !section.is_empty() || lead_part.is_some() {
+        index.toc.get(conn, bid).ok()
+    } else {
+        None
+    };
+    let mut part_words: Option<Vec<String>> = None;
+    let mut spelled: Vec<String> = Vec::new();
+    if let Some(toc) = &toc {
+        if let Some(sp) = toc.spell_part(&section) {
+            spelled.push(join_nonempty(&sp.join(" "), cleaned));
+            part_words = Some(sp);
+        } else if let Some(first) = &lead_part {
+            if let Some(sp) = toc.spell_part(std::slice::from_ref(first)) {
+                spelled.push(join_nonempty(&sp.join(" "), &toc_tokens[1..].join(" ")));
                 part_words = Some(sp);
-            } else if let Some(first) = &lead_part {
-                if let Some(sp) = toc.spell_part(std::slice::from_ref(first)) {
-                    spelled.push(join_nonempty(&sp.join(" "), &toc_tokens[1..].join(" ")));
-                    part_words = Some(sp);
-                }
             }
         }
+    }
 
-        // (address to match heRefs with, text the canonical key is built from): the typed
-        // address keys off its raw form, so ranges and contextual ע"א/ע"ב survive. A
-        // spelled-out part comes first: the key with the part beats the one without it.
-        let mut variants: Vec<(&str, &str)> = Vec::new();
-        for v in &spelled {
-            variants.push((v.as_str(), v.as_str()));
+    // (address to match heRefs with, text the canonical key is built from): the typed
+    // address keys off its raw form, so ranges and contextual ע"א/ע"ב survive. A
+    // spelled-out part comes first: the key with the part beats the one without it.
+    let mut variants: Vec<(&str, &str)> = Vec::new();
+    for v in &spelled {
+        variants.push((v.as_str(), v.as_str()));
+    }
+    if !variants.iter().any(|(a, _)| *a == address) {
+        variants.push((address.as_str(), raw_address.as_str()));
+    }
+    // The title's words anywhere in the address are no part of it ("חתם סופר שו"ת או"ח
+    // לב": שו"ת is the title's) — the app's flat TOC search, matching the whole reference
+    // title included, lets them pass.
+    let title_tokens: Vec<String> =
+        crate::detect::normalize_find_ref(&format!("{title} {book_href}"))
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+    let untitled = crate::detect::drop_title_words(
+        cleaned.split_whitespace().map(str::to_string).collect(),
+        &title_tokens,
+        &[],
+    )
+    .join(" ");
+    let toc_untitled: Vec<String> =
+        crate::detect::drop_title_words(toc_tokens.to_vec(), &title_tokens, &[]);
+    for v in [cleaned.as_str(), without_title.as_str(), untitled.as_str()] {
+        // A cleanup that leaves nothing would just point at the book's start.
+        if !variants.iter().any(|(a, _)| *a == v) && (!v.is_empty() || address.is_empty()) {
+            variants.push((v, v));
         }
-        if !variants.iter().any(|(a, _)| *a == address) {
-            variants.push((address.as_str(), raw_address.as_str()));
-        }
-        for v in [cleaned.as_str(), without_title.as_str()] {
-            // A cleanup that leaves nothing would just point at the book's start.
-            if !variants.iter().any(|(a, _)| *a == v) && (!v.is_empty() || address.is_empty()) {
-                variants.push((v, v));
-            }
-        }
+    }
 
-        let mut found: Vec<(i64, Option<String>, &'static str)> = Vec::new();
-        let mut used = address.as_str();
-        for (vi, (v, key_source)) in variants.iter().enumerate() {
-            let key = refkey::build_ref_key(key_source);
-            if let Some(h) = by_line_ref(conn, caps, bid, key.as_deref())? {
-                // a part was named: a hit in another part is not this reference
-                if part_words.as_ref().is_none_or(|p| in_part(&h.1, p)) {
-                    found.push(h);
-                    used = v;
-                    break;
-                }
+    let mut found: Vec<(i64, Option<String>, &'static str)> = Vec::new();
+    let mut used = address.as_str();
+    for (vi, (v, key_source)) in variants.iter().enumerate() {
+        let key = refkey::build_ref_key(key_source);
+        if let Some(h) = by_line_ref(conn, caps, bid, key.as_deref())? {
+            // a part was named: a hit in another part is not this reference
+            if part_words.as_ref().is_none_or(|p| in_part(&h.1, p)) {
+                found.push(h);
+                used = v;
+                break;
             }
-            // The key with the part's name omitted ("טור שט ג"): one candidate per part
-            // (a single number names a heading, not a line: "ב"ח קא" goes to the TOC).
-            if let Some(k) = key
-                .as_deref()
-                .filter(|k| vi >= spelled.len() && refkey::ref_key_tokens(k).len() >= 2)
+        }
+        // The key with the part's name omitted ("טור שט ג"): one candidate per part
+        // (a single number names a heading, not a line: "ב"ח קא" goes to the TOC).
+        if let Some(k) = key
+            .as_deref()
+            .filter(|k| vi >= spelled.len() && refkey::ref_key_tokens(k).len() >= 2)
+        {
+            let mut hits = by_partial_line_ref(conn, caps, bid, k)?;
+            if let Some(p) = &part_words {
+                hits.retain(|h| in_part(&h.1, p));
+            }
+            if !hits.is_empty() {
+                found = hits;
+                used = v;
+                break;
+            }
+        }
+        // heRefs rarely spell locator words ("פרק", "עמוד" from ע"א …): retry the
+        // heRef match with the canonical key's tokens when they differ.
+        let key_address = key.clone().filter(|k| k != v);
+        let hit = match by_heref(conn, index, bid, v)? {
+            Some(c) => Some(c),
+            None => match &key_address {
+                Some(k) => by_heref(conn, index, bid, k)?,
+                None => None,
+            },
+        };
+        if let Some(h) = hit {
+            if part_words.as_ref().is_none_or(|p| in_part(&h.1, p)) {
+                found.push(h);
+                used = v;
+                break;
+            }
+        }
+    }
+    if found.is_empty() && !address.is_empty() {
+        let (mut hits, mut complete) = by_toc_tree(
+            conn,
+            caps,
+            index,
+            bid,
+            toc.clone(),
+            &section,
+            part_words.as_deref(),
+            toc_tokens,
+            raw_address,
+        )?;
+        if !complete && !toc_untitled.is_empty() && toc_untitled.len() < toc_tokens.len() {
+            // a range's end ("לב-לג") is no heading of its own
+            let mut toc_untitled = toc_untitled.clone();
+            let n = toc_untitled.len();
+            if n >= 2
+                && raw_address.contains('-')
+                && refkey::is_hebrew_numeral(&toc_untitled[n - 1])
+                && refkey::is_hebrew_numeral(&toc_untitled[n - 2])
             {
-                let mut hits = by_partial_line_ref(conn, caps, bid, k)?;
-                if let Some(p) = &part_words {
-                    hits.retain(|h| in_part(&h.1, p));
-                }
-                if !hits.is_empty() {
-                    found = hits;
-                    used = v;
-                    break;
-                }
+                toc_untitled.pop();
             }
-            // heRefs rarely spell locator words ("פרק", "עמוד" from ע"א …): retry the
-            // heRef match with the canonical key's tokens when they differ.
-            let key_address = key.clone().filter(|k| k != v);
-            let hit = match by_heref(conn, index, bid, v)? {
-                Some(c) => Some(c),
-                None => match &key_address {
-                    Some(k) => by_heref(conn, index, bid, k)?,
-                    None => None,
-                },
-            };
-            if let Some(h) = hit {
-                if part_words.as_ref().is_none_or(|p| in_part(&h.1, p)) {
-                    found.push(h);
-                    used = v;
-                    break;
-                }
-            }
-        }
-        if found.is_empty() && !address.is_empty() {
-            let (hits, complete) = by_toc_tree(
+            let (h2, c2) = by_toc_tree(
                 conn,
                 caps,
                 index,
@@ -460,75 +727,437 @@ pub fn resolve(
                 toc.clone(),
                 &section,
                 part_words.as_deref(),
-                &toc_tokens,
-                &raw_address,
+                &toc_untitled,
+                &toc_untitled.join(" "),
             )?;
-            // a heading reached by part of the address only yields to a dibbur hamatchil
-            if complete && !hits.is_empty() {
-                found = hits;
-            } else if let Some(c) = by_dibur(conn, caps, bid, &address)? {
-                found.push(c);
-            } else {
-                found = hits;
+            if c2 && !h2.is_empty() {
+                (hits, complete) = (h2, c2);
             }
         }
-        if let Some(dh) = &dibbur {
-            for f in found.iter_mut() {
-                let d = match f.2 {
-                    "dibur_hamatchil" => None,
-                    // a heading: the dibbur anywhere in its section ("ב"ח קא ד"ה …")
-                    "toc" | "toc_partial" => {
-                        let toc = index.toc.get(conn, bid)?;
-                        let hi = toc.section_end(f.0).unwrap_or(i64::MAX);
-                        dibur_in_lines(conn, caps, bid, f.0, hi, dh)?
-                    }
-                    _ => dibur_in_ref(conn, caps, index, bid, used, f.0, dh)?,
-                };
-                if let Some(d) = d {
-                    *f = d;
-                }
-            }
-            // where the dibbur was found, the locations without it are not the reference
-            if found.iter().any(|f| f.2 == "dibur_in_ref") {
-                found.retain(|f| f.2 == "dibur_in_ref");
-            }
-        }
-        let toc = if found.iter().any(|f| f.2.starts_with("toc")) {
-            index.toc.get(conn, bid).ok()
+        // a heading reached by part of the address only yields to a dibbur hamatchil
+        if complete && !hits.is_empty() {
+            found = hits;
+        } else if let Some(c) = by_dibur(conn, caps, bid, address)? {
+            found.push(c);
         } else {
-            None
+            found = hits;
+        }
+    }
+    if let Some(dh) = &dibbur {
+        for f in found.iter_mut() {
+            let d = match f.2 {
+                "dibur_hamatchil" => None,
+                // a heading: the dibbur anywhere in its section ("ב"ח קא ד"ה …")
+                "toc" | "toc_partial" => {
+                    let toc = index.toc.get(conn, bid)?;
+                    let hi = toc.section_end(f.0).unwrap_or(i64::MAX);
+                    dibur_in_lines(conn, caps, bid, f.0, hi, dh)?
+                }
+                _ => dibur_in_ref(conn, caps, index, bid, used, f.0, dh)?,
+            };
+            if let Some(d) = d {
+                *f = d;
+            }
+        }
+        // where the dibbur was found, the locations without it are not the reference
+        if found.iter().any(|f| f.2 == "dibur_in_ref") {
+            found.retain(|f| f.2 == "dibur_in_ref");
+        }
+    }
+    let toc = if found.iter().any(|f| f.2.starts_with("toc")) {
+        index.toc.get(conn, bid).ok()
+    } else {
+        None
+    };
+    for (line_index, he_ref, kind) in found {
+        let toc_path = toc
+            .as_ref()
+            .filter(|_| kind.starts_with("toc"))
+            .and_then(|t| t.heading_path(line_index));
+        let reference = display_reference(&title, he_ref.as_deref(), toc_path.as_deref(), address);
+        out.push(RefCandidate {
+            book_id: bid,
+            book_title: title.clone(),
+            line_index,
+            he_ref,
+            toc_path,
+            snippet: String::new(),
+            reference,
+            is_source_line: matches!(
+                kind,
+                "exact" | "partial" | "dibur_in_ref" | "dibur_hamatchil"
+            ),
+            is_pdf: index.is_pdf(bid),
+            book_rank: 0,
+            name_score: 0,
+            ref_score: 0,
+            rank: 0,
+            title_extra: 0,
+            scored: false,
+            source: Source::Library,
+            library: None,
+            book_uid: String::new(),
+            link: String::new(),
+            match_kind: kind,
+        });
+    }
+    if !out.is_empty() {
+        let (score, extra) = index.name_score(bid, &q.query_tokens);
+        for c in out.iter_mut() {
+            c.name_score = score;
+            c.title_extra = extra;
+            c.scored = true;
+        }
+    }
+    Ok(out)
+}
+
+/// Order candidates — from one database or several — best first, drop repeats, and
+/// number them with [`RefCandidate::rank`]. Best: the title that accounts for most of the
+/// query; then the book named most directly (a leading name, then the app's match
+/// ranks); the title with fewest words the query left out; the match kind; the
+/// reference that accounts for most of the query. Library, personal, attached break ties.
+pub fn rank_candidates(query: &str, cands: Vec<RefCandidate>) -> Vec<RefCandidate> {
+    use crate::detect::{match_score, normalize_find_ref};
+    let words = |s: &str| -> Vec<String> {
+        normalize_find_ref(s)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    let (ref_part, _) = split_dibbur(query.trim());
+    let q = words(&refkey::expand_query_amud_marks(&ref_part));
+    let mut scored: Vec<(usize, RefCandidate)> = cands
+        .into_iter()
+        .map(|mut c| {
+            if !c.scored {
+                let title = words(&c.book_title);
+                let (ts, used) = match_score(&title, &q);
+                c.name_score = ts as u32;
+                c.title_extra = (title.len() - used) as u32;
+                c.scored = true;
+            }
+            let r = if c.reference.is_empty() {
+                c.book_title.clone()
+            } else {
+                c.reference.clone()
+            };
+            c.ref_score = match_score(&words(&r), &q).0 as u32;
+            c
+        })
+        .enumerate()
+        .collect();
+    let key = |c: &RefCandidate| {
+        (
+            std::cmp::Reverse(c.name_score),
+            c.book_rank,
+            c.title_extra,
+            kind_rank(c.match_kind),
+            std::cmp::Reverse(c.ref_score),
+        )
+    };
+    scored.sort_by(|(i, a), (j, b)| {
+        key(a)
+            .cmp(&key(b))
+            .then(a.source.rank().cmp(&b.source.rank()))
+            .then(i.cmp(j))
+    });
+    let mut seen = HashSet::new();
+    let mut out: Vec<RefCandidate> = Vec::with_capacity(scored.len());
+    let mut rank = 0u32;
+    let mut prev = None;
+    for (_, mut c) in scored {
+        if !seen.insert((c.source.clone(), c.book_id, c.line_index)) {
+            continue;
+        }
+        let k = key(&c);
+        if prev.is_some_and(|p| p != k) {
+            rank += 1;
+        }
+        prev = Some(k);
+        c.rank = rank;
+        out.push(c);
+    }
+    out
+}
+
+/// The app's wording of a location: a heading's path after the book title (its first
+/// heading dropped when it only repeats the title), a line's heRef, else the title and
+/// the address.
+fn display_reference(
+    title: &str,
+    he_ref: Option<&str>,
+    toc_path: Option<&str>,
+    address: &str,
+) -> String {
+    if let Some(path) = toc_path {
+        let parts: Vec<&str> = path.split(" > ").collect();
+        let t = crate::detect::normalize_find_ref(title);
+        let skip = usize::from(parts.len() > 1 && crate::detect::normalize_find_ref(parts[0]) == t);
+        let mut out = title.to_string();
+        for p in &parts[skip..] {
+            out.push(' ');
+            out.push_str(p);
+        }
+        return out;
+    }
+    if let Some(h) = he_ref.filter(|h| !h.trim().is_empty()) {
+        return h.to_string();
+    }
+    join_nonempty(title, address)
+}
+
+/// The app's book detection: the books the query's words begin, contain or abbreviate,
+/// each searched with what is left of the query once its title's words are taken out.
+/// A book that matched and left nothing to look up is a candidate itself ("book").
+fn detected_books(
+    conn: &Connection,
+    caps: &Caps,
+    index: &RefIndex,
+    ref_part: &str,
+    dibbur: &Option<String>,
+) -> Result<Vec<RefCandidate>> {
+    // The books a longer phrase named may hold nothing at that address ("חת"ס חו"מ"
+    // names חתם סופר על שו"ע חו"מ; the responsa are "חת"ס"): then a shorter phrase.
+    let mut max_phrase = 3;
+    loop {
+        let (found, n) = detected_books_once(conn, caps, index, ref_part, dibbur, max_phrase)?;
+        if !found.is_empty() || n <= 1 {
+            return Ok(found);
+        }
+        max_phrase = n - 1;
+    }
+}
+
+fn detected_books_once(
+    conn: &Connection,
+    caps: &Caps,
+    index: &RefIndex,
+    ref_part: &str,
+    dibbur: &Option<String>,
+    max_phrase: usize,
+) -> Result<(Vec<RefCandidate>, usize)> {
+    use crate::detect::{normalize_find_ref, remaining_tokens, split_inner_marks};
+    let expanded = refkey::expand_query_amud_marks(ref_part);
+    let mut tokens: Vec<String> = normalize_find_ref(&expanded)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if tokens.is_empty() {
+        return Ok((vec![], 0));
+    }
+    let titles = index.titles();
+    let (mut hits, phrase_len) = titles.detect(&tokens, max_phrase);
+    // Most responsa do not carry "שו"ת" in their title: the detection without it wins
+    // when it covers more of the query.
+    let mut dropped_genre = false;
+    if tokens.len() > 1 && matches!(tokens[0].as_str(), "שות" | "תשובות") {
+        let (h2, n2) = titles.detect(&tokens[1..], max_phrase);
+        if !h2.is_empty() && n2 > phrase_len {
+            hits = h2;
+            tokens.remove(0);
+            dropped_genre = true;
+        }
+    }
+    if hits.is_empty() {
+        return Ok((vec![], 0));
+    }
+    // The raw words, so the address keeps what refkey and the citation cleanup read
+    // (quotes of ס"ק, ranges); each with its normalized tokens.
+    let mut raw: Vec<(String, Vec<String>)> = expanded
+        .split_whitespace()
+        .map(|w| {
+            let w = split_inner_marks(w);
+            let n = normalize_find_ref(&w)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            (w, n)
+        })
+        .collect();
+    if dropped_genre && !raw.is_empty() {
+        raw.remove(0);
+    }
+
+    // Too many books to look into: the best-covered ones first (the app's cap is 50).
+    let order: Vec<(usize, (usize, usize))> = hits
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            (
+                i,
+                (
+                    crate::detect::title_coverage(&h.tokens, &tokens),
+                    crate::detect::match_score(&h.tokens, &tokens).0,
+                ),
+            )
+        })
+        .collect();
+    // The app looks into the TOC of 50 books only, but into the canonical-key index of
+    // every one: beyond the 50, a book is checked by key alone.
+    let mut light: HashSet<usize> = HashSet::new();
+    if order.len() > 50 {
+        let mut by_cover = order.clone();
+        by_cover.sort_by_key(|(i, c)| (std::cmp::Reverse(*c), *i));
+        light = by_cover[50..].iter().map(|(i, _)| *i).collect();
+    }
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for (i, _) in order {
+        let hit = &hits[i];
+        // a "contains" hit keeps the phrase length it was found at
+        let n = hit.phrase_len.max(1);
+        // An acronym's words are its name; a title match's words are taken out as the
+        // title's words wherever they stand (the app's rule) — except a misspelt one
+        // (the approximate match), which no title word would take.
+        let (strip, prefix) = if hit.rank >= 3 { (n, 0) } else { (0, n) };
+        let remaining = crate::detect::drop_title_words(
+            remaining_tokens(&tokens, &hit.tokens, strip, prefix),
+            &hit.tokens,
+            &tokens[..n.min(tokens.len())],
+        );
+        if std::env::var_os("OTZARIA_MCP_DEBUG").is_some() {
+            eprintln!(
+                "detect: book {} {:?} rank {} n {} remaining {:?}",
+                hit.id,
+                index.title(hit.id),
+                hit.rank,
+                n,
+                remaining
+            );
+        }
+        if !seen.insert((hit.id, remaining.join(" "))) {
+            continue;
+        }
+        // Raw words whose tokens all went to the title (or the acronym) are dropped.
+        let mut removed: Vec<String> = tokens[..strip.min(tokens.len())].to_vec();
+        let mut rest_pool = remaining.clone();
+        for t in &tokens[strip.min(tokens.len())..] {
+            if let Some(p) = rest_pool.iter().position(|r| r == t) {
+                rest_pool.remove(p);
+            } else {
+                removed.push(t.clone());
+            }
+        }
+        let mut kept: Vec<&str> = Vec::new();
+        for (w, toks) in &raw {
+            if toks.is_empty() {
+                continue;
+            }
+            let mut pool = removed.clone();
+            let all_removed = toks.iter().all(|t| match pool.iter().position(|r| r == t) {
+                Some(p) => {
+                    pool.remove(p);
+                    true
+                }
+                None => false,
+            });
+            if all_removed {
+                removed = pool;
+            } else {
+                kept.push(w.as_str());
+            }
+        }
+        let raw_address = kept.join(" ");
+        let address = normalize_ref(&raw_address);
+        let cleaned_tokens = normalize_ref(&clean_address(&kept).join(" "));
+        let cleaned = drop_leading(&cleaned_tokens, |t| PART_NAMES.contains(&t));
+        let q = AddrQuery {
+            name_tokens: tokens[..n.min(tokens.len())].to_vec(),
+            raw_address,
+            address: address.clone(),
+            cleaned,
+            toc_tokens: cleaned_tokens
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+            query_tokens: tokens.clone(),
         };
-        for (line_index, he_ref, kind) in found {
-            out.push(RefCandidate {
-                book_id: bid,
+        let is_light = light.contains(&i);
+        let mut found = if address.is_empty() && index.is_pdf(hit.id) {
+            vec![]
+        } else if is_light {
+            if address.is_empty() {
+                continue;
+            }
+            by_key_only(conn, caps, index, hit.id, &q)?
+        } else {
+            resolve_in_book(conn, caps, index, hit.id, &q, dibbur)?
+        };
+        if found.is_empty() && remaining.is_empty() && !is_light {
+            let title = index.title(hit.id);
+            found.push(RefCandidate {
+                book_id: hit.id,
                 book_title: title.clone(),
-                line_index,
-                he_ref,
-                toc_path: toc
-                    .as_ref()
-                    .filter(|_| kind.starts_with("toc"))
-                    .and_then(|t| t.heading_path(line_index)),
+                line_index: 0,
+                he_ref: None,
+                toc_path: None,
                 snippet: String::new(),
-                match_kind: kind,
+                reference: title,
+                is_source_line: false,
+                is_pdf: index.is_pdf(hit.id),
+                book_rank: 0,
+                name_score: 0,
+                ref_score: 0,
+                rank: 0,
+                title_extra: 0,
+                scored: false,
+                source: Source::Library,
+                library: None,
+                book_uid: String::new(),
+                link: String::new(),
+                match_kind: "book",
             });
         }
+        for c in found.iter_mut() {
+            c.book_rank = hit.rank + 1;
+        }
+        out.extend(found);
     }
+    Ok((out, phrase_len))
+}
 
-    if out.is_empty() {
-        return fallback_heref_like(conn, &ref_part, limit);
+/// A book beyond the app's TOC cap: only the canonical key of the address.
+fn by_key_only(
+    conn: &Connection,
+    caps: &Caps,
+    index: &RefIndex,
+    bid: i64,
+    q: &AddrQuery,
+) -> Result<Vec<RefCandidate>> {
+    let mut out = Vec::new();
+    for src in [q.raw_address.as_str(), q.cleaned.as_str()] {
+        let key = refkey::build_ref_key(src);
+        if let Some((line_index, he_ref, kind)) = by_line_ref(conn, caps, bid, key.as_deref())? {
+            let title = index.title(bid);
+            let reference = display_reference(&title, he_ref.as_deref(), None, &q.address);
+            let (name_score, title_extra) = index.name_score(bid, &q.query_tokens);
+            out.push(RefCandidate {
+                book_id: bid,
+                book_title: title,
+                line_index,
+                he_ref,
+                toc_path: None,
+                snippet: String::new(),
+                reference,
+                is_source_line: true,
+                is_pdf: index.is_pdf(bid),
+                book_rank: 0,
+                name_score,
+                ref_score: 0,
+                rank: 0,
+                title_extra,
+                scored: true,
+                source: Source::Library,
+                library: None,
+                book_uid: String::new(),
+                link: String::new(),
+                match_kind: kind,
+            });
+            break;
+        }
     }
-
-    // Rank: best match kind first; base texts before commentaries; then catalogue order.
-    out.sort_by_key(|c| {
-        (
-            kind_rank(c.match_kind),
-            !index.is_base(c.book_id),
-            index.order(c.book_id),
-            c.book_id,
-            c.line_index,
-        )
-    });
-    out.truncate(limit.max(1) as usize);
     Ok(out)
 }
 
@@ -962,6 +1591,19 @@ fn fallback_heref_like(conn: &Connection, query: &str, limit: i64) -> Result<Vec
             he_ref: r.get(3)?,
             toc_path: None,
             snippet: String::new(),
+            reference: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            is_source_line: true,
+            is_pdf: false,
+            book_rank: 0,
+            name_score: 0,
+            ref_score: 0,
+            rank: 0,
+            title_extra: 0,
+            scored: false,
+            source: Source::Library,
+            library: None,
+            book_uid: String::new(),
+            link: String::new(),
             match_kind: "fallback",
         })
     })?;

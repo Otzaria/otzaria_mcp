@@ -64,6 +64,7 @@ fn library(path: std::path::PathBuf) -> std::sync::Arc<Library> {
         lexical_db: None,
         dictionaries_dir: None,
         snapshot: false,
+        secondary: Default::default(),
     })
     .unwrap()
 }
@@ -94,7 +95,8 @@ async fn mcp_responses_track_wal_metadata_without_reloading() {
             index: None,
             lexical_db: None,
             dictionaries_dir: None,
-            snapshot: false
+            snapshot: false,
+            secondary: Default::default(),
         })
     );
     let second = request(

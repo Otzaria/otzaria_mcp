@@ -36,6 +36,20 @@ PATH OPTIONS (precedence: flags > env > --data-dir > per-OS defaults):
      on macOS; ~/.local/share/otzaria then /var/lib/otzaria on Linux —
      <root>/books/seforim.db and <root>/index)
     --snapshot            Open the DB with immutable=1 (closed snapshot; ignores WAL)
+
+SECONDARY SOURCES (personal books and attached databases, as the app's find-ref sees them;
+read by resolve_ref when asked for — see its `sources` parameter — and by search_books):
+    --app-data-dir <dir>  The app's data folder (app_preferences.hive, databases/)
+                                                        [env: OTZARIA_APP_DATA_DIR]
+                          (default: the folder holding books/, else the per-OS root)
+    --user-books-db <path>
+                          Personal books database        [env: OTZARIA_USER_BOOKS_DB]
+                          (default: <app data>/databases/user_books.db)
+    --attached <slug>=<path>
+                          An attached database; repeatable. Replaces the app's own list
+                          (read from app_preferences.hive and followed live)
+                                                        [env: OTZARIA_ATTACHED, `;`-separated]
+    --no-secondary        Library only
     -h, --help            Print this help
     -V, --version         Print version
 ";
@@ -68,6 +82,14 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "(none)".into()),
         paths.snapshot,
     );
+    for spec in paths.secondary.discover() {
+        eprintln!(
+            "otzaria-mcp: {} source {} = {}",
+            spec.source.kind(),
+            spec.name,
+            spec.path.display()
+        );
+    }
 
     // Library holds the current DB+index snapshot and hot-reloads it when the
     // underlying files change (opening the index logs to stderr internally).
@@ -110,6 +132,19 @@ fn parse_args() -> Result<Option<PathArgs>> {
                 return Ok(None);
             }
             "--snapshot" => args.snapshot = true,
+            "--no-secondary" => args.no_secondary = true,
+            "--app-data-dir" => {
+                args.app_data_dir = Some(PathBuf::from(next_value(&mut it, "--app-data-dir")?))
+            }
+            "--user-books-db" => {
+                args.user_books_db = Some(PathBuf::from(next_value(&mut it, "--user-books-db")?))
+            }
+            "--attached" => {
+                let v = next_value(&mut it, "--attached")?;
+                let pair = otzaria_mcp::paths::parse_attached_arg(&v)
+                    .ok_or_else(|| anyhow::anyhow!("--attached expects <slug>=<path>, got {v}"))?;
+                args.attached.push(pair);
+            }
             "--db" => args.db = Some(PathBuf::from(next_value(&mut it, "--db")?)),
             "--index" => args.index = Some(PathBuf::from(next_value(&mut it, "--index")?)),
             "--lexical-db" => {

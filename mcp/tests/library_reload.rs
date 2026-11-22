@@ -19,6 +19,7 @@ fn paths(root: &Path, indexed: bool) -> Paths {
         lexical_db: None,
         dictionaries_dir: None,
         snapshot: false,
+        secondary: Default::default(),
     }
 }
 
