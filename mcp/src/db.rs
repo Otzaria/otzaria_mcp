@@ -7,9 +7,16 @@
 //! plain `line.content`): every optional table/column is probed once at open time
 //! ([`Caps`]). The DB is opened with `SQLITE_OPEN_READ_ONLY` (WAL-aware) by default, or
 //! `immutable=1` only in explicit `--snapshot` mode, and `PRAGMA query_only=ON`.
+//!
+//! The connection is not kept for the life of the process: see [`crate::idle`]. A database
+//! opened from a file is closed once it has been idle a moment (and right after each use
+//! while the app is updating it), and reopened by the next query, so the app can always
+//! change its journal mode or replace the file.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rusqlite::types::{Value, ValueRef};
@@ -31,6 +38,122 @@ type StoredLineRow = (i64, i64, Option<String>, Value);
 pub struct Inner {
     pub conn: Connection,
     pub codec: LineCodec,
+}
+
+/// The database file a [`Db`] reads, to open it again after an idle close.
+#[derive(Clone, Debug)]
+pub(crate) struct FileSource {
+    pub path: PathBuf,
+    immutable: bool,
+}
+
+impl FileSource {
+    fn connect(&self) -> Result<Connection> {
+        let conn = if self.immutable {
+            Connection::open_with_flags(
+                format!("file:{}?immutable=1", self.path.display()),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )
+        } else {
+            Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        }?;
+        // the app may be writing (or changing the journal mode); wait for its lock rather
+        // than failing a lookup
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA query_only=ON;")
+            .context("setting query_only pragma")?;
+        Ok(conn)
+    }
+
+    /// [`Self::connect`], once more after a moment: the app replaces a file by renaming,
+    /// and the path can be missing for an instant.
+    fn reconnect(&self) -> Result<Connection> {
+        self.connect().or_else(|_| {
+            std::thread::sleep(Duration::from_millis(150));
+            self.connect()
+        })
+    }
+}
+
+/// A [`Db`]'s connection, which [`crate::idle`] closes while nobody uses it.
+pub(crate) struct ConnSlot {
+    state: Mutex<SlotState>,
+    /// `None` for a connection given by the caller (tests): never closed.
+    source: Option<FileSource>,
+}
+
+struct SlotState {
+    /// While closed, `conn` is an empty in-memory placeholder; the codec is kept.
+    inner: Inner,
+    open: bool,
+    last_used: Instant,
+}
+
+impl ConnSlot {
+    /// Close the connection when nobody holds it and it has been idle for `idle`, or at once
+    /// when `release_now` says the app needs the file. Returns whether it closed it.
+    pub(crate) fn release_if_idle(&self, idle: Duration) -> bool {
+        let Some(source) = &self.source else {
+            return false;
+        };
+        let Ok(mut state) = self.state.try_lock() else {
+            return false; // in use (or poisoned: the next lock() recovers it)
+        };
+        if !state.open {
+            return false;
+        }
+        if state.last_used.elapsed() < idle && !crate::idle::release_now(&source.path) {
+            return false;
+        }
+        close(&mut state);
+        true
+    }
+}
+
+fn close(state: &mut SlotState) {
+    match Connection::open_in_memory() {
+        Ok(placeholder) => {
+            // Dropping the old connection closes the file; a failed close (an unfinalized
+            // statement cannot be left behind here) only leaves it open.
+            drop(std::mem::replace(&mut state.inner.conn, placeholder));
+            state.open = false;
+        }
+        Err(e) => eprintln!("otzaria-mcp: cannot close an idle connection: {e}"),
+    }
+}
+
+/// [`Db::lock`]'s guard: the connection and codec of one query. On release it stamps the
+/// connection's use, and closes it at once when the app is updating the database.
+pub(crate) struct DbGuard<'a> {
+    state: MutexGuard<'a, SlotState>,
+    source: Option<&'a FileSource>,
+}
+
+impl std::ops::Deref for DbGuard<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.state.inner
+    }
+}
+
+impl std::ops::DerefMut for DbGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.state.inner
+    }
+}
+
+impl Drop for DbGuard<'_> {
+    fn drop(&mut self) {
+        self.state.last_used = Instant::now();
+        if let Some(source) = self.source {
+            if self.state.open
+                && self.state.inner.conn.is_autocommit()
+                && crate::idle::release_now(&source.path)
+            {
+                close(&mut self.state);
+            }
+        }
+    }
 }
 
 /// What the opened database has. Probed once; every query adapts to it.
@@ -199,7 +322,7 @@ impl Serialize for Era {
 }
 
 pub struct Db {
-    inner: Mutex<Inner>,
+    slot: Arc<ConnSlot>,
     pub caps: Caps,
     /// Lazily-built normalized book-name index for resolve_ref (find_ref cache).
     ref_index: OnceLock<RefIndex>,
@@ -209,35 +332,84 @@ pub struct Db {
 
 impl Db {
     pub fn open(paths: &Paths) -> Result<Db> {
-        let conn = if paths.snapshot {
-            let uri = format!("file:{}?immutable=1", paths.db.display());
-            Connection::open_with_flags(
-                uri,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-            )
-        } else {
-            Connection::open_with_flags(&paths.db, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        }
-        .with_context(|| format!("opening seforim.db at {}", paths.db.display()))?;
-        Db::from_connection(conn)
+        Db::open_file(&paths.db, paths.snapshot)
+            .with_context(|| format!("opening seforim.db at {}", paths.db.display()))
     }
 
-    /// Wrap an already-open connection (also used by tests with in-memory fixtures).
+    /// Open a database file read-only (`immutable=1` when asked). Its connection is
+    /// closed while idle and reopened by the next query (see [`crate::idle`]).
+    pub fn open_file(path: &Path, immutable: bool) -> Result<Db> {
+        let source = FileSource {
+            path: path.to_path_buf(),
+            immutable,
+        };
+        let conn = source.connect()?;
+        Db::build(conn, Some(source))
+    }
+
+    /// Wrap an already-open connection (also used by tests with in-memory fixtures). It is
+    /// never closed before the `Db` is dropped: there is no file to open it again from.
     pub fn from_connection(conn: Connection) -> Result<Db> {
         conn.execute_batch("PRAGMA query_only=ON;")
             .context("setting query_only pragma")?;
+        Db::build(conn, None)
+    }
+
+    fn build(conn: Connection, source: Option<FileSource>) -> Result<Db> {
         let caps = Caps::probe(&conn).context("probing seforim.db tables")?;
         let codec = LineCodec::load(&conn).context("loading zstd dictionaries")?;
+        let slot = Arc::new(ConnSlot {
+            state: Mutex::new(SlotState {
+                inner: Inner { conn, codec },
+                open: true,
+                last_used: Instant::now(),
+            }),
+            source,
+        });
+        if slot.source.is_some() {
+            crate::idle::register(&slot);
+        }
         Ok(Db {
-            inner: Mutex::new(Inner { conn, codec }),
+            slot,
             caps,
             ref_index: OnceLock::new(),
             eras: OnceLock::new(),
         })
     }
 
-    pub(crate) fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    /// The connection, reopened first when it was closed while idle. Held for one query
+    /// (or a few): while it is held the connection is never closed.
+    pub(crate) fn lock(&self) -> DbGuard<'_> {
+        let mut state = self.slot.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.open {
+            if let Some(source) = &self.slot.source {
+                match source.reconnect() {
+                    Ok(conn) => {
+                        state.inner.conn = conn;
+                        state.open = true;
+                    }
+                    // The query runs against the empty placeholder and fails ("no such
+                    // table"); the next one tries again.
+                    Err(e) => eprintln!(
+                        "otzaria-mcp: cannot reopen {}: {e:#}",
+                        source.path.display()
+                    ),
+                }
+            }
+        }
+        DbGuard {
+            state,
+            source: self.slot.source.as_ref(),
+        }
+    }
+
+    /// Whether the connection is open now (it is closed while idle).
+    pub fn is_open(&self) -> bool {
+        self.slot
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .open
     }
 
     // ── content SQL fragments ────────────────────────────────────────────────
