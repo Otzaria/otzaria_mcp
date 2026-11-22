@@ -4,6 +4,7 @@
 
 pub mod admission;
 pub mod db;
+pub mod idle;
 pub mod links;
 pub mod paths;
 pub mod refkey;
