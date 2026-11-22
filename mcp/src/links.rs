@@ -368,6 +368,8 @@ impl Db {
         let limit_ph = params.len();
         params.push(offset.into());
         let offset_ph = params.len();
+        // On each anchor line, links that start there come before links that only cover it
+        // (`link_coverage`: a range over a whole perek, an introduction).
         let sql = format!(
             "{anchors_cte} \
              SELECT l.id, COALESCE(ct.name, 'OTHER'), al.lineIndex, a.anchorLineId, {this_line}, \
@@ -380,7 +382,7 @@ impl Db {
                LEFT JOIN connection_type ct ON ct.id = l.connectionTypeId \
                {range_join} \
                {where_sql} \
-              ORDER BY al.lineIndex, ob.orderIndex, ol.lineIndex, l.id \
+              ORDER BY al.lineIndex, a.anchorLineId != {this_line}, ob.orderIndex, ol.lineIndex, l.id \
               LIMIT ?{limit_ph} OFFSET ?{offset_ph}"
         );
         let mut stmt = inner.conn.prepare(&sql)?;
