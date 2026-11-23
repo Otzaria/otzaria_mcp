@@ -199,6 +199,31 @@ fn text_versions_toc_categories_and_info() {
 }
 
 #[test]
+fn links_starting_on_the_line_come_before_links_covering_it() {
+    let db = fixture_db();
+    // A commentary that starts on base line 1, from a book later in catalogue order than
+    // the range link (lines 0-2) that only covers line 1.
+    db.lock()
+        .conn
+        .execute_batch(
+            "PRAGMA query_only=OFF; INSERT INTO link VALUES (300, 1, 3, 11, 30, 0, 3, 1, 0); PRAGMA query_only=ON;",
+        )
+        .unwrap();
+    let out = db
+        .get_links(1, Some((1, 1)), None, None, "outgoing", 10, 0)
+        .unwrap();
+    let ids: Vec<i64> = out.iter().map(|l| l.link_id).collect();
+    assert_eq!(ids, [300, 100], "{out:?}");
+    let first = db
+        .get_links(1, Some((1, 1)), None, None, "outgoing", 1, 0)
+        .unwrap();
+    assert_eq!(
+        first[0].link_id, 300,
+        "the covering link must not crowd it out"
+    );
+}
+
+#[test]
 fn range_link_is_deduplicated_before_link_pagination() {
     let db = fixture_db();
     {
