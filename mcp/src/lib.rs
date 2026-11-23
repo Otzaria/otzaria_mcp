@@ -15,6 +15,9 @@ pub mod server;
 pub mod text;
 pub mod toc_search;
 
+#[cfg(windows)]
+mod windows_file;
+
 #[cfg(test)]
 mod fixture_tests;
 

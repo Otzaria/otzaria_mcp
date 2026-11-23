@@ -1,8 +1,10 @@
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::Arc;
 
 use otzaria_mcp::paths::Paths;
 use otzaria_mcp::reload::{fingerprint, Library};
+#[cfg(unix)]
 use otzaria_mcp::search::{Mode, SearchRequest};
 use rusqlite::Connection;
 use search_engine::api::search_engine::{refresh_line_source, SearchEngine, TextStorage};
@@ -186,15 +188,20 @@ fn snapshot_mode_does_not_watch_wal_that_immutable_sqlite_ignores() {
     assert_eq!(fingerprint(&paths), before);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn replacement_with_same_size_and_mtime_changes_identity() {
     let root = tempfile::tempdir().unwrap();
     let paths = paths(root.path(), false);
     make_db(&paths.db, "old");
     let before = fingerprint(&paths);
-    let times = std::fs::FileTimes::new()
-        .set_modified(std::fs::metadata(&paths.db).unwrap().modified().unwrap());
+    let original = std::fs::metadata(&paths.db).unwrap();
+    let times = std::fs::FileTimes::new().set_modified(original.modified().unwrap());
+    #[cfg(windows)]
+    let times = {
+        use std::os::windows::fs::FileTimesExt;
+        times.set_created(original.created().unwrap())
+    };
     let replacement = root.path().join("replacement.db");
     make_db(&replacement, "new");
     assert_eq!(
@@ -208,6 +215,10 @@ fn replacement_with_same_size_and_mtime_changes_identity() {
         .set_times(times)
         .unwrap();
     std::fs::rename(replacement, &paths.db).unwrap();
+    let replaced = std::fs::metadata(&paths.db).unwrap();
+    assert_eq!(original.modified().unwrap(), replaced.modified().unwrap());
+    #[cfg(windows)]
+    assert_eq!(original.created().unwrap(), replaced.created().unwrap());
     assert_ne!(fingerprint(&paths), before);
 }
 

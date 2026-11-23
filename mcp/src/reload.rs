@@ -212,13 +212,20 @@ pub fn fingerprint(paths: &Paths) -> String {
 
 fn hash_file(path: &Path, wal: bool, hasher: &mut impl Hasher) {
     path.hash(hasher);
+    #[cfg(not(windows))]
     let metadata = std::fs::metadata(path).ok();
+    #[cfg(windows)]
+    let (metadata, identity) = crate::windows_file::metadata(path)
+        .map(|(meta, identity)| (Some(meta), Some(identity)))
+        .unwrap_or_default();
     let metadata = metadata.filter(|meta| !wal || meta.len() > 0);
     metadata.is_some().hash(hasher);
     if let Some(meta) = metadata {
         meta.len().hash(hasher);
         meta.modified().ok().hash(hasher);
         meta.created().ok().hash(hasher);
+        #[cfg(windows)]
+        identity.hash(hasher);
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
