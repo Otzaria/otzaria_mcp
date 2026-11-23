@@ -204,6 +204,7 @@ fn links_starting_on_the_line_come_before_links_covering_it() {
     // A commentary that starts on base line 1, from a book later in catalogue order than
     // the range link (lines 0-2) that only covers line 1.
     db.lock()
+        .unwrap()
         .conn
         .execute_batch(
             "PRAGMA query_only=OFF; INSERT INTO link VALUES (300, 1, 3, 11, 30, 0, 3, 1, 0); PRAGMA query_only=ON;",
@@ -227,7 +228,7 @@ fn links_starting_on_the_line_come_before_links_covering_it() {
 fn range_link_is_deduplicated_before_link_pagination() {
     let db = fixture_db();
     {
-        let inner = db.lock();
+        let inner = db.lock().unwrap();
         inner
             .conn
             .execute_batch(
@@ -255,7 +256,7 @@ fn range_link_is_deduplicated_before_link_pagination() {
 fn range_commentaries_are_deduplicated_before_limit() {
     let db = fixture_db();
     {
-        let inner = db.lock();
+        let inner = db.lock().unwrap();
         inner
             .conn
             .execute_batch(
@@ -278,7 +279,7 @@ fn range_commentaries_are_deduplicated_before_limit() {
 fn both_directions_use_one_offset_over_a_stable_combined_list() {
     let db = fixture_db();
     {
-        let inner = db.lock();
+        let inner = db.lock().unwrap();
         inner
             .conn
             .execute_batch(

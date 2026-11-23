@@ -7,9 +7,16 @@
 //! plain `line.content`): every optional table/column is probed once at open time
 //! ([`Caps`]). The DB is opened with `SQLITE_OPEN_READ_ONLY` (WAL-aware) by default, or
 //! `immutable=1` only in explicit `--snapshot` mode, and `PRAGMA query_only=ON`.
+//!
+//! The connection is not kept for the life of the process: see [`crate::idle`]. A database
+//! opened from a file is closed once it has been idle a moment (and right after each use
+//! while the app needs it), and reopened by the next query once updates finish. The
+//! watcher publishes a new snapshot when the file or schema is replaced.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use rusqlite::types::{Value, ValueRef};
@@ -31,6 +38,252 @@ type StoredLineRow = (i64, i64, Option<String>, Value);
 pub struct Inner {
     pub conn: Connection,
     pub codec: LineCodec,
+}
+
+/// A metadata-only stamp. Never open an SQLite file outside SQLite: on Unix a raw
+/// close could drop locks held by another connection in this process.
+#[derive(PartialEq, Eq)]
+struct FileVersion {
+    created: Option<SystemTime>,
+    modified: Option<SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+impl FileVersion {
+    fn read(path: &Path) -> std::io::Result<Self> {
+        let metadata = path.metadata()?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            created: metadata.created().ok(),
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    }
+
+    fn same_file(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.identity == other.identity
+        }
+        #[cfg(not(unix))]
+        {
+            // A replacement can inherit the previous creation time on Windows.
+            // Treat any change to the main-file stamp as a new generation.
+            self == other
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct DbVersion {
+    main: FileVersion,
+    wal: Option<FileVersion>,
+}
+
+/// The database file a [`Db`] reads, to open it again after an idle close.
+struct FileSource {
+    path: PathBuf,
+    marker: PathBuf,
+    wal: PathBuf,
+    shm: PathBuf,
+    immutable: bool,
+    schema: i64,
+}
+
+impl FileSource {
+    fn connect(&self) -> Result<Connection> {
+        let conn = if self.immutable {
+            Connection::open_with_flags(
+                format!("file:{}?immutable=1", self.path.display()),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )
+        } else {
+            Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        }
+        .with_context(|| format!("opening SQLite at {}", self.path.display()))?;
+        conn.execute_batch("PRAGMA query_only=ON;")
+            .context("setting query_only pragma")?;
+        Ok(conn)
+    }
+
+    fn version(&self) -> Result<DbVersion> {
+        self.ensure_not_updating()?;
+        let main = FileVersion::read(&self.path)
+            .with_context(|| format!("checking SQLite at {}", self.path.display()))?;
+        let wal = (!self.immutable)
+            .then(|| {
+                FileVersion::read(&self.wal)
+                    .ok()
+                    .filter(|stamp| stamp.len > 0)
+            })
+            .flatten();
+        Ok(DbVersion { main, wal })
+    }
+
+    fn ensure_not_updating(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.marker.exists(),
+            "the application is updating {}; retry after it finishes",
+            self.path.display()
+        );
+        Ok(())
+    }
+
+    fn release_now(&self) -> bool {
+        self.marker.exists() || (!self.immutable && self.shm.exists())
+    }
+
+    fn verify_schema(&self, conn: &Connection) -> Result<()> {
+        anyhow::ensure!(
+            sqlite_schema(conn)? == self.schema,
+            "SQLite schema changed at {}; reopen the library to use the new schema",
+            self.path.display()
+        );
+        Ok(())
+    }
+}
+
+fn sqlite_schema(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.pragma_query_value(None, "schema_version", |row| row.get(0))
+}
+
+/// A [`Db`]'s connection, which [`crate::idle`] closes while nobody uses it.
+pub(crate) struct ConnSlot {
+    state: Mutex<SlotState>,
+    /// `None` for a connection given by the caller (tests): never closed.
+    source: Option<FileSource>,
+}
+
+struct SlotState {
+    inner: Option<Inner>,
+    codec: Option<LineCodec>,
+    version: Option<DbVersion>,
+    last_used: Instant,
+    ref_index: Option<Arc<RefIndex>>,
+    eras: Option<Arc<HashMap<i64, Era>>>,
+}
+
+impl SlotState {
+    fn close(&mut self) -> bool {
+        let Some(Inner { conn, codec }) = self.inner.take() else {
+            return false;
+        };
+        drop(conn);
+        self.codec = Some(codec);
+        true
+    }
+
+    fn open_for_query(&mut self, source: &FileSource) -> Result<()> {
+        let version = match source.version() {
+            Ok(version) => version,
+            Err(error) => {
+                self.close();
+                return Err(error);
+            }
+        };
+        let previous = self
+            .version
+            .as_ref()
+            .expect("file-backed slot has a version");
+        if !version.main.same_file(&previous.main) {
+            self.close();
+            anyhow::bail!(
+                "SQLite file replaced at {}; reopen the library to use the new file",
+                source.path.display()
+            );
+        }
+        if self.inner.is_some() && *previous == version {
+            return Ok(());
+        }
+        let opened = self.inner.is_none().then(|| source.connect()).transpose()?;
+        let conn = self
+            .inner
+            .as_ref()
+            .map(|inner| &inner.conn)
+            .or(opened.as_ref())
+            .expect("slot was open or just reopened");
+        source.verify_schema(conn)?;
+        let codec = if *previous == version {
+            None
+        } else {
+            Some(LineCodec::load(conn).context("loading updated zstd dictionaries")?)
+        };
+        anyhow::ensure!(
+            source.version()? == version,
+            "SQLite changed while checking {}; retry after the update settles",
+            source.path.display()
+        );
+        if let Some(codec) = codec {
+            if let Some(inner) = self.inner.as_mut() {
+                inner.codec = codec;
+            } else {
+                self.codec = Some(codec);
+            }
+            self.ref_index = None;
+            self.eras = None;
+        }
+        if let Some(conn) = opened {
+            self.inner = Some(Inner {
+                conn,
+                codec: self.codec.take().expect("closed slot retains its codec"),
+            });
+        }
+        self.version = Some(version);
+        Ok(())
+    }
+}
+
+impl ConnSlot {
+    pub(crate) fn release_if_idle(&self, idle: Duration) -> bool {
+        let Some(source) = &self.source else {
+            return false;
+        };
+        let Ok(mut state) = self.state.try_lock() else {
+            return false; // in use (or poisoned: the next lock() recovers it)
+        };
+        state.inner.is_some()
+            && (state.last_used.elapsed() >= idle || source.release_now())
+            && state.close()
+    }
+}
+
+/// The connection and codec of one query. The reaper leaves the slot alone while held.
+pub(crate) struct DbGuard<'a> {
+    state: MutexGuard<'a, SlotState>,
+    source: Option<&'a FileSource>,
+}
+
+impl std::ops::Deref for DbGuard<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        self.state
+            .inner
+            .as_ref()
+            .expect("guard holds an open connection")
+    }
+}
+
+impl std::ops::DerefMut for DbGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        self.state
+            .inner
+            .as_mut()
+            .expect("guard holds an open connection")
+    }
+}
+
+impl Drop for DbGuard<'_> {
+    fn drop(&mut self) {
+        self.state.last_used = Instant::now();
+        if self.source.is_some_and(FileSource::release_now) {
+            self.state.close();
+        }
+    }
 }
 
 /// What the opened database has. Probed once; every query adapts to it.
@@ -199,45 +452,94 @@ impl Serialize for Era {
 }
 
 pub struct Db {
-    inner: Mutex<Inner>,
+    slot: Arc<ConnSlot>,
     pub caps: Caps,
-    /// Lazily-built normalized book-name index for resolve_ref (find_ref cache).
-    ref_index: OnceLock<RefIndex>,
-    /// bookId → era (earliest generation), built lazily from `book_generation`.
-    eras: OnceLock<HashMap<i64, Era>>,
 }
 
 impl Db {
     pub fn open(paths: &Paths) -> Result<Db> {
-        let conn = if paths.snapshot {
-            let uri = format!("file:{}?immutable=1", paths.db.display());
-            Connection::open_with_flags(
-                uri,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-            )
-        } else {
-            Connection::open_with_flags(&paths.db, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        }
-        .with_context(|| format!("opening seforim.db at {}", paths.db.display()))?;
-        Db::from_connection(conn)
+        Db::open_file(&paths.db, paths.snapshot)
+            .with_context(|| format!("opening seforim.db at {}", paths.db.display()))
     }
 
-    /// Wrap an already-open connection (also used by tests with in-memory fixtures).
+    /// Open a database file read-only (`immutable=1` when asked). Its connection is
+    /// closed while idle and reopened by the next query (see [`crate::idle`]).
+    pub fn open_file(path: &Path, immutable: bool) -> Result<Db> {
+        let mut source = FileSource {
+            path: path.to_path_buf(),
+            marker: crate::idle::update_marker(path),
+            wal: crate::idle::sidecar(path, "-wal"),
+            shm: crate::idle::sidecar(path, "-shm"),
+            immutable,
+            schema: 0,
+        };
+        let version = source.version()?;
+        let conn = source.connect()?;
+        source.schema = sqlite_schema(&conn)?;
+        Db::build(conn, Some((source, version)))
+    }
+
+    /// Wrap an already-open connection without managing its lease or file generation.
     pub fn from_connection(conn: Connection) -> Result<Db> {
         conn.execute_batch("PRAGMA query_only=ON;")
             .context("setting query_only pragma")?;
+        Db::build(conn, None)
+    }
+
+    fn build(conn: Connection, source: Option<(FileSource, DbVersion)>) -> Result<Db> {
         let caps = Caps::probe(&conn).context("probing seforim.db tables")?;
         let codec = LineCodec::load(&conn).context("loading zstd dictionaries")?;
-        Ok(Db {
-            inner: Mutex::new(Inner { conn, codec }),
-            caps,
-            ref_index: OnceLock::new(),
-            eras: OnceLock::new(),
+        let (source, version) = match source {
+            Some((source, version)) => {
+                anyhow::ensure!(
+                    source.version()? == version && sqlite_schema(&conn)? == source.schema,
+                    "SQLite changed while opening {}; retry after the update settles",
+                    source.path.display()
+                );
+                (Some(source), Some(version))
+            }
+            None => (None, None),
+        };
+        let slot = Arc::new(ConnSlot {
+            state: Mutex::new(SlotState {
+                inner: Some(Inner { conn, codec }),
+                codec: None,
+                version,
+                last_used: Instant::now(),
+                ref_index: None,
+                eras: None,
+            }),
+            source,
+        });
+        if slot.source.is_some() {
+            crate::idle::register(&slot);
+        }
+        Ok(Db { slot, caps })
+    }
+
+    /// Obtain the read connection or return the reason it is temporarily unavailable.
+    pub(crate) fn lock(&self) -> Result<DbGuard<'_>> {
+        let mut state = self.slot.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(source) = &self.slot.source {
+            if let Err(error) = state.open_for_query(source) {
+                state.close();
+                return Err(error);
+            }
+        }
+        Ok(DbGuard {
+            state,
+            source: self.slot.source.as_ref(),
         })
     }
 
-    pub(crate) fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    /// Whether the connection is open now (it is closed while idle).
+    pub fn is_open(&self) -> bool {
+        self.slot
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .inner
+            .is_some()
     }
 
     // ── content SQL fragments ────────────────────────────────────────────────
@@ -383,7 +685,7 @@ impl Db {
             he_ref: Option<String>,
         }
 
-        let mut inner = self.lock();
+        let mut inner = self.lock()?;
         let mut ids = link_ids.to_vec();
         ids.sort_unstable();
         ids.dedup();
@@ -514,34 +816,44 @@ impl Db {
         Ok(rows)
     }
 
-    /// Era of every book with a generation (cached). Takes the connection lock on first
-    /// use, so never call it (or [`Self::era_of`]) while holding [`Self::lock`].
-    pub fn eras(&self) -> &HashMap<i64, Era> {
-        self.eras.get_or_init(|| {
-            let mut map: HashMap<i64, Era> = HashMap::new();
-            if !self.caps.book_generation {
-                return map;
-            }
-            let inner = self.lock();
-            let Ok(mut stmt) = inner.conn.prepare(
+    /// Era of every book with a generation. The map is reused for this file version.
+    pub fn eras(&self) -> Result<Arc<HashMap<i64, Era>>> {
+        let mut inner = self.lock()?;
+        if let Some(eras) = &inner.state.eras {
+            return Ok(Arc::clone(eras));
+        }
+        let mut map: HashMap<i64, Era> = HashMap::new();
+        if self.caps.book_generation {
+            let mut stmt = inner.conn.prepare(
                 "SELECT bg.bookId, g.name FROM book_generation bg JOIN generation g ON g.id = bg.generationId",
-            ) else {
-                return map;
-            };
-            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
-                for (book, name) in rows.flatten() {
-                    let era = Era::from_generation_name(&name);
-                    map.entry(book)
-                        .and_modify(|e| *e = (*e).min(era))
-                        .or_insert(era);
-                }
+            )?;
+            for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+                let (book, name) = row?;
+                let era = Era::from_generation_name(&name);
+                map.entry(book)
+                    .and_modify(|e| *e = (*e).min(era))
+                    .or_insert(era);
             }
-            map
-        })
+        }
+        let map = Arc::new(map);
+        inner.state.eras = Some(Arc::clone(&map));
+        Ok(map)
     }
 
     pub fn era_of(&self, book_id: i64) -> Era {
-        self.eras().get(&book_id).copied().unwrap_or(Era::Other)
+        self.eras()
+            .ok()
+            .and_then(|eras| eras.get(&book_id).copied())
+            .unwrap_or(Era::Other)
+    }
+
+    fn ref_index(inner: &mut DbGuard<'_>) -> Arc<RefIndex> {
+        if let Some(index) = &inner.state.ref_index {
+            return Arc::clone(index);
+        }
+        let index = Arc::new(RefIndex::build(&inner.conn));
+        inner.state.ref_index = Some(Arc::clone(&index));
+        index
     }
 
     // ── identity / stats ─────────────────────────────────────────────────────
@@ -557,7 +869,7 @@ impl Db {
     }
 
     fn meta_int(&self, key: &str) -> Option<i64> {
-        let inner = self.lock();
+        let inner = self.lock().ok()?;
         inner
             .conn
             .query_row("SELECT value FROM schema_meta WHERE key = ?1", [key], |r| {
@@ -580,7 +892,7 @@ impl Db {
     }
 
     pub fn library_stats(&self) -> Result<LibraryStats> {
-        let inner = self.lock();
+        let inner = self.lock()?;
         let count = |sql: &str| -> i64 { inner.conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
         let mut connection_types = Vec::new();
         if let Ok(mut stmt) = inner
@@ -603,12 +915,9 @@ impl Db {
     // ── resolve_ref ──────────────────────────────────────────────────────────
     /// Resolve a human reference string to candidate (book_id, line_index) locations.
     pub fn resolve_ref(&self, query: &str, limit: i64) -> Result<Vec<RefCandidate>> {
-        let index = self.ref_index.get_or_init(|| {
-            let inner = self.lock();
-            RefIndex::build(&inner.conn)
-        });
-        let mut inner = self.lock();
-        let mut cands = refs::resolve(&inner.conn, &self.caps, index, query, limit)?;
+        let mut inner = self.lock()?;
+        let index = Self::ref_index(&mut inner);
+        let mut cands = refs::resolve(&inner.conn, &self.caps, &index, query, limit)?;
         // Fill snippets with the decoded text of each candidate line.
         for c in cands.iter_mut() {
             if c.snippet.is_empty() {
@@ -659,7 +968,7 @@ impl Db {
               ORDER BY rank, b.isBaseBook DESC, b.orderIndex, b.title
               LIMIT ?5"
         );
-        let inner = self.lock();
+        let inner = self.lock()?;
         let mut stmt = inner.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
@@ -683,10 +992,11 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         drop(inner);
+        let eras = self.eras()?;
         Ok(rows
             .into_iter()
             .map(|mut b| {
-                b.era = Some(self.era_of(b.book_id));
+                b.era = Some(eras.get(&b.book_id).copied().unwrap_or(Era::Other));
                 b
             })
             .collect())
@@ -700,10 +1010,8 @@ impl Db {
         if norm.is_empty() {
             return Ok(vec![]);
         }
-        let index = self.ref_index.get_or_init(|| {
-            let inner = self.lock();
-            RefIndex::build(&inner.conn)
-        });
+        let index = Self::ref_index(&mut self.lock()?);
+        let eras = self.eras()?;
         let mut out: Vec<TitleMatch> = Vec::new();
         let mut seen = HashSet::new();
         for (name, ids, exact) in index.names_matching(&norm, (limit * 4) as usize) {
@@ -715,7 +1023,7 @@ impl Db {
                         matched_name: name.clone(),
                         match_kind: if exact { "exact" } else { "prefix" },
                         is_base_book: index.is_base(id),
-                        era: self.era_of(id),
+                        era: eras.get(&id).copied().unwrap_or(Era::Other),
                     });
                 }
             }
@@ -741,7 +1049,7 @@ impl Db {
         strip_html: bool,
         version: Option<&str>,
     ) -> Result<Option<GetTextResult>> {
-        let mut inner = self.lock();
+        let mut inner = self.lock()?;
         let book: Option<(String, i64)> = inner
             .conn
             .query_row(
@@ -898,7 +1206,7 @@ impl Db {
               WHERE b.id = ?1"
         );
         let base = {
-            let inner = self.lock();
+            let inner = self.lock()?;
             inner
                 .conn
                 .query_row(&sql, [book_id], |r| {
@@ -957,7 +1265,7 @@ impl Db {
         info.era = self.era_of(book_id);
         info.category_path = self.category_path(info.category_id)?;
 
-        let inner = self.lock();
+        let inner = self.lock()?;
         let strings = |sql: &str| -> Result<Vec<String>> {
             let mut stmt = inner.conn.prepare(sql)?;
             let v = stmt
@@ -1055,7 +1363,7 @@ impl Db {
 
     /// Category titles from the root down to `category_id`.
     pub fn category_path(&self, category_id: i64) -> Result<Vec<NamedCategory>> {
-        let inner = self.lock();
+        let inner = self.lock()?;
         let mut path = Vec::new();
         let mut current = Some(category_id);
         let mut guard = 0;
@@ -1100,7 +1408,7 @@ impl Db {
 
     /// Titles of the given book ids.
     pub fn book_titles(&self, ids: &[i64]) -> Result<HashMap<i64, String>> {
-        let inner = self.lock();
+        let inner = self.lock()?;
         let mut out = HashMap::new();
         for chunk in ids.chunks(400) {
             let ph = vec!["?"; chunk.len()].join(",");
@@ -1127,7 +1435,7 @@ impl Db {
         alt_structure_key: Option<&str>,
         parent_id: Option<i64>,
     ) -> Result<BookToc> {
-        let inner = self.lock();
+        let inner = self.lock()?;
         let parent_filter = if parent_id.is_some() {
             "AND te.parentId = ?3"
         } else {
@@ -1247,7 +1555,7 @@ impl Db {
                     "NULL, NULL"
                 };
                 let row = {
-                    let inner = self.lock();
+                    let inner = self.lock()?;
                     inner
                         .conn
                         .query_row(
@@ -1274,7 +1582,7 @@ impl Db {
             None => None,
         };
 
-        let inner = self.lock();
+        let inner = self.lock()?;
         let book_count = if self.caps.category_closure {
             "(SELECT COUNT(*) FROM book b JOIN category_closure cc ON cc.descendantId = b.categoryId WHERE cc.ancestorId = c.id)"
         } else {
@@ -1344,7 +1652,7 @@ impl Db {
             .filter(|p| !p.is_empty())
             .map(norm)
             .collect();
-        let inner = self.lock();
+        let inner = self.lock()?;
         let mut parent: Option<i64> = None;
         for part in parts {
             let mut stmt = inner.conn.prepare(

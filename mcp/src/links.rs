@@ -526,7 +526,7 @@ impl Db {
             types,
             book_ids: linked_book_ids,
         };
-        let mut inner = self.lock();
+        let mut inner = self.lock()?;
         let mut rows = Vec::new();
         if want_out && want_in {
             let offset = offset.max(0);
@@ -597,8 +597,8 @@ impl Db {
             book_ids: commentator_ids,
         };
         // Initialise the era cache BEFORE taking the connection lock (it locks too).
-        let eras = self.eras();
-        let mut inner = self.lock();
+        let eras = self.eras()?;
+        let mut inner = self.lock()?;
         let raw = self.window_links(
             &mut inner,
             book_id,
@@ -646,7 +646,7 @@ impl Db {
     }
 
     fn defaults(&self, book_id: i64) -> Result<(Vec<NamedBook>, Vec<NamedBook>)> {
-        let inner = self.lock();
+        let inner = self.lock()?;
         let named = |sql: &str| -> Result<Vec<NamedBook>> {
             let mut stmt = inner.conn.prepare(sql)?;
             let v = stmt
@@ -721,7 +721,7 @@ impl Db {
               GROUP BY l.targetBookId, ct.name"
         );
         let counts: Vec<(i64, String, i64)> = {
-            let inner = self.lock();
+            let inner = self.lock()?;
             let mut stmt = inner.conn.prepare(&sql)?;
             let v = stmt
                 .query_map(rusqlite::params_from_iter(params.iter()), |r| {
@@ -744,7 +744,7 @@ impl Db {
             .map(|(i, b)| (b.book_id, i))
             .collect();
         let orders: HashMap<i64, i64> = {
-            let inner = self.lock();
+            let inner = self.lock()?;
             let mut m = HashMap::new();
             for chunk in ids.chunks(400) {
                 let ph = vec!["?"; chunk.len()].join(",");
@@ -761,12 +761,13 @@ impl Db {
             m
         };
 
+        let eras = self.eras()?;
         let mut groups: HashMap<Era, Vec<Commentator>> = HashMap::new();
         let mut total = 0;
         for (bid, types) in by_book {
             let count: i64 = types.iter().map(|(_, n)| n).sum();
             total += count;
-            let era = self.era_of(bid);
+            let era = eras.get(&bid).copied().unwrap_or(Era::Other);
             groups.entry(era).or_default().push(Commentator {
                 book_id: bid,
                 title: titles.get(&bid).cloned().unwrap_or_default(),
@@ -810,7 +811,7 @@ impl Db {
     /// Word-level link anchors inside one line: for every anchor, the anchored words
     /// (or, for a point anchor, the text around the marker) and the link's other side.
     pub fn get_line_anchors(&self, book_id: i64, line_index: i64) -> Result<Option<LineAnchors>> {
-        let mut inner = self.lock();
+        let mut inner = self.lock()?;
         // Stored anchors exclude the bodies removed into line_note. Keep both the
         // reported text and its offsets in that original coordinate system.
         let lines = self.raw_lines_in_range(&mut inner, book_id, line_index, line_index)?;
