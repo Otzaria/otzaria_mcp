@@ -153,7 +153,7 @@ fn schema7_notes_batch_more_than_sqlite_variable_limit_without_losing_rows() {
                 .unwrap();
         }
     });
-    let mut inner = db.lock();
+    let mut inner = db.lock().unwrap();
     let ids: Vec<_> = (1000..2001).chain([1000]).collect();
     let text = db.texts_by_line_id(&mut inner, &ids).unwrap();
     assert_eq!(text.len(), 1001);
@@ -178,15 +178,15 @@ fn schema7_notes_absent_or_partial_table_keeps_legacy_text() {
 fn schema7_notes_failed_read_releases_snapshot() {
     let db = with_notes(|_| {});
     {
-        let inner = db.lock();
+        let inner = db.lock().unwrap();
         inner
             .conn
             .execute_batch("PRAGMA query_only=OFF; DROP TABLE line_note; PRAGMA query_only=ON;")
             .unwrap();
     }
     assert!(db.get_text(1, 0, 1, false, None).is_err());
-    assert!(db.lock().conn.is_autocommit());
-    let mut inner = db.lock();
+    assert!(db.lock().unwrap().conn.is_autocommit());
+    let mut inner = db.lock().unwrap();
     assert!(db.lines_in_range(&mut inner, 1, 0, 1).is_err());
     assert!(inner.conn.is_autocommit());
     assert!(db.texts_by_line_id(&mut inner, &[10]).is_err());

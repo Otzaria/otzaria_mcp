@@ -103,7 +103,7 @@ fn malformed_current_marker_errors_and_releases_transaction() {
         });
         let error = db.get_text(1, 0, 1, false, None).unwrap_err().to_string();
         assert!(error.contains("hasMarker"), "{error}");
-        assert!(db.lock().conn.is_autocommit());
+        assert!(db.lock().unwrap().conn.is_autocommit());
     }
 }
 
@@ -133,7 +133,7 @@ fn malformed_compressed_or_utf8_body_is_reported_not_dropped() {
             error.contains(if invalid_utf8 { "UTF-8" } else { "zstd" }),
             "{error}"
         );
-        assert!(db.lock().conn.is_autocommit());
+        assert!(db.lock().unwrap().conn.is_autocommit());
     }
     let db = current_notes(|conn| {
         conn.execute_batch("INSERT INTO line_note VALUES(10,0,0,0,CAST(X'FFFE' AS TEXT));")

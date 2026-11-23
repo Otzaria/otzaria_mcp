@@ -291,13 +291,28 @@ static LINE_DIRTY: AtomicBool = AtomicBool::new(false);
 /// The database the line source reads, and when a search last finished.
 static LINE_STATE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
-struct LineUse(#[allow(dead_code)] RwLockReadGuard<'static, ()>);
-
-fn line_use() -> LineUse {
-    LineUse(LINE_ACTIVITY.read().unwrap_or_else(|p| p.into_inner()))
+struct LineUse<'a> {
+    guard: Option<RwLockReadGuard<'static, ()>>,
+    path: &'a Path,
 }
 
-impl Drop for LineUse {
+fn line_use(path: &Path) -> Result<LineUse<'_>> {
+    let guard = LINE_ACTIVITY.read().unwrap_or_else(|p| p.into_inner());
+    if crate::idle::update_marker(path).exists() {
+        drop(guard);
+        release_idle_line_source(Duration::MAX, &crate::idle::release_now);
+        bail!(
+            "the application is updating {}; retry after it finishes",
+            path.display()
+        );
+    }
+    Ok(LineUse {
+        guard: Some(guard),
+        path,
+    })
+}
+
+impl Drop for LineUse<'_> {
     fn drop(&mut self) {
         if let Some(state) = LINE_STATE
             .lock()
@@ -307,6 +322,10 @@ impl Drop for LineUse {
             state.1 = Instant::now();
         }
         LINE_DIRTY.store(true, Ordering::Release);
+        drop(self.guard.take());
+        if crate::idle::release_now(self.path) {
+            release_idle_line_source(Duration::MAX, &crate::idle::release_now);
+        }
     }
 }
 
@@ -324,6 +343,10 @@ pub fn release_idle_line_source(idle: Duration, force: &dyn Fn(&Path) -> bool) -
         return 0;
     };
     if last.elapsed() < idle && !force(Path::new(&db)) {
+        return 0;
+    }
+    if !line_source_status().open {
+        LINE_DIRTY.store(false, Ordering::Release);
         return 0;
     }
     match refresh_line_source(db) {
@@ -370,10 +393,15 @@ impl Search {
             .to_str()
             .context("seforim.db path is not valid UTF-8")?
             .to_string();
-        refresh_line_source(db_str.clone())
-            .with_context(|| format!("refreshing the engine's line source at {db_str}"))?;
-        *LINE_STATE.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some((db_str.clone(), Instant::now()));
+        {
+            let _exclusive = LINE_ACTIVITY.write().unwrap_or_else(|p| p.into_inner());
+            refresh_line_source(db_str.clone())
+                .with_context(|| format!("refreshing the engine's line source at {db_str}"))?;
+            *LINE_STATE.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some((db_str.clone(), Instant::now()));
+            LINE_DIRTY.store(false, Ordering::Release);
+        }
+        crate::idle::start();
 
         let mut engine = SearchEngine::open_read_only(&index_str)?;
         let lexical = lexical_db
@@ -418,7 +446,7 @@ impl Search {
         let order = parse_order(&req.order)?;
         let grouping = parse_grouping(&req.grouping)?;
         let mode = req.effective_mode();
-        let _lines = line_use();
+        let _lines = line_use(Path::new(&self.info.line_source))?;
         let engine = self.lock();
         let page: SearchPageResult = match mode {
             Mode::Exact => engine.search_and_count_exact(
@@ -493,7 +521,7 @@ impl Search {
     /// Hit counts per child facet under `facet_prefix` (`/` = top-level categories,
     /// `/era`, `/author`, or any category path).
     pub fn facet_counts(&self, req: &SearchRequest, facet_prefix: &str) -> Result<Vec<FacetCount>> {
-        let _lines = line_use();
+        let _lines = line_use(Path::new(&self.info.line_source))?;
         let engine = self.lock();
         let prefix = facet_prefix.to_string();
         match req.effective_mode() {
@@ -542,7 +570,7 @@ impl Search {
 
     /// Hit counts per indexed book (`file_path` → count).
     pub fn count_by_book(&self, req: &SearchRequest) -> Result<HashMap<String, u32>> {
-        let _lines = line_use();
+        let _lines = line_use(Path::new(&self.info.line_source))?;
         let engine = self.lock();
         match req.effective_mode() {
             Mode::Exact => engine.count_by_book_exact(

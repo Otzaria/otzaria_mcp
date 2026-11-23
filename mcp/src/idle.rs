@@ -9,14 +9,13 @@
 //! open handle also stops a database from being renamed or replaced (an attached database's
 //! update swaps its file so).
 //!
-//! So every [`crate::db::Db`] opened from a file, and the search engine's own line-source
-//! connection (through its public `refresh_line_source`, see `crate::search`), are closed
-//! once they have been idle for [`IDLE`], by a background thread that looks every
-//! [`TICK`]; and at once after each use while the database is in WAL mode or the app's
-//! update marker (`<db>.applying`) is present. The next query reopens the file
-//! (about a millisecond; the zstd dictionaries and the table probe are kept).
+//! File-backed reads release their database on idle or after use when an update marker
+//! (`<db>.applying`) or SQLite's shared-memory sidecar is present. While the marker exists,
+//! new reads return an error so they cannot interfere with the writer. These checks read
+//! file metadata only: raw file descriptors can drop SQLite's Unix locks on close.
+//! On Windows idle release also applies to the engine's connection, where open handles
+//! block rename. Unix retains the engine's ordinary rollback-mode cache between searches.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once, Weak};
 use std::time::Duration;
@@ -37,12 +36,20 @@ pub(crate) fn register(slot: &Arc<ConnSlot>) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .push(Arc::downgrade(slot));
+    start();
+}
+
+pub(crate) fn start() {
     REAPER.call_once(|| {
         let spawned = std::thread::Builder::new()
             .name("otzaria-mcp-idle".into())
             .spawn(|| loop {
                 std::thread::sleep(TICK);
-                sweep(IDLE);
+                sweep_slots(IDLE);
+                // On Windows an idle handle prevents rename even in rollback mode. On
+                // Unix keep the search core's caches until WAL or an update needs release.
+                let search_idle = if cfg!(windows) { IDLE } else { Duration::MAX };
+                crate::search::release_idle_line_source(search_idle, &release_now);
             });
         if let Err(e) = spawned {
             eprintln!("otzaria-mcp: cannot start the idle-connection reaper: {e}");
@@ -52,6 +59,10 @@ pub(crate) fn register(slot: &Arc<ConnSlot>) {
 
 /// Close every connection idle for `idle` (or wanted by the app now); returns how many.
 pub fn sweep(idle: Duration) -> usize {
+    sweep_slots(idle) + crate::search::release_idle_line_source(idle, &release_now)
+}
+
+fn sweep_slots(idle: Duration) -> usize {
     let slots: Vec<Arc<ConnSlot>> = {
         let mut all = SLOTS.lock().unwrap_or_else(|p| p.into_inner());
         all.retain(|w| w.strong_count() > 0);
@@ -63,30 +74,23 @@ pub fn sweep(idle: Duration) -> usize {
             closed += 1;
         }
     }
-    closed + crate::search::release_idle_line_source(idle, &release_now)
+    closed
 }
 
-/// Whether the app needs `db` released now: it is in WAL mode (the app switches to WAL
-/// for an update and back when it is done), or the app's update marker is present.
+/// Detect an update or an active WAL connection without opening any SQLite files.
 pub fn release_now(db: &Path) -> bool {
-    is_wal(db) || update_marker(db).exists()
+    update_marker(db).exists() || sidecar(db, "-shm").exists()
 }
 
-/// `<db>.applying`, which Otzaria's library updater writes while it patches the database
-/// (`otzaria_library_updater`'s `markerPathFor`).
+/// Marker written by Otzaria's updater while applying a library update.
 pub fn update_marker(db: &Path) -> PathBuf {
-    let mut marker = db.as_os_str().to_owned();
-    marker.push(".applying");
-    PathBuf::from(marker)
+    sidecar(db, ".applying")
 }
 
-/// The header's file-format version bytes (18 and 19) are 2 for a WAL database.
-pub fn is_wal(db: &Path) -> bool {
-    let mut header = [0u8; 20];
-    std::fs::File::open(db)
-        .and_then(|mut f| f.read_exact(&mut header))
-        .is_ok()
-        && (header[18] == 2 || header[19] == 2)
+pub(crate) fn sidecar(db: &Path, suffix: &str) -> PathBuf {
+    let mut path = db.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 #[cfg(test)]
@@ -115,6 +119,7 @@ mod tests {
 
     fn title(db: &Db) -> String {
         db.lock()
+            .unwrap()
             .conn
             .query_row("SELECT title FROM book WHERE id = 1", [], |r| r.get(0))
             .unwrap()
@@ -126,7 +131,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = make_db(tmp.path(), false);
         let db = Db::open_file(&path, false).unwrap();
-        assert!(!is_wal(&path));
+        assert!(!release_now(&path));
         assert_eq!(title(&db), "x");
         assert!(db.is_open());
         // used just now: kept
@@ -146,7 +151,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = make_db(tmp.path(), false);
         let db = Db::open_file(&path, false).unwrap();
-        let guard = db.lock();
+        let guard = db.lock().unwrap();
         std::thread::sleep(Duration::from_millis(20));
         sweep(Duration::ZERO);
         drop(guard);
@@ -158,7 +163,6 @@ mod tests {
         let _serial = serial();
         let tmp = tempfile::tempdir().unwrap();
         let path = make_db(tmp.path(), true);
-        assert!(is_wal(&path));
         let db = Db::open_file(&path, false).unwrap();
         assert_eq!(title(&db), "x");
         assert!(
@@ -179,8 +183,10 @@ mod tests {
         std::fs::write(update_marker(&path), b"").unwrap();
         sweep(Duration::from_secs(60));
         assert!(!db.is_open());
-        assert_eq!(title(&db), "x");
+        assert!(db.lock().is_err());
         assert!(!db.is_open());
+        std::fs::remove_file(update_marker(&path)).unwrap();
+        assert_eq!(title(&db), "x");
     }
 
     /// The bug this module fixes: the app's switch back to DELETE succeeds while the MCP
@@ -195,7 +201,7 @@ mod tests {
         let app = rusqlite::Connection::open(&path).unwrap();
         {
             // what happened before: a connection kept open blocks the switch
-            let held = db.lock();
+            let held = db.lock().unwrap();
             let n: i64 = held
                 .conn
                 .query_row("SELECT count(*) FROM book", [], |r| r.get(0))
@@ -207,7 +213,7 @@ mod tests {
                 r.map_or(true, |m| m == "wal"),
                 "switched while a reader held it"
             );
-            assert!(is_wal(&path));
+            assert!(release_now(&path));
         }
         app.busy_timeout(Duration::from_secs(5)).unwrap();
         app.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -216,7 +222,7 @@ mod tests {
             .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
             .unwrap();
         assert_eq!(mode, "delete");
-        assert!(!is_wal(&path));
+        assert!(!release_now(&path));
         drop(app);
         assert_eq!(title(&db), "x");
     }

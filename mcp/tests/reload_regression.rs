@@ -168,6 +168,8 @@ fn idle_sweep_releases_the_line_source_and_search_reopens_it() {
     std::fs::write(&marker, b"").unwrap();
     otzaria_mcp::idle::sweep(std::time::Duration::from_secs(60));
     assert!(!line_source_status().open);
+    assert!(search.search(&request).is_err());
+    assert!(!line_source_status().open);
     std::fs::remove_file(&marker).unwrap();
 
     let again = search.search(&request).unwrap();
