@@ -3,17 +3,21 @@
 //! captures the current snapshot only when it starts, and responses are stamped
 //! with `schema_version` + `data_version` (the snapshot fingerprint).
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::admission::{Admitted, Error as AdmissionError};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::db::{Db, Era};
+use crate::refs::{RefCandidate, ResolveOptions};
 use crate::reload::{Library, Snapshot};
 use crate::search::{self, Mode, SearchRequest, WordOptions};
 
@@ -269,6 +273,92 @@ pub struct ResolveRefParams {
     /// Max candidate locations to return (default 10, capped at 50).
     #[serde(default)]
     pub limit: Option<u32>,
+    #[serde(flatten)]
+    options: ResolveRefOptions,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ResolveRefOptions {
+    /// Exclude candidates that only name a book or a part without an internal address.
+    #[serde(default)]
+    exclude_book_level: bool,
+    /// Allow a full-library heRef substring scan for misses. Defaults to true for
+    /// resolve_ref and false for resolve_refs.
+    #[serde(default)]
+    heref_fallback: Option<bool>,
+    /// Include the candidate line's text as a snippet. Defaults to true.
+    #[serde(default)]
+    snippets: Option<bool>,
+}
+
+impl ResolveRefOptions {
+    fn resolve_options(&self, default_fallback: bool) -> ResolveOptions {
+        ResolveOptions {
+            heref_fallback: self.heref_fallback.unwrap_or(default_fallback),
+            exclude_book_level: self.exclude_book_level,
+            snippets: self.snippets.unwrap_or(true),
+        }
+    }
+}
+
+const MAX_BATCH_REFERENCES: usize = 2_000;
+const MAX_BATCH_CANDIDATES: usize = 20_000;
+const MAX_REFERENCE_BYTES: usize = 1_024;
+// Answer generation, distinct from the package version and library data version.
+const RESOLVER_VERSION: &str = "0.4";
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ResolveRefsParams {
+    /// One to 2,000 Hebrew references. Duplicates are resolved once. Each reference
+    /// can be at most 1,024 UTF-8 bytes.
+    pub references: Vec<String>,
+    /// Max candidates per reference (default 10, capped at 50). At most 20,000
+    /// candidates may be requested across the batch.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(flatten)]
+    options: ResolveRefOptions,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ReferenceOutcome {
+    Matches {
+        count: usize,
+        candidates: Vec<RefCandidate>,
+        ms: u64,
+    },
+    Error {
+        error: String,
+    },
+}
+
+#[derive(Serialize)]
+struct ReferenceResult<'a> {
+    reference: &'a str,
+    #[serde(flatten)]
+    outcome: &'a ReferenceOutcome,
+}
+
+#[derive(Serialize)]
+struct ReferenceBatch<'a> {
+    count: usize,
+    results: Vec<ReferenceResult<'a>>,
+    schema_version: Option<i64>,
+    data_version: String,
+    resolver: &'static str,
+    timing_ms: BatchTiming,
+}
+
+#[derive(Serialize)]
+struct BatchTiming {
+    total: u64,
+}
+
+struct BatchGeneration {
+    schema_version: Option<i64>,
+    published: String,
+    observed: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -465,6 +555,7 @@ impl OtzariaServer {
             json!({
                 "db_version": snap.schema_version,
                 "db_schema_version": db_schema_version,
+                "resolver": RESOLVER_VERSION,
                 "stats": stats,
                 "capabilities": snap.snapshot.db.caps,
                 "index": index,
@@ -824,14 +915,153 @@ impl OtzariaServer {
             .await
             .map_err(admission_error)?;
         let limit = p.limit.unwrap_or(10).clamp(1, 50) as i64;
+        let options = p.options.resolve_options(true);
         let (snap, candidates) = run_blocking(admitted, self.lib.clone(), move |_snap, db| {
-            db.resolve_ref(&reference, limit)
+            db.resolve_ref_with_options(&reference, limit, options)
         })
         .await?;
         Self::respond(
             &snap,
-            json!({ "count": candidates.len(), "candidates": candidates }),
+            json!({
+                "count": candidates.len(),
+                "candidates": candidates,
+                "resolver": RESOLVER_VERSION,
+            }),
         )
+    }
+
+    #[tool(
+        name = "resolve_refs",
+        description = "Resolve a list of Hebrew references in order, using the same resolver as resolve_ref. \
+                       Repeated references are resolved once. Results contain candidates or a per-reference \
+                       error. Full-library heRef fallback is off by default for batches.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn resolve_refs(
+        &self,
+        Parameters(p): Parameters<ResolveRefsParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = p.limit.unwrap_or(10).clamp(1, 50);
+        if !(1..=MAX_BATCH_REFERENCES).contains(&p.references.len()) {
+            return Err(invalid(format!(
+                "provide between 1 and {MAX_BATCH_REFERENCES} references"
+            )));
+        }
+        if p.references.len() * limit as usize > MAX_BATCH_CANDIDATES {
+            return Err(invalid(format!(
+                "references times limit must be at most {MAX_BATCH_CANDIDATES}; lower limit or split the batch"
+            )));
+        }
+        if p.references.iter().any(|r| r.len() > MAX_REFERENCE_BYTES) {
+            return Err(invalid(format!(
+                "each reference must be at most {MAX_REFERENCE_BYTES} UTF-8 bytes"
+            )));
+        }
+
+        let options = p.options.resolve_options(false);
+        let start = Instant::now();
+        let references: Vec<&str> = p.references.iter().map(|r| r.trim()).collect();
+        let mut answers = HashMap::new();
+        let mut generation: Option<BatchGeneration> = None;
+        for &reference in &references {
+            let Entry::Vacant(entry) = answers.entry(reference) else {
+                continue;
+            };
+            if reference.is_empty() {
+                entry.insert(ReferenceOutcome::Error {
+                    error: "reference must not be empty".to_string(),
+                });
+                continue;
+            }
+
+            // Acquire once per distinct reference. Other reads can run between
+            // lookups, and a cancelled batch starts no further blocking work.
+            let admitted = self
+                .lib
+                .read_admission()
+                .acquire(context.ct.clone())
+                .await
+                .map_err(admission_error)?;
+            let query = reference.to_string();
+            let expected = generation
+                .as_ref()
+                .map(|version| (version.published.clone(), version.observed.clone()));
+            let library = self.lib.clone();
+            let (outcome, first_generation) = admitted
+                .run(move || {
+                    let snapshot = library.current();
+                    let observed = library.observed_fingerprint();
+                    if expected.as_ref().is_some_and(|(published, version)| {
+                        *published != snapshot.fingerprint || *version != observed
+                    }) {
+                        return None;
+                    }
+                    let first_generation = expected.is_none().then(|| BatchGeneration {
+                        schema_version: snapshot.db.schema_version(),
+                        published: snapshot.fingerprint.clone(),
+                        observed: observed.clone(),
+                    });
+                    let start = Instant::now();
+                    let outcome = match snapshot.db.resolve_ref_with_options(
+                        &query,
+                        i64::from(limit),
+                        options,
+                    ) {
+                        Ok(candidates) => ReferenceOutcome::Matches {
+                            count: candidates.len(),
+                            candidates,
+                            ms: start.elapsed().as_millis() as u64,
+                        },
+                        Err(error) => ReferenceOutcome::Error {
+                            error: format!("{error:#}"),
+                        },
+                    };
+                    (library.observed_fingerprint() == observed)
+                        .then_some((outcome, first_generation))
+                })
+                .await
+                .map_err(admission_error)?
+                .ok_or_else(|| {
+                    ErrorData::internal_error(
+                        "library changed while resolving references; retry the batch",
+                        Some(json!({ "reason": "library_changed" })),
+                    )
+                })?;
+            if let Some(first_generation) = first_generation {
+                generation = Some(first_generation);
+            }
+            entry.insert(outcome);
+        }
+        if context.ct.is_cancelled() {
+            return Err(admission_error(AdmissionError::Cancelled));
+        }
+        let (schema_version, data_version) = generation
+            .map(|version| (version.schema_version, version.observed))
+            .unwrap_or_else(|| {
+                let snapshot = self.lib.current();
+                (snapshot.schema_version, snapshot.fingerprint.clone())
+            });
+        let results = references
+            .into_iter()
+            .map(|reference| ReferenceResult {
+                reference,
+                outcome: &answers[reference],
+            })
+            .collect::<Vec<_>>();
+        let response = ReferenceBatch {
+            count: results.len(),
+            results,
+            schema_version,
+            data_version,
+            resolver: RESOLVER_VERSION,
+            timing_ms: BatchTiming {
+                total: start.elapsed().as_millis() as u64,
+            },
+        };
+        let text = serde_json::to_string(&response)
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[tool(

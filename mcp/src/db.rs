@@ -915,11 +915,24 @@ impl Db {
     // ── resolve_ref ──────────────────────────────────────────────────────────
     /// Resolve a human reference string to candidate (book_id, line_index) locations.
     pub fn resolve_ref(&self, query: &str, limit: i64) -> Result<Vec<RefCandidate>> {
+        self.resolve_ref_with_options(query, limit, refs::ResolveOptions::default())
+    }
+
+    pub(crate) fn resolve_ref_with_options(
+        &self,
+        query: &str,
+        limit: i64,
+        options: refs::ResolveOptions,
+    ) -> Result<Vec<RefCandidate>> {
         let mut inner = self.lock()?;
         let index = Self::ref_index(&mut inner);
-        let mut cands = refs::resolve(&inner.conn, &self.caps, &index, query, limit)?;
+        let mut cands =
+            refs::resolve_with_options(&inner.conn, &self.caps, &index, query, limit, options)?;
+        if !options.snippets {
+            return Ok(cands);
+        }
         // Fill snippets with the decoded text of each candidate line.
-        for c in cands.iter_mut() {
+        for c in &mut cands {
             if c.snippet.is_empty() {
                 let lines =
                     self.lines_in_range(&mut inner, c.book_id, c.line_index, c.line_index)?;
