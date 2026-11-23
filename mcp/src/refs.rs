@@ -31,7 +31,7 @@
 //! and `:`→" ב", and drops commas/maqaf — applied identically to the query and to names.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -40,7 +40,7 @@ use serde::Serialize;
 
 use crate::db::Caps;
 use crate::refkey;
-use crate::toc_search::{BookToc, TocCache};
+use crate::toc_search::{BookToc, TocCache, TocHeading};
 
 /// Normalize a reference/name for matching. Applied to book names, acronyms,
 /// `line.heRef`, and the user query alike.
@@ -102,16 +102,18 @@ pub struct RefIndex {
     /// bookId → (is_base_book, orderIndex) for ranking candidates.
     book_meta: HashMap<i64, (bool, i64)>,
     /// Lazily built normalized heRef index for each requested book.
-    line_cache: Mutex<HashMap<i64, BTreeMap<String, CachedLine>>>,
+    line_cache: Mutex<HashMap<i64, Arc<BookLines>>>,
     /// Lazily loaded TOC trees (the app's hierarchical TOC search).
     toc: TocCache,
 }
 
-#[derive(Clone)]
 struct CachedLine {
     line_index: i64,
     he_ref: String,
+    other_indexes: Vec<i64>,
 }
+
+type BookLines = BTreeMap<String, CachedLine>;
 
 fn add_name(map: &mut BTreeMap<String, Vec<i64>>, name: &str, id: i64) {
     let n = normalize_ref(name);
@@ -206,18 +208,52 @@ impl RefIndex {
     }
 
     /// Line indexes of every line whose normalized heRef equals or token-extends `canonical`.
-    fn lines_under(&self, conn: &Connection, book_id: i64, canonical: &str) -> Result<Vec<i64>> {
-        self.matching_line(conn, book_id, canonical)?; // fills the cache
-        let cache = self.line_cache.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(lines) = cache.get(&book_id) else {
-            return Ok(vec![]);
-        };
+    fn lines_under(
+        &self,
+        conn: &Connection,
+        book_id: i64,
+        canonical: &str,
+    ) -> Result<HashSet<i64>> {
+        let lines = self.book_lines(conn, book_id)?;
         Ok(lines
             .range(canonical.to_string()..)
             .take_while(|(he_ref, _)| he_ref.starts_with(canonical))
             .filter(|(he_ref, _)| starts_with_tokens(he_ref, canonical))
-            .map(|(_, line)| line.line_index)
+            .flat_map(|(_, line)| {
+                std::iter::once(line.line_index).chain(line.other_indexes.iter().copied())
+            })
             .collect())
+    }
+
+    fn book_lines(&self, conn: &Connection, book_id: i64) -> Result<Arc<BookLines>> {
+        let mut cache = self.line_cache.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = match cache.entry(book_id) {
+            Entry::Occupied(entry) => return Ok(entry.get().clone()),
+            Entry::Vacant(entry) => entry,
+        };
+        let mut stmt = conn.prepare(
+            "SELECT lineIndex, heRef FROM line \
+              WHERE bookId = ?1 AND heRef IS NOT NULL ORDER BY lineIndex",
+        )?;
+        let mut lines = BookLines::new();
+        for row in stmt.query_map([book_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (line_index, he_ref) = row?;
+            match lines.entry(normalize_ref(&he_ref)) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().other_indexes.push(line_index);
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(CachedLine {
+                        line_index,
+                        he_ref,
+                        other_indexes: Vec::new(),
+                    });
+                }
+            }
+        }
+        Ok(entry.insert(Arc::new(lines)).clone())
     }
 
     fn matching_line(
@@ -225,31 +261,10 @@ impl RefIndex {
         conn: &Connection,
         book_id: i64,
         canonical: &str,
-    ) -> Result<Option<CachedLine>> {
-        let mut cache = self.line_cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Entry::Vacant(entry) = cache.entry(book_id) {
-            let mut stmt = conn.prepare(
-                "SELECT lineIndex, heRef FROM line \
-                  WHERE bookId = ?1 AND heRef IS NOT NULL ORDER BY lineIndex",
-            )?;
-            let mut lines = BTreeMap::new();
-            for row in stmt.query_map([book_id], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })? {
-                let (line_index, he_ref) = row?;
-                let normalized = normalize_ref(&he_ref);
-                lines
-                    .entry(normalized)
-                    .or_insert(CachedLine { line_index, he_ref });
-            }
-            entry.insert(lines);
-        }
-
-        let Some(lines) = cache.get(&book_id) else {
-            return Ok(None);
-        };
+    ) -> Result<Option<(i64, String)>> {
+        let lines = self.book_lines(conn, book_id)?;
         if let Some(line) = lines.get(canonical) {
-            return Ok(Some(line.clone()));
+            return Ok(Some((line.line_index, line.he_ref.clone())));
         }
 
         Ok(lines
@@ -257,7 +272,7 @@ impl RefIndex {
             .take_while(|(he_ref, _)| starts_with_tokens(he_ref, canonical))
             .map(|(_, line)| line)
             .min_by_key(|line| line.line_index)
-            .cloned())
+            .map(|line| (line.line_index, line.he_ref.clone())))
     }
 }
 
@@ -306,7 +321,6 @@ pub fn resolve(
 ) -> Result<Vec<RefCandidate>> {
     let (ref_part, dibbur) = split_dibbur(query.trim());
     let expanded = refkey::expand_query_amud_marks(&ref_part);
-    let raw: Vec<&str> = expanded.split_whitespace().collect();
     let q_tokens: Vec<String> = normalize_ref(&expanded)
         .split_whitespace()
         .map(str::to_string)
@@ -340,19 +354,14 @@ pub fn resolve(
     let raw_address = raw_address_after_book(&ref_part, &normalized_book)
         .map(str::to_string)
         .unwrap_or_else(|| q_tokens[consumed..].join(" "));
-    let address = normalize_ref(&refkey::expand_query_amud_marks(&raw_address));
+    let expanded_address = refkey::expand_query_amud_marks(&raw_address);
+    let address = normalize_ref(&expanded_address);
+    let raw_tokens: Vec<&str> = expanded_address.split_whitespace().collect();
+    let toc_address = normalize_ref(&clean_address(&raw_tokens).join(" "));
     // The address with citation markers cleaned up, tried only when the typed one fails.
-    let cleaned = raw_rest(&raw, consumed)
-        .map(|rest| normalize_ref(&clean_address(&rest).join(" ")))
-        .unwrap_or_else(|| address.clone());
-    let cleaned = drop_leading(&cleaned, |t| PART_NAMES.contains(&t));
+    let cleaned = drop_leading(&toc_address, |t| PART_NAMES.contains(&t));
     // The address for the TOC search: unit markers dropped, part names KEPT ("יו"ד קא").
-    let toc_tokens: Vec<String> = raw_rest(&raw, consumed)
-        .map(|rest| normalize_ref(&clean_address(&rest).join(" ")))
-        .unwrap_or_else(|| address.clone())
-        .split_whitespace()
-        .map(str::to_string)
-        .collect();
+    let toc_tokens: Vec<String> = toc_address.split_whitespace().map(str::to_string).collect();
     let name_tokens: Vec<String> = q_tokens[..consumed].to_vec();
     let mut out: Vec<RefCandidate> = Vec::new();
 
@@ -368,23 +377,26 @@ pub fn resolve(
         // A part of the book named by the alias itself ("טור יו"ד" → "יו"ד"), or by the
         // first word of the address ("ב"ח יו"ד קא"), spelled out as the heRefs spell it.
         let section = acronym_section_tokens(&name_tokens, &own_words);
-        let lead_part = toc_tokens.first().filter(|t| may_name_a_part(t)).cloned();
-        let toc: Option<Arc<BookToc>> = if !section.is_empty() || lead_part.is_some() {
-            index.toc.get(conn, bid).ok()
+        let may_have_part = toc_tokens
+            .first()
+            .is_some_and(|t| may_name_a_part(t) || PART_NAMES.contains(&t.as_str()));
+        let mut toc: Option<Arc<BookToc>> = if !section.is_empty() || may_have_part {
+            index.toc.get(conn, bid, caps.alt_toc).ok()
         } else {
             None
         };
         let mut part_words: Option<Vec<String>> = None;
         let mut spelled: Vec<String> = Vec::new();
         if let Some(toc) = &toc {
-            if let Some(sp) = toc.spell_part(&section) {
+            if let Some((sp, _)) = toc
+                .named_part(&section)
+                .filter(|(_, len)| *len == section.len())
+            {
                 spelled.push(join_nonempty(&sp.join(" "), &cleaned));
                 part_words = Some(sp);
-            } else if let Some(first) = &lead_part {
-                if let Some(sp) = toc.spell_part(std::slice::from_ref(first)) {
-                    spelled.push(join_nonempty(&sp.join(" "), &toc_tokens[1..].join(" ")));
-                    part_words = Some(sp);
-                }
+            } else if let Some((sp, len)) = toc.named_part(&toc_tokens) {
+                spelled.push(join_nonempty(&sp.join(" "), &toc_tokens[len..].join(" ")));
+                part_words = Some(sp);
             }
         }
 
@@ -405,15 +417,15 @@ pub fn resolve(
             }
         }
 
-        let mut found: Vec<(i64, Option<String>, &'static str)> = Vec::new();
-        let mut used = address.as_str();
+        let mut found = Vec::new();
+        let mut used = address.clone();
         for (vi, (v, key_source)) in variants.iter().enumerate() {
             let key = refkey::build_ref_key(key_source);
             if let Some(h) = by_line_ref(conn, caps, bid, key.as_deref())? {
                 // a part was named: a hit in another part is not this reference
-                if part_words.as_ref().is_none_or(|p| in_part(&h.1, p)) {
+                if part_words.as_ref().is_none_or(|p| in_part(&h.he_ref, p)) {
                     found.push(h);
-                    used = v;
+                    used = key.unwrap_or_else(|| v.to_string());
                     break;
                 }
             }
@@ -425,44 +437,43 @@ pub fn resolve(
             {
                 let mut hits = by_partial_line_ref(conn, caps, bid, k)?;
                 if let Some(p) = &part_words {
-                    hits.retain(|h| in_part(&h.1, p));
+                    hits.retain(|h| in_part(&h.he_ref, p));
                 }
                 if !hits.is_empty() {
                     found = hits;
-                    used = v;
+                    used = k.to_string();
                     break;
                 }
             }
             // heRefs rarely spell locator words ("פרק", "עמוד" from ע"א …): retry the
             // heRef match with the canonical key's tokens when they differ.
-            let key_address = key.clone().filter(|k| k != v);
-            let hit = match by_heref(conn, index, bid, v)? {
-                Some(c) => Some(c),
-                None => match &key_address {
-                    Some(k) => by_heref(conn, index, bid, k)?,
-                    None => None,
-                },
-            };
-            if let Some(h) = hit {
-                if part_words.as_ref().is_none_or(|p| in_part(&h.1, p)) {
+            let key_address = key.as_deref().filter(|k| k != v);
+            for scope in std::iter::once(*v).chain(key_address) {
+                if let Some(h) = by_heref(conn, index, bid, scope)? {
+                    if part_words.as_ref().is_some_and(|p| !in_part(&h.he_ref, p)) {
+                        continue;
+                    }
                     found.push(h);
-                    used = v;
+                    used = scope.to_string();
                     break;
                 }
             }
+            if !found.is_empty() {
+                break;
+            }
         }
         if found.is_empty() && !address.is_empty() {
+            let lookup = match &toc {
+                Some(lookup) => lookup,
+                None => toc.insert(index.toc.get(conn, bid, caps.alt_toc)?),
+            };
             let (hits, complete) = by_toc_tree(
-                conn,
-                caps,
-                index,
-                bid,
-                toc.clone(),
+                lookup,
                 &section,
                 part_words.as_deref(),
                 &toc_tokens,
                 &raw_address,
-            )?;
+            );
             // a heading reached by part of the address only yields to a dibbur hamatchil
             if complete && !hits.is_empty() {
                 found = hits;
@@ -474,42 +485,45 @@ pub fn resolve(
         }
         if let Some(dh) = &dibbur {
             for f in found.iter_mut() {
-                let d = match f.2 {
-                    "dibur_hamatchil" => None,
+                let d = match f.kind {
+                    "dibur_hamatchil" | "toc_partial" => None,
                     // a heading: the dibbur anywhere in its section ("ב"ח קא ד"ה …")
-                    "toc" | "toc_partial" => {
-                        let toc = index.toc.get(conn, bid)?;
-                        let hi = toc.section_end(f.0).unwrap_or(i64::MAX);
-                        dibur_in_lines(conn, caps, bid, f.0, hi, dh)?
+                    "toc" => {
+                        let hi = toc
+                            .as_deref()
+                            .zip(f.heading)
+                            .and_then(|(toc, heading)| {
+                                toc.section_end(heading, part_words.as_deref())
+                            })
+                            .unwrap_or(i64::MAX);
+                        dibur_in_lines(conn, caps, bid, f.line_index, hi, dh)?
                     }
-                    _ => dibur_in_ref(conn, caps, index, bid, used, f.0, dh)?,
+                    _ => dibur_in_ref(conn, caps, index, bid, &used, f, dh)?,
                 };
                 if let Some(d) = d {
                     *f = d;
                 }
             }
             // where the dibbur was found, the locations without it are not the reference
-            if found.iter().any(|f| f.2 == "dibur_in_ref") {
-                found.retain(|f| f.2 == "dibur_in_ref");
+            if found.iter().any(|f| f.kind == "dibur_in_ref") {
+                found.retain(|f| f.kind == "dibur_in_ref");
             }
         }
-        let toc = if found.iter().any(|f| f.2.starts_with("toc")) {
-            index.toc.get(conn, bid).ok()
-        } else {
-            None
-        };
-        for (line_index, he_ref, kind) in found {
+        // The global ranking uses the same order within a book. Bound path rendering
+        // to the candidates that can survive that ranking.
+        found.sort_by_key(|h| (kind_rank(h.kind), h.line_index));
+        for hit in found.into_iter().take(limit.max(1) as usize) {
             out.push(RefCandidate {
                 book_id: bid,
                 book_title: title.clone(),
-                line_index,
-                he_ref,
+                line_index: hit.line_index,
+                he_ref: hit.he_ref,
                 toc_path: toc
-                    .as_ref()
-                    .filter(|_| kind.starts_with("toc"))
-                    .and_then(|t| t.heading_path(line_index)),
+                    .as_deref()
+                    .zip(hit.heading)
+                    .map(|(t, heading)| t.heading_path(heading)),
                 snippet: String::new(),
-                match_kind: kind,
+                match_kind: hit.kind,
             });
         }
     }
@@ -532,8 +546,24 @@ pub fn resolve(
     Ok(out)
 }
 
-/// (line index, heRef, match kind).
-type Hit = (i64, Option<String>, &'static str);
+struct Hit {
+    line_index: i64,
+    he_ref: Option<String>,
+    kind: &'static str,
+    heading: Option<TocHeading>,
+}
+
+impl Hit {
+    fn new(line_index: i64, he_ref: Option<String>, kind: &'static str) -> Self {
+        Self {
+            line_index,
+            he_ref,
+            kind,
+            heading: None,
+        }
+    }
+}
+
 type Found = Option<Hit>;
 
 /// Canonical key → `line_ref` (the full key).
@@ -551,7 +581,7 @@ fn by_line_ref(conn: &Connection, caps: &Caps, book_id: i64, key: Option<&str>) 
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    Ok(row.map(|(li, he_ref)| (li, he_ref, "exact")))
+    Ok(row.map(|(li, he_ref)| Hit::new(li, he_ref, "exact")))
 }
 
 /// The partial key (named parts of the heRef omitted): every part of the book in which the
@@ -562,7 +592,7 @@ fn by_partial_line_ref(
     caps: &Caps,
     book_id: i64,
     key: &str,
-) -> Result<Vec<(i64, Option<String>, &'static str)>> {
+) -> Result<Vec<Hit>> {
     if !caps.line_ref {
         return Ok(vec![]);
     }
@@ -592,7 +622,7 @@ fn by_partial_line_ref(
             String::new()
         };
         if seen_parts.insert(part) {
-            out.push((li, he_ref, "partial"));
+            out.push(Hit::new(li, he_ref, "partial"));
         }
     }
     Ok(out)
@@ -606,111 +636,63 @@ fn by_heref(conn: &Connection, index: &RefIndex, book_id: i64, address: &str) ->
         canonical.push(' ');
         canonical.push_str(address);
     }
-    let Some(line) = index.matching_line(conn, book_id, &canonical)? else {
+    let Some((line_index, he_ref)) = index.matching_line(conn, book_id, &canonical)? else {
         return Ok(None);
     };
-    let kind = if normalize_ref(&line.he_ref) == canonical {
+    let kind = if normalize_ref(&he_ref) == canonical {
         "exact"
     } else {
         "prefix"
     };
-    Ok(Some((line.line_index, Some(line.he_ref), kind)))
+    Ok(Some(Hit::new(line_index, Some(he_ref), kind)))
 }
 
-/// Every TOC or alternate-TOC heading whose normalized text equals the address (locator
-/// words such as "פרק"/"סימן" ignored on both sides, as in the canonical key) — one per
-/// part when a multi-part book repeats the heading.
-fn by_toc_key(
-    conn: &Connection,
-    caps: &Caps,
-    book_id: i64,
-    address: &str,
-) -> Result<Vec<(i64, Option<String>, &'static str)>> {
-    let Some(want) = refkey::build_ref_key(address) else {
-        return Ok(vec![]);
-    };
-    let strip_parasha = |k: &str| k.strip_prefix("פרשת ").unwrap_or(k).to_string();
-    let want = strip_parasha(&want);
-    let mut sql = String::from(
-        "SELECT tt.text, l.lineIndex, l.heRef FROM tocEntry te JOIN tocText tt ON tt.id = te.textId \
-           JOIN line l ON l.id = te.lineId WHERE te.bookId = ?1",
-    );
-    if caps.alt_toc {
-        sql.push_str(
-            " UNION ALL SELECT tt.text, l.lineIndex, l.heRef FROM alt_toc_entry ae \
-                JOIN alt_toc_structure s ON s.id = ae.structureId \
-                JOIN tocText tt ON tt.id = ae.textId JOIN line l ON l.id = ae.lineId \
-               WHERE s.bookId = ?1",
-        );
-    }
-    let mut stmt = conn.prepare(&sql)?;
-    let mut hits: BTreeMap<i64, Option<String>> = BTreeMap::new();
-    for row in stmt.query_map([book_id], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, Option<String>>(2)?,
-        ))
-    })? {
-        let (text, li, he_ref) = row?;
-        let Some(k) = refkey::build_ref_key(&crate::text::strip_html_tags(&text)) else {
-            continue;
-        };
-        if strip_parasha(&k) == want {
-            hits.entry(li).or_insert(he_ref);
-        }
-    }
-    Ok(hits.into_iter().map(|(li, h)| (li, h, "toc")).collect())
-}
-
-/// TOC lookup, as the app does it: the book's part named by the alias first
-/// ("טור יו"ד" + "קא"), then a heading equal to the address, then the token-by-token tree
-/// search (part abbreviations, transpositions, flat fallback). Returns every heading that
-/// fits, and whether the whole address was matched (else they are "toc_partial").
-#[allow(clippy::too_many_arguments)]
+/// Try the alias's named section, exact headings, then the primary tree search.
 fn by_toc_tree(
-    conn: &Connection,
-    caps: &Caps,
-    index: &RefIndex,
-    book_id: i64,
-    toc: Option<Arc<BookToc>>,
+    toc: &BookToc,
     section: &[String],
     part_words: Option<&[String]>,
     toc_tokens: &[String],
     raw_address: &str,
-) -> Result<(Vec<Hit>, bool)> {
-    let toc = match toc {
-        Some(t) => t,
-        None => index.toc.get(conn, book_id)?,
-    };
-    let collect = |hits: &[usize], complete: bool| -> Vec<(i64, Option<String>, &'static str)> {
+) -> (Vec<Hit>, bool) {
+    let collect = |headings: &[TocHeading], complete: bool| -> Vec<Hit> {
         let kind = if complete { "toc" } else { "toc_partial" };
-        let mut seen = std::collections::HashSet::new();
-        hits.iter()
-            .map(|&i| &toc.nodes[i])
-            .filter(|n| seen.insert(n.line_index))
-            .map(|n| (n.line_index, n.he_ref.clone(), kind))
+        let mut seen = HashSet::new();
+        headings
+            .iter()
+            .filter_map(|&heading| {
+                let node = toc.node(heading);
+                let line_index = node.line_index?;
+                if part_words.is_some_and(|part| !toc.heading_in_part(heading, part))
+                    || !seen.insert(line_index)
+                {
+                    return None;
+                }
+                Some(Hit {
+                    line_index,
+                    he_ref: node.he_ref.clone(),
+                    kind,
+                    heading: Some(heading),
+                })
+            })
             .collect()
     };
     if !section.is_empty() {
         let tokens: Vec<String> = section.iter().chain(toc_tokens).cloned().collect();
-        let (hits, complete) = toc.search(&tokens);
-        if complete && !hits.is_empty() {
-            return Ok((collect(&hits, true), true));
+        let (headings, complete) = toc.search(&tokens);
+        if complete {
+            let hits = collect(&headings, true);
+            if !hits.is_empty() {
+                return (hits, true);
+            }
         }
     }
-    let mut by_key = by_toc_key(conn, caps, book_id, raw_address)?;
-    if let Some(p) = part_words {
-        by_key.retain(|h| in_part(&h.1, p));
+    let hits = collect(toc.by_key(raw_address), true);
+    if !hits.is_empty() {
+        return (hits, true);
     }
-    if !by_key.is_empty() {
-        return Ok((by_key, true));
-    }
-    let (mut hits, complete) = toc.search(toc_tokens);
-    if let Some(p) = part_words {
-        hits.retain(|&i| in_part(&toc.nodes[i].he_ref, p));
-    }
-    Ok((collect(&hits, complete), complete))
+    let (headings, complete) = toc.search(toc_tokens);
+    (collect(&headings, complete), complete)
 }
 
 /// The heRef lies in the named part ("ב\"ח, יורה דעה, קא" in ["יורה", "דעה"]).
@@ -779,7 +761,7 @@ fn by_dibur(conn: &Connection, caps: &Caps, book_id: i64, address: &str) -> Resu
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    Ok(row.map(|(li, he_ref)| (li, he_ref, "dibur_hamatchil")))
+    Ok(row.map(|(li, he_ref)| Hit::new(li, he_ref, "dibur_hamatchil")))
 }
 
 /// The first `ד"ה <words>` line in `lo..=hi` (a heading's section).
@@ -805,7 +787,7 @@ fn dibur_in_lines(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    Ok(row.map(|(li, he_ref)| (li, he_ref, "dibur_in_ref")))
+    Ok(row.map(|(li, he_ref)| Hit::new(li, he_ref, "dibur_in_ref")))
 }
 
 /// The `ד"ה <words>` line inside the location found for `address` (the lines whose heRef
@@ -816,7 +798,7 @@ fn dibur_in_ref(
     index: &RefIndex,
     book_id: i64,
     address: &str,
-    found_line: i64,
+    found: &Hit,
     dibbur: &str,
 ) -> Result<Found> {
     if !caps.line_dh || dibbur.chars().count() < 2 {
@@ -828,12 +810,21 @@ fn dibur_in_ref(
         canonical.push(' ');
         canonical.push_str(address);
     }
-    let mut lines = index.lines_under(conn, book_id, &canonical)?;
+    // A partial key may omit a named part. Its own heRef keeps each
+    // candidate within the part where it was found.
+    let mut lines = if found.kind == "partial" {
+        HashSet::new()
+    } else {
+        index.lines_under(conn, book_id, &canonical)?
+    };
     if lines.is_empty() {
-        lines.push(found_line);
+        if let Some(he_ref) = &found.he_ref {
+            lines = index.lines_under(conn, book_id, &normalize_ref(he_ref))?;
+        }
     }
-    let lo = lines.iter().copied().min().unwrap_or(found_line);
-    let hi = lines.iter().copied().max().unwrap_or(found_line);
+    lines.insert(found.line_index);
+    let lo = lines.iter().copied().min().unwrap_or(found.line_index);
+    let hi = lines.iter().copied().max().unwrap_or(found.line_index);
     let mut stmt = conn.prepare(
         "SELECT d.lineIndex, l.heRef FROM line_dh d \
            JOIN line l ON l.bookId = d.bookId AND l.lineIndex = d.lineIndex \
@@ -847,7 +838,7 @@ fn dibur_in_ref(
     for row in rows {
         let (li, he_ref) = row?;
         if lines.contains(&li) {
-            return Ok(Some((li, he_ref, "dibur_in_ref")));
+            return Ok(Some(Hit::new(li, he_ref, "dibur_in_ref")));
         }
     }
     Ok(None)
@@ -877,22 +868,6 @@ fn split_dibbur(query: &str) -> (String, Option<String>) {
         }
         None => (query.to_string(), None),
     }
-}
-
-/// The raw tokens after the first `consumed` normalized tokens, when that boundary falls
-/// between raw tokens.
-fn raw_rest<'a>(raw: &[&'a str], consumed: usize) -> Option<Vec<&'a str>> {
-    let mut n = 0;
-    for (i, t) in raw.iter().enumerate() {
-        if n == consumed {
-            return Some(raw[i..].to_vec());
-        }
-        n += normalize_ref(t).split_whitespace().count();
-        if n > consumed {
-            return None;
-        }
-    }
-    (n == consumed).then(Vec::new)
 }
 
 /// Rewrite an address the way a heRef spells it: unit markers dropped, marker-prefixed
@@ -1010,6 +985,8 @@ mod tests {
              CREATE TABLE line_dh (bookId INTEGER NOT NULL, dhText TEXT NOT NULL, lineIndex INTEGER NOT NULL, dhDisplay TEXT NOT NULL);
              CREATE TABLE tocText (id INTEGER PRIMARY KEY, text TEXT NOT NULL);
              CREATE TABLE tocEntry (id INTEGER PRIMARY KEY, bookId INTEGER NOT NULL, parentId INTEGER, textId INTEGER NOT NULL, level INTEGER NOT NULL, lineId INTEGER, hasChildren INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE alt_toc_structure (id INTEGER PRIMARY KEY, bookId INTEGER NOT NULL);
+             CREATE TABLE alt_toc_entry (id INTEGER PRIMARY KEY, structureId INTEGER NOT NULL, parentId INTEGER, textId INTEGER NOT NULL, level INTEGER NOT NULL, lineId INTEGER);
              INSERT INTO book VALUES (1, 'בראשית', 'בראשית', 1, 1), (103, 'ברכות', 'ברכות', 1, 1), (9, 'רש\"י על ברכות', 'רש\"י על ברכות', 0, 5), (28, 'תהילים', 'תהילים', 1, 2);
              INSERT INTO book_acronym VALUES (1, 'ספר בראשית'), (1, 'ספר־בראשית'), (28, 'תהלים');
              INSERT INTO line VALUES (1, 1, 2, 'בראשית א, א'), (2, 103, 2, 'ברכות, ב., א'), (3, 103, 17, 'ברכות, ב:, א'), (4, 9, 5, 'רש\"י על ברכות, ב., א'), (5, 28, 1160, 'תהילים, עא, א'), (6, 28, 1185, 'תהילים, עב, א');
@@ -1274,6 +1251,92 @@ mod tests {
     }
 
     #[test]
+    fn named_parts_keep_headings_without_heref() {
+        let conn = multipart_fixture();
+        conn.execute("UPDATE line SET heRef = NULL WHERE bookId IN (50, 60)", [])
+            .unwrap();
+        let index = RefIndex::build(&conn);
+        for (query, book_id) in [
+            ("ב\"ח יו\"ד קא", 50),
+            ("ב\"ח יורה דעה קא", 50),
+            ("טור יו\"ד קא", 60),
+        ] {
+            let c = super::resolve(&conn, &caps(), &index, query, 10).unwrap();
+            assert_eq!(found(&c), vec![(book_id, 20, "toc")], "{query}");
+            assert_eq!(c[0].toc_path.as_deref(), Some("יורה דעה > סימן קא"));
+        }
+    }
+
+    #[test]
+    fn daf_toc_matches_page_and_side_positionally() {
+        let conn = fixture();
+        conn.execute_batch(
+            "INSERT INTO line VALUES (50, 9, 10, NULL), (51, 9, 20, NULL);
+             INSERT INTO tocText VALUES (50, 'דף ה:'), (51, 'דף ו:'), (52, 'כותרת לא מעוגנת');
+             INSERT INTO tocEntry VALUES (50, 9, NULL, 50, 1, 50, 0), (51, 9, NULL, 51, 1, 51, 0),
+                                         (52, 9, NULL, 52, 1, NULL, 0);",
+        )
+        .unwrap();
+        let index = RefIndex::build(&conn);
+        let r = |q: &str| found(&super::resolve(&conn, &caps(), &index, q, 10).unwrap());
+        assert_eq!(r("רש\"י על ברכות ב:"), vec![]);
+        assert_eq!(r("רש\"י על ברכות ה."), vec![]);
+        assert_eq!(r("רש\"י על ברכות ה:"), vec![(9, 10, "toc")]);
+        assert_eq!(r("רש\"י על ברכות ה ע\"ב"), vec![(9, 10, "toc")]);
+        assert_eq!(r("רש\"י על ברכות כותרת לא מעוגנת"), vec![]);
+    }
+
+    #[test]
+    fn alternate_toc_dibbur_stays_inside_its_structure_and_section() {
+        let conn = fixture();
+        conn.execute_batch(
+            "INSERT INTO line VALUES (50, 103, 6, NULL), (51, 103, 12, NULL), (52, 103, 21, NULL);
+             INSERT INTO tocText VALUES (50, 'פרשת נח'), (51, 'פרשת לך לך'), (52, 'מבנה שני');
+             INSERT INTO alt_toc_structure VALUES (50, 103), (51, 103);
+             INSERT INTO alt_toc_entry VALUES (50, 50, NULL, 50, 1, 2), (51, 50, NULL, 51, 1, 3),
+                                              (52, 51, NULL, 52, 1, 50);
+             INSERT INTO line_dh VALUES (103, 'בתוך הפרשה', 12, 'בתוך הפרשה'),
+                                        (103, 'מחוץ לפרשה', 21, 'מחוץ לפרשה');",
+        )
+        .unwrap();
+        let index = RefIndex::build(&conn);
+        let caps = Caps {
+            alt_toc: true,
+            ..caps()
+        };
+        let r = |q: &str| super::resolve(&conn, &caps, &index, q, 10).unwrap();
+        let c = r("ברכות פרשת נח ד\"ה מחוץ לפרשה");
+        assert_eq!(found(&c), vec![(103, 2, "toc")]);
+        assert_eq!(c[0].toc_path.as_deref(), Some("פרשת נח"));
+        assert_eq!(
+            found(&r("ברכות פרשת נח ד\"ה בתוך הפרשה")),
+            vec![(103, 12, "dibur_in_ref")]
+        );
+    }
+
+    #[test]
+    fn named_part_bounds_alternate_toc_dibbur() {
+        let conn = multipart_fixture();
+        conn.execute_batch(
+            "INSERT INTO book_acronym VALUES (60, 'טור או\"ח');
+             INSERT INTO tocText VALUES (50, 'פרשת נח');
+             INSERT INTO alt_toc_structure VALUES (50, 60);
+             INSERT INTO alt_toc_entry SELECT 50, 50, NULL, 50, 1, id
+               FROM line WHERE bookId = 60 AND lineIndex = 11;
+             INSERT INTO line_dh VALUES (60, 'מחוץ לחלק', 21, 'מחוץ לחלק');",
+        )
+        .unwrap();
+        let index = RefIndex::build(&conn);
+        let caps = Caps {
+            alt_toc: true,
+            ..caps()
+        };
+        let c =
+            super::resolve(&conn, &caps, &index, "טור או\"ח פרשת נח ד\"ה מחוץ לחלק", 10).unwrap();
+        assert_eq!(found(&c), vec![(60, 11, "toc")]);
+    }
+
+    #[test]
     fn resolves_from_the_per_book_normalized_cache() {
         let conn = fixture();
         let index = RefIndex::build(&conn);
@@ -1365,6 +1428,7 @@ mod tests {
         assert_eq!(first("ירושלמי שביעית פ\"ב ה\"א"), (144, 40));
         assert_eq!(first("מגן אברהם אורח חיים שח ב"), (3839, 3267));
         assert_eq!(first("מג\"א או\"ח סי' שח ס\"ק ב"), (3839, 3267));
+        assert_eq!(first("מג\"א,סי' שח ס\"ק ב"), (3839, 3267));
         assert_eq!(first("קצות החושן כח א"), (3862, 171));
         assert_eq!(first("שבת דף מג ע\"ב"), (103, 500));
         // The address as typed still wins: daf 82, not perek 2.
@@ -1375,13 +1439,30 @@ mod tests {
     fn dibbur_is_found_inside_the_location() {
         let conn = citation_library();
         let index = RefIndex::build(&conn);
-        let c = super::resolve(&conn, &caps(), &index, "תוס' שבת מג: ד\"ה בעודן", 3).unwrap();
-        assert_eq!((c[0].line_index, c[0].match_kind), (541, "dibur_in_ref"));
+        for query in ["תוס' שבת מג: ד\"ה בעודן", "תוס' שבת מג ע\"ב ד\"ה בעודן"]
+        {
+            let c = super::resolve(&conn, &caps(), &index, query, 3).unwrap();
+            assert_eq!(
+                (c[0].line_index, c[0].match_kind),
+                (541, "dibur_in_ref"),
+                "{query}"
+            );
+        }
         // The same dibbur on the next daf is not taken for this one.
         let c = super::resolve(&conn, &caps(), &index, "תוס' שבת מד. ד\"ה בעודן", 3).unwrap();
         assert_eq!((c[0].line_index, c[0].match_kind), (560, "dibur_in_ref"));
         // An unknown dibbur leaves the location itself.
         let c = super::resolve(&conn, &caps(), &index, "תוס' שבת מג: ד\"ה ופורסין", 3).unwrap();
         assert_eq!((c[0].line_index, c[0].match_kind), (540, "prefix"));
+    }
+
+    #[test]
+    fn dibbur_can_match_later_line_with_the_same_heref() {
+        let conn = citation_library();
+        conn.execute("UPDATE line SET heRef = 'תוספות על שבת, מג:' WHERE bookId = 1907 AND lineIndex IN (540, 541)", [])
+            .unwrap();
+        let index = RefIndex::build(&conn);
+        let c = super::resolve(&conn, &caps(), &index, "תוס' שבת מג: ד\"ה בעודן", 3).unwrap();
+        assert_eq!(found(&c), vec![(1907, 541, "dibur_in_ref")]);
     }
 }
