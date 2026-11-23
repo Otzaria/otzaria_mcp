@@ -803,7 +803,12 @@ impl OtzariaServer {
                        app's logic — book names, acronyms and aliases; the canonical reference key looked up \
                        in the library's line_ref index (\"בראשית א, א\", \"פרק א פסוק א\", \"ברכות ב.\", \"ב ע\\\"א\", \
                        \"טור שט ג\" with named parts omitted); chapter/daf-level prefixes; TOC and parasha \
-                       headings; and a commentary's dibbur hamatchil. Feed a candidate into get_text / get_links.",
+                       headings (the app's tree search: a multi-part book like ב\"ח or טור yields one \
+                       candidate per part, each with its toc_path, unless a part is named — \"ב\"ח יו\"ד קא\", \
+                       \"טור יו\"ד קא\"); and a commentary's dibbur hamatchil. Citation forms are also understood \
+                       (\"ירושלמי שביעית פ\\\"ב ה\\\"א\", \"מג\\\"א או\\\"ח סי' שח ס\\\"ק ב\"), and a trailing \
+                       ד\\\"ה <words> returns that dibbur's line inside the location (match_kind \"dibur_in_ref\"). \
+                       Feed a candidate into get_text / get_links.",
         annotations(read_only_hint = true)
     )]
     pub async fn resolve_ref(

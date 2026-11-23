@@ -13,6 +13,7 @@ pub mod reload;
 pub mod search;
 pub mod server;
 pub mod text;
+pub mod toc_search;
 
 #[cfg(test)]
 mod fixture_tests;
