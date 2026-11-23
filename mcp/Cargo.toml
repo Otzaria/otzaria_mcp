@@ -27,6 +27,9 @@ rmcp = { version = "2.2.0", features = ["transport-io", "schemars"] }
 # copied search source. The reviewed Git revision and Cargo.lock pin updates.
 search_engine = { package = "otzaria-search-core", git = "https://github.com/Otzaria/otzaria_search_engine", rev = "4bb3d8e7d11499861ce0655c88841eb23e0f1649" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = "3"
 # Unit tests build dictionary-compressed frames like the library builder does.

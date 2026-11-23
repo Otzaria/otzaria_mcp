@@ -40,8 +40,8 @@ pub struct Inner {
     pub codec: LineCodec,
 }
 
-/// A metadata-only stamp. Never open an SQLite file outside SQLite: on Unix a raw
-/// close could drop locks held by another connection in this process.
+/// A metadata-only stamp. Unix must stat the path without opening a file
+/// descriptor: a raw close could drop locks on another SQLite connection.
 #[derive(PartialEq, Eq)]
 struct FileVersion {
     created: Option<SystemTime>,
@@ -49,11 +49,16 @@ struct FileVersion {
     len: u64,
     #[cfg(unix)]
     identity: (u64, u64),
+    #[cfg(windows)]
+    identity: crate::windows_file::FileIdentity,
 }
 
 impl FileVersion {
     fn read(path: &Path) -> std::io::Result<Self> {
+        #[cfg(not(windows))]
         let metadata = path.metadata()?;
+        #[cfg(windows)]
+        let (metadata, identity) = crate::windows_file::metadata(path)?;
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         Ok(Self {
@@ -62,18 +67,18 @@ impl FileVersion {
             len: metadata.len(),
             #[cfg(unix)]
             identity: (metadata.dev(), metadata.ino()),
+            #[cfg(windows)]
+            identity,
         })
     }
 
     fn same_file(&self, other: &Self) -> bool {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.identity == other.identity
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
-            // A replacement can inherit the previous creation time on Windows.
-            // Treat any change to the main-file stamp as a new generation.
             self == other
         }
     }

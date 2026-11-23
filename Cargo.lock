@@ -1004,6 +1004,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
