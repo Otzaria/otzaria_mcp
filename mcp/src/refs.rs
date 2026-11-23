@@ -296,6 +296,26 @@ pub struct RefCandidate {
     /// A reference that exists in several parts of one book ("ב\"ח קא": אורח חיים, יורה
     /// דעה, אבן העזר, חושן משפט) yields one candidate per part.
     pub match_kind: &'static str,
+    /// The reference names the book or one of its parts without an internal location.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub book_level: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ResolveOptions {
+    pub heref_fallback: bool,
+    pub exclude_book_level: bool,
+    pub snippets: bool,
+}
+
+impl Default for ResolveOptions {
+    fn default() -> Self {
+        Self {
+            heref_fallback: true,
+            exclude_book_level: false,
+            snippets: true,
+        }
+    }
 }
 
 fn kind_rank(kind: &str) -> u8 {
@@ -319,7 +339,25 @@ pub fn resolve(
     query: &str,
     limit: i64,
 ) -> Result<Vec<RefCandidate>> {
+    resolve_with_options(conn, caps, index, query, limit, ResolveOptions::default())
+}
+
+pub(crate) fn resolve_with_options(
+    conn: &Connection,
+    caps: &Caps,
+    index: &RefIndex,
+    query: &str,
+    limit: i64,
+    options: ResolveOptions,
+) -> Result<Vec<RefCandidate>> {
     let (ref_part, dibbur) = split_dibbur(query.trim());
+    let fallback = || {
+        if options.heref_fallback {
+            fallback_heref_like(conn, &ref_part, limit)
+        } else {
+            Ok(Vec::new())
+        }
+    };
     let expanded = refkey::expand_query_amud_marks(&ref_part);
     let q_tokens: Vec<String> = normalize_ref(&expanded)
         .split_whitespace()
@@ -343,7 +381,7 @@ pub fn resolve(
     }
 
     if book_ids.is_empty() {
-        return fallback_heref_like(conn, &ref_part, limit);
+        return fallback();
     }
     // Base texts first, then catalogue order: the strongest candidates are tried first.
     book_ids.sort_by_key(|id| (!index.is_base(*id), index.order(*id), *id));
@@ -356,6 +394,9 @@ pub fn resolve(
         .unwrap_or_else(|| q_tokens[consumed..].join(" "));
     let expanded_address = refkey::expand_query_amud_marks(&raw_address);
     let address = normalize_ref(&expanded_address);
+    if options.exclude_book_level && dibbur.is_none() && address.is_empty() {
+        return Ok(Vec::new());
+    }
     let raw_tokens: Vec<&str> = expanded_address.split_whitespace().collect();
     let toc_address = normalize_ref(&clean_address(&raw_tokens).join(" "));
     // The address with citation markers cleaned up, tried only when the typed one fails.
@@ -364,6 +405,7 @@ pub fn resolve(
     let toc_tokens: Vec<String> = toc_address.split_whitespace().map(str::to_string).collect();
     let name_tokens: Vec<String> = q_tokens[..consumed].to_vec();
     let mut out: Vec<RefCandidate> = Vec::new();
+    let mut tried_book = false;
 
     for bid in book_ids.iter().copied().take(60) {
         let title = index.title(bid);
@@ -387,6 +429,7 @@ pub fn resolve(
         };
         let mut part_words: Option<Vec<String>> = None;
         let mut spelled: Vec<String> = Vec::new();
+        let mut names_only_part = false;
         if let Some(toc) = &toc {
             if let Some((sp, _)) = toc
                 .named_part(&section)
@@ -397,8 +440,15 @@ pub fn resolve(
             } else if let Some((sp, len)) = toc.named_part(&toc_tokens) {
                 spelled.push(join_nonempty(&sp.join(" "), &toc_tokens[len..].join(" ")));
                 part_words = Some(sp);
+                names_only_part = len == toc_tokens.len();
             }
         }
+
+        let book_level = dibbur.is_none() && (address.is_empty() || names_only_part);
+        if options.exclude_book_level && book_level {
+            continue;
+        }
+        tried_book = true;
 
         // (address to match heRefs with, text the canonical key is built from): the typed
         // address keys off its raw form, so ranges and contextual ע"א/ע"ב survive. A
@@ -524,12 +574,13 @@ pub fn resolve(
                     .map(|(t, heading)| t.heading_path(heading)),
                 snippet: String::new(),
                 match_kind: hit.kind,
+                book_level,
             });
         }
     }
 
     if out.is_empty() {
-        return fallback_heref_like(conn, &ref_part, limit);
+        return if tried_book { fallback() } else { Ok(out) };
     }
 
     // Rank: best match kind first; base texts before commentaries; then catalogue order.
@@ -938,6 +989,7 @@ fn fallback_heref_like(conn: &Connection, query: &str, limit: i64) -> Result<Vec
             toc_path: None,
             snippet: String::new(),
             match_kind: "fallback",
+            book_level: false,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1203,6 +1255,31 @@ mod tests {
         c.iter()
             .map(|c| (c.book_id, c.line_index, c.match_kind))
             .collect()
+    }
+
+    #[test]
+    fn book_level_flags_named_parts_but_keeps_their_internal_addresses() {
+        let conn = multipart_fixture();
+        let index = RefIndex::build(&conn);
+        let options = super::ResolveOptions {
+            exclude_book_level: true,
+            ..Default::default()
+        };
+        for part in ["ב\"ח יו\"ד", "ב\"ח יורה דעה", "טור יו\"ד"] {
+            let items = super::resolve(&conn, &caps(), &index, part, 10).unwrap();
+            assert!(!items.is_empty(), "{part}");
+            assert!(items.iter().all(|item| item.book_level), "{items:?}");
+            assert!(
+                super::resolve_with_options(&conn, &caps(), &index, part, 10, options)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let items =
+            super::resolve_with_options(&conn, &caps(), &index, "טור יו\"ד קא", 10, options)
+                .unwrap();
+        assert_eq!(items[0].line_index, 20);
+        assert!(!items[0].book_level);
     }
 
     #[test]

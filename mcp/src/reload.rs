@@ -56,6 +56,12 @@ impl Library {
         Arc::clone(&self.inner.read().unwrap())
     }
 
+    /// Files currently visible to the server, including WAL edits that the
+    /// watcher has not published yet. Call from a blocking worker.
+    pub(crate) fn observed_fingerprint(&self) -> String {
+        fingerprint(&self.paths)
+    }
+
     pub fn read_admission(&self) -> &Gate {
         &self.reads
     }

@@ -68,6 +68,225 @@ fn library(path: std::path::PathBuf) -> std::sync::Arc<Library> {
     .unwrap()
 }
 
+fn reference_fixture(path: &std::path::Path) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE book (id INTEGER PRIMARY KEY, title TEXT, heRef TEXT,
+                               isBaseBook INTEGER, orderIndex INTEGER, totalLines INTEGER);
+             CREATE TABLE line (id INTEGER PRIMARY KEY, bookId INTEGER, lineIndex INTEGER,
+                               heRef TEXT, content TEXT);
+             CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO schema_meta VALUES ('db_version', '39');
+             INSERT INTO book VALUES (1, 'אוצר חכמה', 'אוצר חכמה', 1, 0, 3);
+             INSERT INTO line VALUES
+                (1, 1, 0, 'אוצר חכמה', 'כותרת'),
+                (2, 1, 1, 'אוצר חכמה, חכמה', 'תוכן הסעיף'),
+                (3, 1, 2, 'אוצר חכמה, תיבה נדירה', 'תוכן נוסף');",
+    )
+    .unwrap();
+    db
+}
+
+#[tokio::test]
+async fn resolve_refs_reuses_results_and_preserves_single_lookup_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("test.db");
+    drop(reference_fixture(&path));
+    let lib = library(path);
+    let (mut reader, mut writer) = client(lib.clone()).await;
+    let response = request(
+        &mut reader,
+        &mut writer,
+        2,
+        "tools/call",
+        json!({
+            "name": "resolve_refs",
+            "arguments": {
+                "references": [
+                    "אוצר חכמה חכמה", "אוצר חכמה", " אוצר חכמה חכמה ", "תיבה נדירה", " "
+                ],
+                "exclude_book_level": true,
+                "snippets": false
+            }
+        }),
+    )
+    .await;
+    let batch = payload(&response);
+    let results = batch["results"].as_array().unwrap();
+    assert_eq!(batch["count"], 5);
+    assert_eq!(batch["schema_version"], 39);
+    assert_eq!(results[0]["candidates"][0]["line_index"], 1);
+    assert_eq!(results[0]["candidates"][0]["snippet"], "");
+    assert!(results[0]["candidates"][0].get("book_level").is_none());
+    assert_eq!(results[1]["count"], 0);
+    assert_eq!(results[0], results[2]);
+    assert_eq!(results[3]["count"], 0, "batch fallback is opt-in");
+    assert!(results[4]["error"].is_string());
+    assert_eq!(lib.read_admission().metrics().completed, 3);
+
+    let response = request(
+        &mut reader,
+        &mut writer,
+        3,
+        "tools/call",
+        json!({"name":"resolve_ref", "arguments":{"reference":"תיבה נדירה"}}),
+    )
+    .await;
+    let single = payload(&response);
+    assert_eq!(single["candidates"][0]["match_kind"], "fallback");
+    assert_eq!(single["candidates"][0]["snippet"], "תוכן נוסף");
+    assert_eq!(single["resolver"], batch["resolver"]);
+    assert_eq!(single["data_version"], batch["data_version"]);
+
+    let response = request(
+        &mut reader,
+        &mut writer,
+        4,
+        "tools/call",
+        json!({
+            "name":"resolve_refs",
+            "arguments":{"references":["תיבה נדירה", "אוצר חכמה"], "heref_fallback":true}
+        }),
+    )
+    .await;
+    let batch = payload(&response);
+    assert_eq!(
+        batch["results"][0]["candidates"][0]["match_kind"],
+        "fallback"
+    );
+    assert_eq!(batch["results"][1]["candidates"][0]["book_level"], true);
+
+    let response = request(
+        &mut reader,
+        &mut writer,
+        5,
+        "tools/call",
+        json!({
+            "name":"resolve_refs",
+            "arguments":{"references":vec!["אוצר חכמה"; 401], "limit":50}
+        }),
+    )
+    .await;
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+}
+
+async fn wait_for_reads(gate: &otzaria_mcp::admission::Gate, count: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while gate.metrics().in_flight != count {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn hold_between_batch_references(
+    gate: &otzaria_mcp::admission::Gate,
+    writer: &mut Writer,
+) -> otzaria_mcp::admission::Admitted {
+    let held = gate.acquire(CancellationToken::new()).await.unwrap();
+    let batch = json!({
+        "jsonrpc":"2.0", "id":2, "method":"tools/call",
+        "params":{"name":"resolve_refs","arguments":{"references":["אוצר חכמה", "אוצר חכמה חכמה"]}}
+    });
+    writer
+        .write_all(format!("{batch}\n").as_bytes())
+        .await
+        .unwrap();
+    wait_for_reads(gate, 2).await;
+
+    let other_reader = tokio::spawn({
+        let gate = gate.clone();
+        async move { gate.acquire(CancellationToken::new()).await.unwrap() }
+    });
+    wait_for_reads(gate, 3).await;
+    drop(held);
+    let other_reader = tokio::time::timeout(Duration::from_secs(5), other_reader)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_reads(gate, 2).await;
+    assert_eq!(gate.metrics().completed, 1, "only the first reference ran");
+    other_reader
+}
+
+#[tokio::test]
+async fn resolve_refs_yields_to_another_reader_and_stops_on_cancellation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("test.db");
+    drop(reference_fixture(&path));
+    let lib = library(path);
+    let (mut reader, mut writer) = client(lib.clone()).await;
+    let gate = lib.read_admission();
+    let other_reader = hold_between_batch_references(gate, &mut writer).await;
+    writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2}}\n")
+        .await
+        .unwrap();
+    wait_for_reads(gate, 1).await;
+    drop(other_reader);
+    let single = json!({
+        "jsonrpc":"2.0", "id":3, "method":"tools/call",
+        "params":{"name":"resolve_ref","arguments":{"reference":"אוצר חכמה"}}
+    });
+    writer
+        .write_all(format!("{single}\n").as_bytes())
+        .await
+        .unwrap();
+    loop {
+        let mut line = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(n, 0);
+        let response: Value = serde_json::from_str(&line).unwrap();
+        if response["id"] == 3 {
+            assert_eq!(payload(&response)["count"], 1);
+            break;
+        }
+        assert_eq!(response["id"], 2);
+        assert!(response.get("error").is_some(), "{response}");
+    }
+    assert_eq!(gate.metrics().completed, 2);
+}
+
+#[tokio::test]
+async fn resolve_refs_rejects_a_wal_commit_between_references() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("test.db");
+    let db = reference_fixture(&path);
+    db.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+    let lib = library(path);
+    let (mut reader, mut writer) = client(lib.clone()).await;
+    let other_reader = hold_between_batch_references(lib.read_admission(), &mut writer).await;
+    db.execute("UPDATE line SET content='תוכן מעודכן' WHERE id=2", [])
+        .unwrap();
+    drop(other_reader);
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["id"], 2);
+    assert_eq!(response["error"]["data"]["reason"], "library_changed");
+
+    let response = request(
+        &mut reader,
+        &mut writer,
+        3,
+        "tools/call",
+        json!({"name":"resolve_refs", "arguments":{"references":["אוצר חכמה חכמה"]}}),
+    )
+    .await;
+    assert_eq!(
+        payload(&response)["results"][0]["candidates"][0]["snippet"],
+        "תוכן מעודכן",
+    );
+}
+
 #[tokio::test]
 async fn mcp_responses_track_wal_metadata_without_reloading() {
     let tmp = tempfile::tempdir().unwrap();
